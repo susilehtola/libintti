@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MPL-2.0
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc-serial
+            cc: gcc
+            cxx: g++
+            cmake_args: ""
+          - name: gcc-openmp
+            cc: gcc
+            cxx: g++
+            cmake_args: "-DKokkos_ENABLE_OPENMP=ON"
+          - name: clang-serial
+            cc: clang
+            cxx: clang++
+            cmake_args: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build build -j $(nproc)
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+      - name: Build
+        run: cmake --build build -j $(nproc)
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
