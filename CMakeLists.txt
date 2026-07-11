@@ -6,6 +6,7 @@ project(intti VERSION 0.1.0
 
 option(INTTI_BUILD_TESTS "Build unit tests" ON)
 option(INTTI_ENABLE_MPI "Enable MPI support (placeholder, used from later milestones)" OFF)
+option(INTTI_ENABLE_CHOLESKY "Enable the Cholesky decomposition module (needs LAPACK)" ON)
 
 find_package(Kokkos 4.0 QUIET)
 if(Kokkos_FOUND)
@@ -27,6 +28,11 @@ target_include_directories(intti INTERFACE
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(intti INTERFACE Kokkos::kokkos)
 target_compile_features(intti INTERFACE cxx_std_20)
+
+if(INTTI_ENABLE_CHOLESKY)
+  find_package(LAPACK REQUIRED)
+  target_link_libraries(intti INTERFACE LAPACK::LAPACK)
+endif()
 
 if(INTTI_ENABLE_MPI)
   find_package(MPI REQUIRED COMPONENTS CXX)

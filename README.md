@@ -87,9 +87,18 @@ Options: `INTTI_BUILD_TESTS` (default `ON`), `INTTI_ENABLE_MPI` (default
 
 ## Status
 
-Milestone 1: primitive Cartesian ERI quartets (`intti::eri_quartet`) for all
-four kernels, templated on the scalar type, validated against analytic
-McMurchie–Davidson integrals (in double and long double precision).
+- **M1:** primitive Cartesian ERI quartets (`intti::eri_quartet`) for all
+  four kernels, templated on the scalar type, validated against analytic
+  McMurchie–Davidson integrals (in double and long double precision).
+- **M2:** batched quartet driver (`intti::eri_quartets` over a `PairTable`
+  with precomputed per-pair Hermite expansion tables and a reusable,
+  allocation-free workspace) and a two-step pivoted Cholesky decomposition
+  of the ERI matrix (`intti::two_step_cholesky`: pivot selection followed by
+  RI-style vector construction; requires LAPACK). The prolate-spheroidal
+  representation of orbital products — the bridge to integrals between
+  atomic, diatomic, and 3D basis sets — is validated in
+  `prototype/psc_validation.py` and documented in `docs/psc.md`; the C++
+  interfaces are fixed in `include/intti/product.hpp` for M3.
 
 ## License
 

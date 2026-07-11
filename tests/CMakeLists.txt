@@ -16,7 +16,11 @@ add_executable(intti_tests
   test_boys.cpp
   test_hermite1d.cpp
   test_quartet.cpp
-  test_multiprec.cpp)
+  test_multiprec.cpp
+  test_batch.cpp)
+if(INTTI_ENABLE_CHOLESKY)
+  target_sources(intti_tests PRIVATE test_cholesky.cpp)
+endif()
 target_link_libraries(intti_tests PRIVATE intti::intti GTest::gtest)
 include(GoogleTest)
 gtest_discover_tests(intti_tests)
