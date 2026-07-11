@@ -15,7 +15,8 @@ add_executable(intti_tests
   test_tgrid.cpp
   test_boys.cpp
   test_hermite1d.cpp
-  test_quartet.cpp)
+  test_quartet.cpp
+  test_multiprec.cpp)
 target_link_libraries(intti_tests PRIVATE intti::intti GTest::gtest)
 include(GoogleTest)
 gtest_discover_tests(intti_tests)

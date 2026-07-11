@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Susi Lehtola
 #pragma once
 
-#include <cmath>
-
 #include <Kokkos_Core.hpp>
+
+#include "math.hpp"
 
 namespace intti {
 
@@ -33,31 +33,32 @@ KOKKOS_INLINE_FUNCTION void cart_comp(int l, int k, int &lx, int &ly, int &lz) {
 
 /// Unnormalized primitive Cartesian Gaussian shell:
 ///   (x-Ax)^lx (y-Ay)^ly (z-Az)^lz exp(-alpha |r-A|^2)  for all lx+ly+lz = l.
-struct PrimitiveShell {
-  double alpha;     ///< exponent
-  double center[3]; ///< A
-  int l;            ///< angular momentum
+template <class Real = double> struct PrimitiveShell {
+  Real alpha;     ///< exponent
+  Real center[3]; ///< A
+  int l;          ///< angular momentum
 };
 
 /// Gaussian-product-theorem data for a shell pair. This is the reuse unit of
 /// the library: per-(pair, t) intermediates are shared across all quartets in
 /// later J/K builds, so all integral drivers consume ShellPairs, never shells.
-struct ShellPair {
-  double p;    ///< alpha + beta
-  double P[3]; ///< product center (alpha A + beta B)/p
-  double K[3]; ///< per-direction prefactor exp(-alpha beta/p (A_d - B_d)^2)
-  double A[3], B[3];
+template <class Real = double> struct ShellPair {
+  Real p;    ///< alpha + beta
+  Real P[3]; ///< product center (alpha A + beta B)/p
+  Real K[3]; ///< per-direction prefactor exp(-alpha beta/p (A_d - B_d)^2)
+  Real A[3], B[3];
   int la, lb;
 };
 
-inline ShellPair make_pair(const PrimitiveShell &a, const PrimitiveShell &b) {
-  ShellPair sp;
+template <class Real>
+ShellPair<Real> make_pair(const PrimitiveShell<Real> &a, const PrimitiveShell<Real> &b) {
+  ShellPair<Real> sp;
   sp.p = a.alpha + b.alpha;
-  const double mu = a.alpha * b.alpha / sp.p;
+  const Real mu = a.alpha * b.alpha / sp.p;
   for (int d = 0; d < 3; ++d) {
     sp.P[d] = (a.alpha * a.center[d] + b.alpha * b.center[d]) / sp.p;
-    const double AB = a.center[d] - b.center[d];
-    sp.K[d] = std::exp(-mu * AB * AB);
+    const Real AB = a.center[d] - b.center[d];
+    sp.K[d] = exp_(-mu * AB * AB);
     sp.A[d] = a.center[d];
     sp.B[d] = b.center[d];
   }

@@ -4,10 +4,6 @@ project(intti VERSION 0.1.0
         DESCRIPTION "Efficient quadrature code for tensor expressions"
         LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
 option(INTTI_BUILD_TESTS "Build unit tests" ON)
 option(INTTI_ENABLE_MPI "Enable MPI support (placeholder, used from later milestones)" OFF)
 
@@ -23,20 +19,19 @@ else()
   FetchContent_MakeAvailable(kokkos)
 endif()
 
-add_library(intti
-  src/tgrid.cpp
-  src/quartet.cpp)
+# header-only: the core is templated on the scalar type (arbitrary precision)
+add_library(intti INTERFACE)
 add_library(intti::intti ALIAS intti)
-target_include_directories(intti PUBLIC
+target_include_directories(intti INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(intti PUBLIC Kokkos::kokkos)
-target_compile_features(intti PUBLIC cxx_std_20)
+target_link_libraries(intti INTERFACE Kokkos::kokkos)
+target_compile_features(intti INTERFACE cxx_std_20)
 
 if(INTTI_ENABLE_MPI)
   find_package(MPI REQUIRED COMPONENTS CXX)
-  target_link_libraries(intti PUBLIC MPI::MPI_CXX)
-  target_compile_definitions(intti PUBLIC INTTI_HAVE_MPI)
+  target_link_libraries(intti INTERFACE MPI::MPI_CXX)
+  target_compile_definitions(intti INTERFACE INTTI_HAVE_MPI)
 endif()
 
 if(INTTI_BUILD_TESTS)
@@ -46,9 +41,7 @@ endif()
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
-install(TARGETS intti EXPORT inttiTargets
-  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS intti EXPORT inttiTargets)
 install(DIRECTORY include/intti DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT inttiTargets NAMESPACE intti::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/intti)

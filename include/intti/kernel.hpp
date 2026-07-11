@@ -17,15 +17,23 @@ enum class KernelType {
 
 /// Kernel descriptor: shapes the t quadrature grid and the tail correction.
 /// The hot loops are kernel-agnostic.
-struct Kernel {
+template <class Real = double> struct Kernel {
   KernelType type{KernelType::Coulomb};
-  double omega{0.0}; ///< range-separation parameter (Erf, Erfc)
-  double kappa{0.0}; ///< screening exponent (Yukawa)
-
-  static Kernel coulomb() { return {KernelType::Coulomb, 0.0, 0.0}; }
-  static Kernel erf_rs(double omega) { return {KernelType::Erf, omega, 0.0}; }
-  static Kernel erfc_rs(double omega) { return {KernelType::Erfc, omega, 0.0}; }
-  static Kernel yukawa(double kappa) { return {KernelType::Yukawa, 0.0, kappa}; }
+  Real omega{0}; ///< range-separation parameter (Erf, Erfc)
+  Real kappa{0}; ///< screening exponent (Yukawa)
 };
+
+template <class Real = double> Kernel<Real> coulomb() {
+  return {KernelType::Coulomb, Real(0), Real(0)};
+}
+template <class Real> Kernel<Real> erf_rs(Real omega) {
+  return {KernelType::Erf, omega, Real(0)};
+}
+template <class Real> Kernel<Real> erfc_rs(Real omega) {
+  return {KernelType::Erfc, omega, Real(0)};
+}
+template <class Real> Kernel<Real> yukawa(Real kappa) {
+  return {KernelType::Yukawa, Real(0), kappa};
+}
 
 } // namespace intti
