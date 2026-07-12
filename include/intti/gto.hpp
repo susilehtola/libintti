@@ -50,6 +50,28 @@ template <class Real = double> struct ShellPair {
   int la, lb;
 };
 
+/// Value of one Cartesian component (ka, kb) of a pair product at point r,
+/// via the Gaussian product theorem (only ShellPair data needed):
+///   prod_d (r_d-A_d)^{a_d} (r_d-B_d)^{b_d} K_d exp(-p (r_d-P_d)^2).
+template <class Real>
+KOKKOS_INLINE_FUNCTION Real pair_component_value(const ShellPair<Real> &sp, int ka,
+                                                 int kb, const Real *r) {
+  int a3[3], b3[3];
+  cart_comp(sp.la, ka, a3[0], a3[1], a3[2]);
+  cart_comp(sp.lb, kb, b3[0], b3[1], b3[2]);
+  Real val = 1;
+  for (int d = 0; d < 3; ++d) {
+    const Real dA = r[d] - sp.A[d], dB = r[d] - sp.B[d], dP = r[d] - sp.P[d];
+    Real f = sp.K[d] * exp_(-sp.p * dP * dP);
+    for (int j = 0; j < a3[d]; ++j)
+      f *= dA;
+    for (int j = 0; j < b3[d]; ++j)
+      f *= dB;
+    val *= f;
+  }
+  return val;
+}
+
 template <class Real>
 ShellPair<Real> make_pair(const PrimitiveShell<Real> &a, const PrimitiveShell<Real> &b) {
   ShellPair<Real> sp;
