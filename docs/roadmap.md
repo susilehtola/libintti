@@ -13,7 +13,13 @@ for delegated implementation. **Ground rules for any implementer:**
    patterns for builtin FP with serial class-type fallbacks, MPL-2.0 + SPDX
    headers, tests in tests/ with calibrated (not guessed) tolerances.
 
-## M7 — libcint-compatible C façade  [delegable: HIGH]
+## M7 — libcint-compatible C façade  [DONE — commit 041faa2]
+
+Delivered and validated beyond the stated oracle (unseen bases cc-pVTZ /
+6-31G* / def2-SVP at 1e-14, and an RHF driven entirely by libintti ERIs
+matching PySCF to 1.4e-13 Ha). Original spec retained below for reference.
+
+### Original spec
 
 Goal: `int2e_cart`/`int2e_sph`-compatible entry points so libintti is a
 drop-in ERI backend for PySCF-style codes.
@@ -38,7 +44,15 @@ drop-in ERI backend for PySCF-style codes.
 - Acceptance stretch: a PySCF SCF on H2O/cc-pVDZ with ERIs monkeypatched to
   the façade reproduces the reference SCF energy to 1e-10 Ha.
 
-## M8 — MPI distribution  [delegable: MEDIUM; blocked on OpenMPI install]
+## M8 — MPI distribution  [DONE — commit d49acaf]
+
+Delivered; MPI vs serial deviation is exactly 0 at 1, 2, 4 ranks (disjoint
+ownership). Environment: `source /etc/profile.d/modules.sh && module load
+mpi/openmpi-x86_64` (plain `module load mpi` does not resolve); configure
+with `-DCMAKE_CXX_COMPILER=mpicxx -DINTTI_ENABLE_MPI=ON`. Original spec
+retained below.
+
+### Original spec
 
 - `coulomb_build`/`exchange_build` MPI variants: bra pairs (J) and (a, b)
   shell blocks (K) strided by rank, `MPI_Allreduce` on the result; the
@@ -57,12 +71,14 @@ structure demonstrated in docs/psc.md). Oracle: matches the scalar
 `interaction` to 1e-13; target ≥10× on a naux² PSC Gram matrix. Risk:
 memory/accuracy tradeoffs in kernel-matrix caching need judgment.
 
-## M10 — GPU enablement  [delegable: MEDIUM for the mechanics; needs hardware]
+## M10 — GPU enablement  [delegable: MEDIUM for the mechanics]
 
 Replace the per-thread stack arrays in the hot kernels (batch.hpp phase G,
-jbuild.hpp phase 2, kbuild.hpp) with team scratch; add a CUDA/HIP
-compile-only CI job. Runtime validation requires a GPU machine; do not
-claim correctness without one.
+jbuild.hpp phase 2, kbuild.hpp) with team scratch, and enable a HIP/CUDA
+Kokkos backend. NOTE: this machine has ROCm installed (`module avail` shows
+rocm/rocm-7.1 and gfx targets), so runtime validation on real hardware is
+possible — do not settle for a compile-only check. Oracle: every existing
+test passes with the GPU backend; results match the host backend to 1e-13.
 
 ## M11 — optimized quadrature tooling  [delegable: LOW — strong model]
 

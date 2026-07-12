@@ -127,6 +127,18 @@ Options: `INTTI_BUILD_TESTS` (default `ON`), `INTTI_ENABLE_MPI` (default
   s/p/d/f test system agrees to 2×10⁻¹⁴ with the pinned normalization
   conventions (`intti::cart_norm_pyscf`, `docs/conventions.md`). The PySCF
   cross-check runs as a ctest whenever PySCF is importable.
+- **M7:** libcint-compatible C façade (`intti_int2e_cart`/`intti_int2e_sph`,
+  `include/intti/cint.h`), making libintti a **drop-in ERI backend**: it
+  consumes libcint's `atm`/`bas`/`env` arrays directly. Verified against
+  PySCF to 10⁻¹⁴ for contracted bases in both Cartesian and spherical form
+  (cc-pVDZ, cc-pVTZ, 6-31G*, def2-SVP), and an RHF calculation driven
+  entirely by libintti integrals reproduces PySCF's SCF energy to
+  1.4×10⁻¹³ Ha.
+- **M8:** MPI distribution of the Fock builds (`intti::coulomb_build_mpi`,
+  `intti::exchange_build_mpi`, `include/intti/mpi.hpp`): the kernels
+  partition their outer index space by rank into disjoint owned sets, so
+  every matrix element is produced by exactly one rank and the allreduce
+  reproduces the serial result **bitwise** (verified at 1, 2, 4 ranks).
 
 ## License
 
