@@ -40,6 +40,16 @@ if(INTTI_ENABLE_MPI)
   target_compile_definitions(intti INTERFACE INTTI_HAVE_MPI)
 endif()
 
+# libcint-compatible C facade: the one compiled (non-header-only) piece of
+# the library, so it can be dlopen()'d / ctypes-loaded as a drop-in ERI
+# backend (see include/intti/cint.h, docs/roadmap.md M7).
+add_library(intti_cint SHARED src/cint.cpp)
+add_library(intti::cint ALIAS intti_cint)
+target_link_libraries(intti_cint PRIVATE intti::intti)
+target_include_directories(intti_cint PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+
 if(INTTI_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
@@ -52,8 +62,11 @@ if(INTTI_BUILD_TESTS)
     if(_pyscf_rc EQUAL 0)
       add_test(NAME PySCFValidation
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/prototype/pyscf_validation.py
-                $<TARGET_FILE:intti_dump_eri> ${CMAKE_CURRENT_BINARY_DIR})
-      message(STATUS "PySCF found - cross-validation test enabled")
+                --dumper $<TARGET_FILE:intti_dump_eri> --workdir ${CMAKE_CURRENT_BINARY_DIR})
+      add_test(NAME PySCFValidationFacade
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/prototype/pyscf_validation.py
+                --facade $<TARGET_FILE:intti_cint>)
+      message(STATUS "PySCF found - cross-validation tests enabled")
     else()
       message(STATUS "PySCF not found - cross-validation test skipped")
     endif()
@@ -62,7 +75,7 @@ endif()
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
-install(TARGETS intti EXPORT inttiTargets)
+install(TARGETS intti intti_cint EXPORT inttiTargets)
 install(DIRECTORY include/intti DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT inttiTargets NAMESPACE intti::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/intti)

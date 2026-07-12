@@ -37,10 +37,27 @@ exact against libcint's analytic integrals at the 10⁻¹⁴ level.
 ## Spherical harmonics
 
 libintti's `c2s_matrix` (include/intti/c2s.hpp) rows are sphere-orthonormal
-real solid harmonics in m = −l..+l order. libcint's `int2e_sph` uses the
-same m order with per-row scale factors; the mapping is a diagonal rescale
-to be pinned when the façade lands (M7). Rotational behavior is identical
-(both row sets are orthogonal under Wigner rotations).
+real solid harmonics in m = −l..+l order. Pinned by the M7 façade harness
+(`prototype/pyscf_validation.py --facade`, `intti::sph_rescale`,
+include/intti/normalization.hpp) against PySCF 2.13's `int2e_sph`, to
+1.1×10⁻¹⁵ relative deviation for a d/f two-center system:
+
+- **l ≤ 1**: libcint's spherical AOs are *identical* to the
+  `cart_norm_pyscf`-normalized Cartesian AOs — same functions, same order
+  (x, y, z for p), bit-for-bit (checked to 0.0 absolute deviation against
+  PySCF for an s+p shell). No `c2s_matrix` row corresponds to libcint's
+  ordering here (`c2s_matrix(1)`'s m = −1, 0, +1 rows are y, z, x — a
+  *permutation*, not a diagonal rescale, of libcint's x, y, z), so the
+  façade bypasses `c2s_matrix` for these shells and copies the Cartesian
+  block directly.
+- **l ≥ 2**: the row order already matches m = −l..+l (PySCF's `dxy, dyz,
+  dz^2, dxz, dx2-y2` for d and `f-3..f+3` for f are exactly `c2s_matrix`'s
+  row order), and every row of every shell shares one l-independent
+  constant, **1/√(4π) = 0.28209479177387814**. I.e.
+  `sph_block = c2s_matrix(l) · cart_block(cart_norm_pyscf) / sqrt(4 pi)`.
+
+`intti::sph_rescale<Real>(l)` (include/intti/normalization.hpp) returns
+this constant (1 for l ≤ 1, unused there; 1/√(4π) for l ≥ 2).
 
 ## Contraction
 
@@ -48,6 +65,28 @@ libintti evaluates contracted AOs either through
 `eri_quartets_accumulate` (include/intti/batch.hpp) with coefficient
 products, or by tabulating contracted products on grids
 (include/intti/product.hpp). PySCF contraction coefficients are normalized
-per contracted function; the façade must fold PySCF's `bas`/`env`
-coefficient conventions (already gto_norm-scaled) directly into the
-accumulation weights.
+per contracted function; the façade folds PySCF's `bas`/`env` coefficient
+conventions directly into the accumulation weights.
+
+Pinned empirically (M7, `prototype/pyscf_validation.py --facade`, cc-pVDZ
+oxygen s-shell: 8 primitives, 2 contracted functions, and synthetic
+multi-primitive d/f shells) against PySCF 2.13's `mol._env`: PySCF's
+`env[ptr_coeff + c*nprim + p]` coefficients are already scaled by PySCF's
+*own* internal primitive normalization, `pyscf.gto.mole.gto_norm(l,
+alpha)`, which equals `intti::cart_norm_component(l, 0, 0, alpha) *
+sqrt(4 pi / (2l+1))` for every l (verified l = 0..4) — i.e.
+`intti::cart_norm_pyscf(l, alpha)` exactly for l ≥ 2, but carrying an
+*extra* l-independent factor `sqrt(4 pi / (2l+1))` for l ≤ 1 that
+`cart_norm_pyscf` does not include. The façade therefore uses
+
+```
+weight(prim p, contracted fn c) = env_coeff(p, c) * coeff_rescale(l)
+coeff_rescale(l) = sqrt((2l+1) / (4 pi))   for l <= 1
+                  = 1                       for l >= 2
+```
+
+as the coefficient in the primitive-quartet accumulation; no further
+per-primitive `cart_norm_pyscf` multiplication is needed; it is already
+implied. This was confirmed by reconstructing PySCF's `int1e_ovlp_cart`
+diagonal (both axial and off-axial Cartesian components) from raw `env`
+coefficients for contracted d and f shells, matching to double precision.
