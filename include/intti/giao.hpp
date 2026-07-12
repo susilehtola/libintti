@@ -34,6 +34,7 @@
 // 64-node Mobius grid reproduces analytic complex-Boys GIAO ERIs to 3e-15 at
 // fields up to B = 5 a.u., with no extra nodes.
 
+#include <cmath>
 #include <complex>
 
 #include "gto.hpp"
@@ -87,8 +88,7 @@ ShellPair<std::complex<Real>> make_giao_pair(const PrimitiveShell<Real> &a,
     sp.P[d] = C(P[d], -K[d] / (2 * sp.p));
     const Real damp = exp_(-K[d] * K[d] / (4 * sp.p));
     const Real phase = -K[d] * P[d];
-    sp.K[d] = C(K0[d] * damp) *
-              C(Kokkos::cos(phase), Kokkos::sin(phase)); // exp(-i K_d P_d)
+    sp.K[d] = C(K0[d] * damp) * C(std::cos(phase), std::sin(phase)); // exp(-i K_d P_d)
     sp.A[d] = a.center[d];
     sp.B[d] = b.center[d];
   }
