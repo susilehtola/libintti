@@ -120,6 +120,12 @@ Options: `INTTI_BUILD_TESTS` (default `ON`), `INTTI_ENABLE_MPI` (default
   t-space organization with nothing materialized. Cartesian → real solid
   harmonic transform (`intti::c2s_matrix`, exact Racah-recursion
   construction, sphere-orthonormal rows) validated by rotational invariance.
+- **M6:** Cholesky-accelerated J/K (`intti::cholesky_jk`: J in O(naux·nao²),
+  K in O(naux·nao³) via BLAS — the production exchange path) and **external
+  validation against PySCF/libcint**: the full `int2e_cart` tensor of an
+  s/p/d/f test system agrees to 2×10⁻¹⁴ with the pinned normalization
+  conventions (`intti::cart_norm_pyscf`, `docs/conventions.md`). The PySCF
+  cross-check runs as a ctest whenever PySCF is importable.
 
 ## License
 
