@@ -17,7 +17,9 @@ add_executable(intti_tests
   test_hermite1d.cpp
   test_quartet.cpp
   test_multiprec.cpp
-  test_batch.cpp)
+  test_batch.cpp
+  test_bessel.cpp
+  test_interaction.cpp)
 if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_cholesky.cpp)
 endif()
