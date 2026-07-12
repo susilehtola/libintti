@@ -25,6 +25,10 @@ jobs:
             cc: clang
             cxx: clang++
             cmake_args: ""
+          - name: gcc-quadmath
+            cc: gcc
+            cxx: g++
+            cmake_args: "-DINTTI_ENABLE_QUADMATH=ON"
     steps:
       - uses: actions/checkout@v4
       - name: Install LAPACK

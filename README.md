@@ -64,14 +64,29 @@ functionals, and a thread-safe libcint-compatible interface.
   using GPGPUs*, J. Chem. Theory Comput. **11**, 2053 (2015).
   [doi:10.1021/ct501128u](https://doi.org/10.1021/ct501128u)
 
-## Arbitrary precision
+## Scalar types: arbitrary precision and complex (GIAO) integrals
 
-The core is header-only and templated on the scalar type. Builtin
-floating-point types (`float`, `double`, `long double`) execute through
-Kokkos parallel patterns; class-type scalars with the standard math
-functions available via ADL (e.g. MPFR C++ wrappers, Boost.Multiprecision)
-automatically use a serial host path. Quadrature nodes, weights, and all
-intermediates are generated in the requested precision.
+The core is header-only and templated on the scalar type, with the *real*
+type (exponents, the t grid, tolerances) kept separate from the possibly
+complex *scalar* type (centres, coefficients, integrals). `float`, `double`
+and `long double` execute through Kokkos; `__float128` (with
+`INTTI_ENABLE_QUADMATH`), `std::complex`, and class-type scalars such as
+MPFR wrappers take a serial host path. Quadrature nodes, weights and all
+intermediates are generated in the requested precision: the Möbius grid
+converges to the working-precision floor of whatever type it is given —
+measured relative error of the golden (ss|ss) quartet in `__float128` is
+1.7×10⁻³⁴ at 64 nodes and exactly zero at 128.
+
+**GIAOs / London orbitals** (`include/intti/giao.hpp`) come almost for free.
+A London orbital carries the phase exp(−i(B×R_a)·r/2), so a GIAO pair
+product is a Gaussian with a **complex centre** and an unchanged **real
+exponent** — and every step of the machinery (Gaussian product theorem,
+McMurchie–Davidson coefficients, Hermite recursion, t quadrature) is pure
+algebra in the centres. A GIAO integral is therefore just `eri_quartet`
+instantiated on `std::complex`. The analytic route needs the Boys function
+of a *complex argument*; the quadrature route never forms a Boys function at
+all. Verified against a complex-Boys reference to 10⁻¹³ up to (dd|pp) at
+fields up to 1 a.u., **on the ordinary 64-node grid with no extra nodes**.
 
 ## Building
 

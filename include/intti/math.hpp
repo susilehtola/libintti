@@ -71,12 +71,48 @@ KOKKOS_INLINE_FUNCTION real_t<Scalar> abs_(Scalar x) {
   }
 }
 
+/// log() with the same dispatch as exp_().
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION Scalar log_(Scalar x) {
+  if constexpr (kokkos_scalar_v<Scalar>) {
+    return Kokkos::log(x);
+  } else if constexpr (is_quad_v<Scalar>) {
+#ifdef INTTI_HAVE_QUADMATH
+    return logq(x);
+#else
+    return Scalar(0);
+#endif
+  } else {
+    using std::log;
+    return log(x);
+  }
+}
+
+/// cos() with the same dispatch as exp_().
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION Scalar cos_(Scalar x) {
+  if constexpr (kokkos_scalar_v<Scalar>) {
+    return Kokkos::cos(x);
+  } else if constexpr (is_quad_v<Scalar>) {
+#ifdef INTTI_HAVE_QUADMATH
+    return cosq(x);
+#else
+    return Scalar(0);
+#endif
+  } else {
+    using std::cos;
+    return cos(x);
+  }
+}
+
 /// pi in the precision of Real (host only). Real must be a real type.
 template <class Real> Real pi_v() {
   static_assert(!is_complex_v<Real>, "pi_v requires a real type");
   if constexpr (is_quad_v<Real>) {
 #ifdef INTTI_HAVE_QUADMATH
-    return M_PIq;
+    // not M_PIq: that macro is a "Q"-suffixed literal, which only compiles
+    // with GNU extensions enabled
+    return acosq(-1);
 #else
     return Real(0);
 #endif

@@ -62,15 +62,13 @@ template <class Real = double> struct TGrid {
 /// Gauss-Legendre nodes and weights on [a, b], in the precision of Real.
 template <class Real>
 void gauss_legendre(int n, Real a, Real b, Real *x, Real *w) {
-  using std::abs;
-  using std::cos;
   const Real pi = pi_v<Real>();
   const Real tol = 16 * std::numeric_limits<Real>::epsilon();
   const Real xm = (b + a) / 2;
   const Real xl = (b - a) / 2;
   for (int i = 0; i < (n + 1) / 2; ++i) {
     // Newton iteration on P_n from the Tricomi initial guess
-    Real z = cos(pi * (Real(i) + Real(0.75)) / (Real(n) + Real(0.5)));
+    Real z = cos_(pi * (Real(i) + Real(0.75)) / (Real(n) + Real(0.5)));
     Real pp{};
     for (int it = 0; it < 200; ++it) {
       Real p0 = 1, p1 = 0;
@@ -82,7 +80,7 @@ void gauss_legendre(int n, Real a, Real b, Real *x, Real *w) {
       pp = n * (z * p0 - p1) / (z * z - 1);
       const Real dz = p0 / pp;
       z -= dz;
-      if (abs(dz) < tol) break;
+      if (abs_(dz) < tol) break;
     }
     x[i] = xm - xl * z;
     x[n - 1 - i] = xm + xl * z;
@@ -95,18 +93,19 @@ void gauss_legendre(int n, Real a, Real b, Real *x, Real *w) {
 /// ln t at eps ~ 1e-10, scaled with the accuracy demand).
 template <class Real = double>
 TGridSpec<Real> linlog_for(Real t_c, Real target_eps = Real(1e-10)) {
-  using std::ceil;
-  using std::log;
-  using std::log10;
+  auto ceil_int = [](Real x) {
+    const int i = static_cast<int>(x);
+    return x > Real(i) ? i + 1 : i;
+  };
   TGridSpec<Real> spec;
   spec.mapping = TMapping::LinLog;
   spec.t_lin = 2;
   spec.t_c = t_c;
-  const Real demand = -log10(target_eps) / 10; // 1.0 at eps = 1e-10
+  const Real demand = -log_(target_eps) / log_(Real(10)) / 10; // 1.0 at eps = 1e-10
   const Real f = demand < Real(0.5) ? Real(0.5) : demand;
-  spec.n_lin = static_cast<int>(ceil(50 * f));
-  const Real span = t_c > spec.t_lin ? log(t_c / spec.t_lin) : Real(0);
-  int nl = static_cast<int>(ceil(27 * f * span));
+  spec.n_lin = ceil_int(50 * f);
+  const Real span = t_c > spec.t_lin ? log_(Real(t_c / spec.t_lin)) : Real(0);
+  int nl = ceil_int(27 * f * span);
   spec.n_log = nl < 20 ? 20 : nl;
   return spec;
 }
@@ -153,8 +152,6 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
     grid.t_c = Real(0);
     grid.tail_coeff = Real(0);
   } else { // TMapping::LinLog
-    using std::exp;
-    using std::log;
     Real t0 = 0, t1 = spec.t_c;
     bool tail = true;
     switch (kernel.type) {
@@ -191,9 +188,9 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
       if (log_lo <= Real(0))
         throw std::invalid_argument("logarithmic panel needs t_lin > 0");
       std::vector<Real> uu(spec.n_log), w(spec.n_log);
-      gauss_legendre(spec.n_log, log(log_lo), log(t1), uu.data(), w.data());
+      gauss_legendre(spec.n_log, log_(log_lo), log_(t1), uu.data(), w.data());
       for (int i = 0; i < spec.n_log; ++i) {
-        const Real t = exp(uu[i]);
+        const Real t = exp_(uu[i]);
         grid.t.push_back(t);
         grid.w.push_back(w[i] * t);
       }
@@ -206,7 +203,7 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
   for (std::size_t i = 0; i < grid.t.size(); ++i) {
     grid.w[i] *= pref;
     if (kernel.type == KernelType::Yukawa)
-      grid.w[i] *= exp_(-kernel.kappa * kernel.kappa / (4 * grid.t[i] * grid.t[i]));
+      grid.w[i] *= exp_(Real(-kernel.kappa * kernel.kappa / (4 * grid.t[i] * grid.t[i])));
   }
 
   // device copies for builtin floating-point types

@@ -6,6 +6,10 @@
 #include <cmath>
 #include <vector>
 
+#ifdef INTTI_HAVE_QUADMATH
+#include <quadmath.h>
+#endif
+
 #include <gtest/gtest.h>
 
 #include "intti/quartet.hpp"
@@ -102,5 +106,37 @@ TEST(MultiPrec, DoubleMatchesLongDouble) {
   for (int k = 0; k < 9; ++k)
     EXPECT_NEAR(qd[k], static_cast<double>(ql[k]), 1e-13 * std::abs(static_cast<double>(ql[0])) + 1e-15);
 }
+
+#ifdef INTTI_HAVE_QUADMATH
+// Quadruple precision (__float128, 33 decimal digits). Kokkos cannot handle
+// this type, so traits.hpp routes it to the serial host path.
+//
+// NOTE the input parsing: writing Q(0.8) would round 0.8 to a *double* first
+// and then widen it, silently capping the whole calculation at double
+// precision (this actually happened -- the first version of this test came
+// out at 2e-16). Decimal inputs must be parsed straight into quad with
+// strtoflt128.
+TEST(MultiPrec, QuadruplePrecisionQuartet) {
+  using Q = __float128;
+  auto q = [](const char *s) { return strtoflt128(s, nullptr); };
+
+  intti::PrimitiveShell<Q> a{q("0.8"), {q("0.0"), q("0.1"), q("-0.3")}, 0};
+  intti::PrimitiveShell<Q> b{q("1.3"), {q("0.5"), q("-0.2"), q("0.4")}, 0};
+  intti::PrimitiveShell<Q> c{q("2.1"), {q("1.0"), q("0.8"), q("0.0")}, 0};
+  intti::PrimitiveShell<Q> d{q("0.35"), {q("-0.4"), q("0.3"), q("1.1")}, 0};
+  // 40-digit mpmath reference of the golden (ss|ss) quartet
+  const Q golden = q("0.5625558912294552353350706513510382177662");
+
+  auto grid = intti::make_tgrid(intti::coulomb<Q>());
+  Q val;
+  intti::eri_quartet(intti::make_pair(a, b), intti::make_pair(c, d), grid, &val);
+  const double err = static_cast<double>(fabsq((val - golden) / golden));
+
+  // the Mobius grid converges to the working-precision floor of the scalar
+  // type; in quad that is ~1e-33, so demand far beyond double AND beyond
+  // long double (whose epsilon is 1.1e-19)
+  EXPECT_LT(err, 1e-25) << "quad precision achieved only " << err;
+}
+#endif
 
 } // namespace

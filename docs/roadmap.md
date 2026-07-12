@@ -1,8 +1,9 @@
 # libintti roadmap — M7 and beyond
 
-Status: `main` at `b70508f`, 55/55 tests, ERIs validated against PySCF to
-2.3×10⁻¹⁴. This document specifies the remaining milestones precisely enough
-for delegated implementation. **Ground rules for any implementer:**
+Status: M1–M9 delivered; CI green on GitHub. ERIs validated against
+PySCF/libcint to 2.3×10⁻¹⁴ (and an RHF driven entirely by libintti matches
+PySCF to 1.4×10⁻¹³ Ha). This document specifies the remaining milestones
+precisely enough for delegated implementation. **Ground rules for any implementer:**
 
 1. Every deliverable has a stated oracle (an existing reference the result
    must match). Failing the oracle means the implementation is wrong — do
@@ -62,7 +63,22 @@ retained below.
 - Oracle: distributed result equals the serial build bitwise (same
   summation order per owned block) or to 1e-15 if order differs.
 
-## M9 — batched interactions / per-(t,m) GEMM  [delegable: LOW — strong model]
+## M9 (delivered) — scalar generalization: GIAOs + quadruple precision
+
+Commits `f8d4fb3` (scalar/real split), `c3b304f` (GIAO), and the quadmath
+work. The scalar type is now separate from its real type; `kokkos_scalar_v`
+replaced `std::is_floating_point_v` as the execution dispatch (the latter is
+true for `__float128`, which Kokkos cannot handle, and false for
+`std::complex`). GIAO ERIs are `eri_quartet` on `std::complex`; quadruple
+precision is `__float128` behind `INTTI_ENABLE_QUADMATH`.
+
+Two traps recorded for whoever touches this next:
+- `Q(0.8)` rounds through *double* and silently caps quad precision at 1e-16.
+  Parse decimals straight into quad with `strtoflt128`.
+- `M_PIq` / `FLT128_EPSILON` are `Q`-suffixed literal macros that only
+  compile with GNU extensions; use `acosq(-1)` instead.
+
+## M10 — batched interactions / per-(t,m) GEMM  [delegable: LOW — strong model]
 
 Restructure `intti::interaction` (include/intti/product.hpp) for lists:
 all PSC products sharing a grid pair reuse the per-(t, m) kernel matrices,
@@ -71,7 +87,7 @@ structure demonstrated in docs/psc.md). Oracle: matches the scalar
 `interaction` to 1e-13; target ≥10× on a naux² PSC Gram matrix. Risk:
 memory/accuracy tradeoffs in kernel-matrix caching need judgment.
 
-## M10 — GPU enablement  [BLOCKED on hardware — do not attempt runtime claims here]
+## M11 — GPU enablement  [BLOCKED on hardware — do not attempt runtime claims here]
 
 Work: replace the per-thread stack arrays in the hot kernels (batch.hpp
 phase G, jbuild.hpp phase 2, kbuild.hpp — they currently size fixed arrays
@@ -93,7 +109,7 @@ work on a machine with a real discrete GPU. An Iris Xe via a SYCL backend
 would at best exercise the device code paths; it is not a meaningful
 performance target for J/K builds.
 
-## M11 — optimized quadrature tooling  [delegable: LOW — strong model]
+## M12 — optimized quadrature tooling  [delegable: LOW — strong model]
 
 Minimax/Beylkin–Monzón weights for the t kernels and STO Gaussian
 expansions, generated with the arbitrary-precision core (long double /
@@ -104,8 +120,19 @@ published Beylkin–Monzón rates.
 
 ## Standing items
 
-- Push to a remote; the GitHub CI (gcc/clang, OpenMP, ASan) has never run.
-- Even-tempered radial-grid shift optimization and the Graf addition
-  theorem for parallel-offset PSC axes: fold into M9's design review.
-- K from Cholesky vectors covers production exchange; kbuild.hpp remains
-  the exact reference path.
+- **No performance data exists.** The library is exhaustively verified for
+  correctness and has never been benchmarked against libcint. Its cost model
+  (64 t nodes per integral) may well make it *slower* than analytic codes for
+  plain GTO ERIs — in which case its value lies in what analytic codes cannot
+  do (mixed atomic/diatomic/3D representations, GIAOs without complex Boys
+  functions, local exchange energy densities). Benchmark before optimizing.
+- **The stated scientific goal is not served yet:** local exchange energy
+  densities for local hybrids, which motivated the whole design.
+- CI does not exercise the PySCF cross-validation or the MPI tests (neither
+  is installed on the runners); both are verified locally only.
+- Even-tempered radial-grid shift optimization and the Graf addition theorem
+  for parallel-offset PSC axes: fold into M10's design review.
+- K from Cholesky vectors covers production exchange; kbuild.hpp remains the
+  exact reference path.
+- Complex (GIAO) integrals currently run the serial host path only; batched
+  and J/K builds for complex densities are not implemented.

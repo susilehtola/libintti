@@ -7,6 +7,7 @@ project(intti VERSION 0.1.0
 option(INTTI_BUILD_TESTS "Build unit tests" ON)
 option(INTTI_ENABLE_MPI "Enable MPI support (placeholder, used from later milestones)" OFF)
 option(INTTI_ENABLE_CHOLESKY "Enable the Cholesky decomposition module (needs LAPACK)" ON)
+option(INTTI_ENABLE_QUADMATH "Enable __float128 support (needs libquadmath; GCC/clang)" OFF)
 
 # The libcint facade (intti_cint) is a shared library. When Kokkos is fetched
 # rather than found, it builds as a static archive, and linking a non-PIC
@@ -37,6 +38,14 @@ target_compile_features(intti INTERFACE cxx_std_20)
 if(INTTI_ENABLE_CHOLESKY)
   find_package(LAPACK REQUIRED)
   target_link_libraries(intti INTERFACE LAPACK::LAPACK)
+endif()
+
+if(INTTI_ENABLE_QUADMATH)
+  # __float128 has std::is_floating_point_v == true but Kokkos cannot handle
+  # it; traits.hpp routes it to the serial host path. libquadmath supplies
+  # expq/sqrtq/fabsq and M_PIq.
+  target_compile_definitions(intti INTERFACE INTTI_HAVE_QUADMATH)
+  target_link_libraries(intti INTERFACE quadmath)
 endif()
 
 if(INTTI_ENABLE_MPI)
