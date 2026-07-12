@@ -20,7 +20,9 @@ add_executable(intti_tests
   test_batch.cpp
   test_bessel.cpp
   test_interaction.cpp
-  test_jbuild.cpp)
+  test_jbuild.cpp
+  test_fock.cpp
+  test_c2s.cpp)
 if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_cholesky.cpp)
 endif()
