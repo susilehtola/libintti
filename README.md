@@ -99,6 +99,14 @@ Options: `INTTI_BUILD_TESTS` (default `ON`), `INTTI_ENABLE_MPI` (default
   atomic, diatomic, and 3D basis sets — is validated in
   `prototype/psc_validation.py` and documented in `docs/psc.md`; the C++
   interfaces are fixed in `include/intti/product.hpp` for M3.
+- **M3:** cross-representation interactions (`intti::interaction`): analytic
+  GTO pair products, prolate-spheroidal diatomic products (exact finite-m,
+  coaxial pairs coupled m-diagonally through scaled Bessel factors,
+  `include/intti/bessel.hpp`), and 3D tensor-grid products, in any pairing —
+  the bridge between atomic, diatomic, and 3D basis sets. Grid-represented
+  products enforce the truncated LinLog grid + delta tail regime, with t_c
+  bounded by the spatial resolution (see the spurious-diagonal-capture note
+  in `docs/psc.md`).
 
 ## License
 

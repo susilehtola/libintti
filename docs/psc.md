@@ -83,6 +83,24 @@ template for every GTO ↔ diatomic ↔ 3D-grid cross integral: the bra side is
 evaluated at whatever points (or Hermite expansions) the ket representation
 uses, at each t node.
 
+## Spurious diagonal capture (M3 finding)
+
+For **strongly overlapping** products there is a second failure mode of an
+over-ambitious t_c, found while testing the C++ implementation: once the
+kernel width 1/t falls below the node spacing, the discrete double sum over
+grid points degenerates to its near-diagonal terms and **spuriously captures
+the delta-function contribution** — the truncated quadrature then already
+contains (an uncontrolled approximation of) the tail, and adding the
+correction double-counts it. For separated products (S ≈ 0, the prototype
+case) this shows up as harmless non-monotonic noise; for overlapping
+products it is an O(π S/t_c²) error with the *correction applied*.
+
+Rule: **t_c must be small enough that the spatial grids resolve every
+retained t node** (t_c · h_min ≲ 1). Then the raw [0, t_c] sum is clean and
+the delta correction is exactly the missing tail. This is enforced by test
+(`Interaction.TailCorrectionMatters`) and must be respected by the automatic
+t_c heuristics when they land (M4): t_c from grid resolution, never larger.
+
 ## Consequences for M3
 
 - One code path (`intti::interaction` in include/intti/product.hpp) covers
