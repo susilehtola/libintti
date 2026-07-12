@@ -43,6 +43,21 @@ endif()
 if(INTTI_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+  add_executable(intti_dump_eri tools/dump_eri.cpp)
+  target_link_libraries(intti_dump_eri PRIVATE intti::intti)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_FOUND)
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pyscf"
+      RESULT_VARIABLE _pyscf_rc OUTPUT_QUIET ERROR_QUIET)
+    if(_pyscf_rc EQUAL 0)
+      add_test(NAME PySCFValidation
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/prototype/pyscf_validation.py
+                $<TARGET_FILE:intti_dump_eri> ${CMAKE_CURRENT_BINARY_DIR})
+      message(STATUS "PySCF found - cross-validation test enabled")
+    else()
+      message(STATUS "PySCF not found - cross-validation test skipped")
+    endif()
+  endif()
 endif()
 
 include(GNUInstallDirs)
