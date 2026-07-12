@@ -114,6 +114,12 @@ Options: `INTTI_BUILD_TESTS` (default `ON`), `INTTI_ENABLE_MPI` (default
   accumulation (`intti::eri_quartets_accumulate`) and automatic t_c
   selection (`intti::resolution_tc`, `intti::linlog_for`) enforcing the
   diagonal-capture rule.
+- **M5:** complete Fock builds at the shell/AO level (`intti::ShellBasis`,
+  `intti::coulomb_build`, `intti::exchange_build`) with Cauchy–Schwarz plus
+  density screening; the exchange contraction runs in the same Hermite
+  t-space organization with nothing materialized. Cartesian → real solid
+  harmonic transform (`intti::c2s_matrix`, exact Racah-recursion
+  construction, sphere-orthonormal rows) validated by rotational invariance.
 
 ## License
 
