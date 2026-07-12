@@ -32,11 +32,16 @@ inline constexpr int JLMAX = 8;
 /// components within (comp = ka*ncart(lb)+kb). Symmetry weighting of the
 /// density (x2 for off-diagonal AO pairs in a triangular pair list) is the
 /// caller's contract.
+/// Optional screening: pass per-pair Schwarz factors Q and ket bounds
+/// bound[q] = Q_q * max|D_q|; ket pairs with Q_p * bound[q] < tau are
+/// skipped (tau = 0 or null pointers disable screening).
 template <class Real>
 void coulomb_build(const PairTable<Real> &pairs, const Real *D,
-                   const TGrid<Real> &grid, Real *J) {
+                   const TGrid<Real> &grid, Real *J, const Real *Q = nullptr,
+                   const Real *bound = nullptr, Real tau = Real(0)) {
   static_assert(std::is_floating_point_v<Real>,
                 "coulomb_build requires a builtin floating-point type in M4");
+  const bool screen = tau > Real(0) && Q != nullptr && bound != nullptr;
   const int npair = pairs.npair;
   const int nt = grid.n();
   const Real pi = pi_v<Real>();
@@ -71,6 +76,18 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
     Kokkos::deep_copy(prodv, hp);
     Kokkos::deep_copy(hoffv, hh);
     Kokkos::deep_copy(Dv, hD);
+  }
+  Kokkos::View<Real *> Qv("intti::j::Q", screen ? npair : 1);
+  Kokkos::View<Real *> bv("intti::j::bound", screen ? npair : 1);
+  if (screen) {
+    auto hQ = Kokkos::create_mirror_view(Qv);
+    auto hb = Kokkos::create_mirror_view(bv);
+    for (int ip = 0; ip < npair; ++ip) {
+      hQ(ip) = Q[ip];
+      hb(ip) = bound[ip];
+    }
+    Kokkos::deep_copy(Qv, hQ);
+    Kokkos::deep_copy(bv, hb);
   }
   auto lav = pairs.la;
   auto lbv = pairs.lb;
@@ -117,6 +134,7 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
           jp(joff + i) = 0;
         const Real pp = pv(p);
         for (int q = 0; q < npair; ++q) {
+          if (screen && Qv(p) * bv(q) < tau) continue;
           const int Lq = lav(q) + lbv(q), nq1 = Lq + 1;
           const int doff = hoffv(q);
           const Real pq = pv(q);
