@@ -51,4 +51,21 @@ template <class Real> Real cart_norm_pyscf(int l, Real alpha) {
   return cart_norm_cca<Real>(l, alpha) * sqrt(4 * pi / (2 * l + 1));
 }
 
+/// Rescale from intti's c2s_matrix(l) rows (include/intti/c2s.hpp;
+/// sphere-orthonormal, m = -l..+l) to libcint's int2e_sph row convention,
+/// pinned empirically by prototype/pyscf_validation.py (see
+/// docs/conventions.md): for l <= 1, libcint's spherical AOs coincide
+/// exactly with the (cart_norm_pyscf-normalized) Cartesian ones -- same
+/// functions, same order (x, y, z for l = 1), so a c2s row permutation
+/// would be needed on top of a scale factor and the facade bypasses
+/// c2s_matrix entirely for these shells (factor 1, unused). For l >= 2 the
+/// row order already matches m = -l..+l and the rescale is a single
+/// l-independent constant, 1/sqrt(4 pi), confirmed to 1e-15 relative
+/// deviation against PySCF's int2e_sph for l = 2, 3.
+template <class Real> Real sph_rescale(int l) {
+  using std::sqrt;
+  if (l <= 1) return Real(1);
+  return 1 / sqrt(4 * pi_v<Real>());
+}
+
 } // namespace intti
