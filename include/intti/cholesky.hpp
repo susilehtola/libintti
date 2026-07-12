@@ -34,6 +34,9 @@ template <class Real> struct CholeskyBasis {
   int nprod{0}, naux{0};
   /// Cholesky vectors, column-major (nprod x naux), host
   Kokkos::View<Real **, Kokkos::LayoutLeft, Kokkos::HostSpace> L;
+  /// shell indices (i, j) of each pair; set by the ShellBasis-level overload
+  /// (cdjk.hpp) and required by cholesky_jk
+  std::vector<std::pair<int, int>> pair_shells;
 };
 
 template <class Real> struct CholeskyOptions {

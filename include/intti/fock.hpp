@@ -34,6 +34,23 @@ ShellBasis<Real> make_basis(std::vector<PrimitiveShell<Real>> shells) {
   return b;
 }
 
+/// Triangular shell-pair list of a basis, plus the (i, j) shell indices of
+/// each pair (the row bookkeeping shared by the AO-level builders and the
+/// Cholesky unpacking).
+template <class Real>
+void make_shell_pairs(const ShellBasis<Real> &basis,
+                      std::vector<ShellPair<Real>> &plist,
+                      std::vector<std::pair<int, int>> &pshell) {
+  const int ns = static_cast<int>(basis.shells.size());
+  plist.clear();
+  pshell.clear();
+  for (int i = 0; i < ns; ++i)
+    for (int j = i; j < ns; ++j) {
+      plist.push_back(make_pair(basis.shells[i], basis.shells[j]));
+      pshell.push_back({i, j});
+    }
+}
+
 /// Cauchy-Schwarz factors Q_p = sqrt(max_comp (p_comp | p_comp)) per pair,
 /// from one batched diagonal call.
 template <class Real>
@@ -71,14 +88,9 @@ std::vector<Real> schwarz(const PairTable<Real> &pairs,
 template <class Real>
 void coulomb_build(const ShellBasis<Real> &basis, const Real *D,
                    const TGrid<Real> &grid, Real *J, Real tau = Real(0)) {
-  const int ns = static_cast<int>(basis.shells.size());
   std::vector<ShellPair<Real>> plist;
   std::vector<std::pair<int, int>> pshell;
-  for (int i = 0; i < ns; ++i)
-    for (int j = i; j < ns; ++j) {
-      plist.push_back(make_pair(basis.shells[i], basis.shells[j]));
-      pshell.push_back({i, j});
-    }
+  make_shell_pairs(basis, plist, pshell);
   auto tab = make_pair_table(plist);
   const int npair = tab.npair;
   // pair-product density with the symmetry fold (D_ij + D_ji off-diagonal)
