@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 Susi Lehtola
+
+#include <cmath>
+#include <random>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "intti/fock.hpp"
+#include "intti/quartet.hpp"
+
+namespace {
+
+using Shell = intti::PrimitiveShell<double>;
+
+intti::ShellBasis<double> test_basis() {
+  return intti::make_basis<double>({
+      {1.2, {0.0, 0.0, 0.0}, 0},
+      {0.3, {0.0, 0.0, 0.0}, 0},
+      {0.8, {0.0, 0.0, 0.0}, 1},
+      {1.5, {0.0, 0.0, 1.4}, 0},
+      {0.5, {0.0, 0.0, 1.4}, 1},
+      {0.9, {0.0, 0.0, 1.4}, 2},
+  });
+}
+
+std::vector<double> random_symmetric(int n, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  std::vector<double> D(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j <= i; ++j)
+      D[i * n + j] = D[j * n + i] = u(rng);
+  return D;
+}
+
+// dense references from explicit quartets on the same grid
+void dense_jk(const intti::ShellBasis<double> &b, const std::vector<double> &D,
+              const intti::TGrid<double> &grid, std::vector<double> &J,
+              std::vector<double> &K) {
+  const int ns = static_cast<int>(b.shells.size()), nao = b.nao;
+  J.assign(static_cast<std::size_t>(nao) * nao, 0.0);
+  K.assign(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int i = 0; i < ns; ++i)
+    for (int j = 0; j < ns; ++j)
+      for (int k = 0; k < ns; ++k)
+        for (int l = 0; l < ns; ++l) {
+          const auto bra = intti::make_pair(b.shells[i], b.shells[j]);
+          const auto ket = intti::make_pair(b.shells[k], b.shells[l]);
+          const int na = intti::ncart(b.shells[i].l), nb = intti::ncart(b.shells[j].l);
+          const int nc = intti::ncart(b.shells[k].l), nd = intti::ncart(b.shells[l].l);
+          std::vector<double> block(na * nb * nc * nd);
+          intti::eri_quartet(bra, ket, grid, block.data());
+          for (int ka = 0; ka < na; ++ka)
+            for (int kb = 0; kb < nb; ++kb)
+              for (int kc = 0; kc < nc; ++kc)
+                for (int kd = 0; kd < nd; ++kd) {
+                  const double v =
+                      block[((ka * nb + kb) * nc + kc) * nd + kd];
+                  const int A = b.ao_off[i] + ka, B = b.ao_off[j] + kb;
+                  const int C = b.ao_off[k] + kc, E = b.ao_off[l] + kd;
+                  // J_AB += D_CE (AB|CE); for K relabel (ac|bd) = (AB|CE)
+                  // with a=A, c=B, b=C, d=E: K_AC += D_BE (AB|CE)
+                  J[A * b.nao + B] += D[C * b.nao + E] * v;
+                  K[A * b.nao + C] += D[B * b.nao + E] * v;
+                }
+        }
+}
+
+double max_abs_diff(const std::vector<double> &a, const std::vector<double> &b) {
+  double m = 0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    m = std::max(m, std::abs(a[i] - b[i]));
+  return m;
+}
+
+double max_abs(const std::vector<double> &a) {
+  double m = 0;
+  for (double v : a)
+    m = std::max(m, std::abs(v));
+  return m;
+}
+
+TEST(Fock, CoulombMatchesDense) {
+  auto b = test_basis();
+  auto D = random_symmetric(b.nao, 5);
+  for (bool linlog : {false, true}) {
+    intti::TGridSpec<double> spec;
+    if (linlog) spec.mapping = intti::TMapping::LinLog;
+    auto grid = intti::make_tgrid(intti::coulomb(), spec);
+    std::vector<double> J(static_cast<std::size_t>(b.nao) * b.nao);
+    intti::coulomb_build(b, D.data(), grid, J.data());
+    std::vector<double> Jref, Kref;
+    dense_jk(b, D, grid, Jref, Kref);
+    EXPECT_LT(max_abs_diff(J, Jref), 1e-12 * max_abs(Jref)) << "linlog=" << linlog;
+  }
+}
+
+TEST(Fock, ExchangeMatchesDense) {
+  auto b = test_basis();
+  auto D = random_symmetric(b.nao, 7);
+  for (bool linlog : {false, true}) {
+    intti::TGridSpec<double> spec;
+    if (linlog) spec.mapping = intti::TMapping::LinLog;
+    auto grid = intti::make_tgrid(intti::coulomb(), spec);
+    std::vector<double> K(static_cast<std::size_t>(b.nao) * b.nao);
+    intti::exchange_build(b, D.data(), grid, K.data(), 0.0);
+    std::vector<double> Jref, Kref;
+    dense_jk(b, D, grid, Jref, Kref);
+    EXPECT_LT(max_abs_diff(K, Kref), 1e-12 * max_abs(Kref)) << "linlog=" << linlog;
+  }
+}
+
+TEST(Fock, ScreeningIsControlled) {
+  auto b = test_basis();
+  auto D = random_symmetric(b.nao, 11);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const std::size_t n2 = static_cast<std::size_t>(b.nao) * b.nao;
+  std::vector<double> J0(n2), J1(n2), K0(n2), K1(n2);
+  intti::coulomb_build(b, D.data(), grid, J0.data());
+  intti::coulomb_build(b, D.data(), grid, J1.data(), 1e-10);
+  intti::exchange_build(b, D.data(), grid, K0.data(), 0.0);
+  intti::exchange_build(b, D.data(), grid, K1.data(), 1e-10);
+  EXPECT_LT(max_abs_diff(J0, J1), 1e-8 * max_abs(J0));
+  EXPECT_LT(max_abs_diff(K0, K1), 1e-8 * max_abs(K0));
+}
+
+TEST(Fock, SymmetricDensityGivesSymmetricJK) {
+  auto b = test_basis();
+  auto D = random_symmetric(b.nao, 13);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const std::size_t n2 = static_cast<std::size_t>(b.nao) * b.nao;
+  std::vector<double> J(n2), K(n2);
+  intti::coulomb_build(b, D.data(), grid, J.data());
+  intti::exchange_build(b, D.data(), grid, K.data(), 0.0);
+  double asymJ = 0, asymK = 0;
+  for (int i = 0; i < b.nao; ++i)
+    for (int j = 0; j < b.nao; ++j) {
+      asymJ = std::max(asymJ, std::abs(J[i * b.nao + j] - J[j * b.nao + i]));
+      asymK = std::max(asymK, std::abs(K[i * b.nao + j] - K[j * b.nao + i]));
+    }
+  EXPECT_LT(asymJ, 1e-12 * max_abs(J));
+  EXPECT_LT(asymK, 1e-12 * max_abs(K));
+}
+
+} // namespace

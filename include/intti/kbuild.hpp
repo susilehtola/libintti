@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 Susi Lehtola
+#pragma once
+
+// Exchange (K) matrix build in Hermite t-space. Unlike the Coulomb build,
+// the density indices straddle the two pairs (K_ab = sum_cd D_cd (ac|bd)),
+// so there is no pair-local pre-contraction: the cost is that of screened
+// on-the-fly quartet evaluation, organized pairwise so that the E tables and
+// B_n arrays are shared and nothing is materialized. Cauchy-Schwarz plus
+// density screening is what makes this tractable.
+
+#include <stdexcept>
+#include <type_traits>
+#include <vector>
+
+#include "batch.hpp"
+#include "gto.hpp"
+#include "hermite1d.hpp"
+#include "tgrid.hpp"
+
+namespace intti {
+
+/// Maximum shell angular momentum supported by the exchange-build stack
+/// buffers.
+inline constexpr int KLMAX = 4;
+
+namespace detail {
+/// forward declaration; defined in fock.hpp
+}
+
+template <class Real> struct ShellBasis;
+
+/// K_{a ka, b kb} = sum_{c kc, d kd} D_{c kc, d kd} (a ka, c kc | b kb, d kd).
+/// D and K are nao x nao row-major Cartesian AO matrices. Pairs (a c) and
+/// (b d) with Q_ac Q_bd max|D_cd| < tau are skipped.
+template <class Real>
+void exchange_build(const ShellBasis<Real> &basis, const Real *D,
+                    const TGrid<Real> &grid, Real *K, Real tau = Real(1e-12));
+
+namespace detail {
+
+template <class Real>
+void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
+                         const std::vector<int> &ao_off, int nao, const Real *D,
+                         const TGrid<Real> &grid, Real *K, Real tau,
+                         const std::vector<Real> &Qex,
+                         const PairTable<Real> &tab) {
+  static_assert(std::is_floating_point_v<Real>,
+                "exchange_build requires a builtin floating-point type in M5");
+  const int ns = static_cast<int>(shells.size());
+  const int nt = grid.n();
+  const Real pi = pi_v<Real>();
+  const Real tail_coeff = grid.tail_coeff;
+
+  for (const auto &sh : shells)
+    if (sh.l > KLMAX)
+      throw std::invalid_argument("exchange_build: shell angular momentum exceeds KLMAX");
+
+  // per-(c,d) shell-block density maxima for screening
+  std::vector<Real> maxD(static_cast<std::size_t>(ns) * ns, Real(0));
+  for (int c = 0; c < ns; ++c)
+    for (int d = 0; d < ns; ++d) {
+      Real m = 0;
+      for (int kc = 0; kc < ncart(shells[c].l); ++kc)
+        for (int kd = 0; kd < ncart(shells[d].l); ++kd) {
+          const Real v = D[(ao_off[c] + kc) * nao + ao_off[d] + kd];
+          const Real a = v < 0 ? -v : v;
+          if (a > m) m = a;
+        }
+      maxD[c * ns + d] = m;
+    }
+
+  // stage everything on device
+  Kokkos::View<Real *> Dv("intti::k::D", static_cast<std::size_t>(nao) * nao);
+  Kokkos::View<Real *> Kv("intti::k::K", static_cast<std::size_t>(nao) * nao);
+  Kokkos::View<Real *> Qv("intti::k::Q", Qex.size());
+  Kokkos::View<Real *> mDv("intti::k::maxD", maxD.size());
+  Kokkos::View<int *> aov("intti::k::ao", ns + 1), lv("intti::k::l", ns);
+  {
+    auto hD = Kokkos::create_mirror_view(Dv);
+    auto hQ = Kokkos::create_mirror_view(Qv);
+    auto hm = Kokkos::create_mirror_view(mDv);
+    auto ha = Kokkos::create_mirror_view(aov);
+    auto hl = Kokkos::create_mirror_view(lv);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(nao) * nao; ++i)
+      hD(i) = D[i];
+    for (std::size_t i = 0; i < Qex.size(); ++i)
+      hQ(i) = Qex[i];
+    for (std::size_t i = 0; i < maxD.size(); ++i)
+      hm(i) = maxD[i];
+    for (int i = 0; i <= ns; ++i)
+      ha(i) = ao_off[i];
+    for (int i = 0; i < ns; ++i)
+      hl(i) = shells[i].l;
+    Kokkos::deep_copy(Dv, hD);
+    Kokkos::deep_copy(Qv, hQ);
+    Kokkos::deep_copy(mDv, hm);
+    Kokkos::deep_copy(aov, ha);
+    Kokkos::deep_copy(lv, hl);
+  }
+  Kokkos::deep_copy(Kv, Real(0));
+  auto pv = tab.p;
+  auto Pv = tab.P;
+  auto eoffv = tab.e_off;
+  auto Ev = tab.E;
+  auto tv = grid.t_dev;
+  auto wv = grid.w_dev;
+
+  constexpr int KC1 = KLMAX + 1;
+  constexpr int KNC = (KLMAX + 1) * (KLMAX + 2) / 2;
+
+  Kokkos::parallel_for(
+      "intti::k::build", Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {ns, ns}),
+      KOKKOS_LAMBDA(int a, int b) {
+        const int la = lv(a), lb = lv(b);
+        const int nca = ncart(la), ncb = ncart(lb);
+        Real Kblk[KNC * KNC];
+        for (int i = 0; i < nca * ncb; ++i)
+          Kblk[i] = 0;
+        int a3s[KNC][3], b3s[KNC][3];
+        for (int k = 0; k < nca; ++k)
+          cart_comp(la, k, a3s[k][0], a3s[k][1], a3s[k][2]);
+        for (int k = 0; k < ncb; ++k)
+          cart_comp(lb, k, b3s[k][0], b3s[k][1], b3s[k][2]);
+        for (int c = 0; c < ns; ++c) {
+          const int lc = lv(c), ncc = ncart(lc);
+          const int p = a * ns + c;
+          int c3s[KNC][3];
+          for (int k = 0; k < ncc; ++k)
+            cart_comp(lc, k, c3s[k][0], c3s[k][1], c3s[k][2]);
+          for (int d = 0; d < ns; ++d) {
+            const int q = b * ns + d;
+            if (Qv(p) * Qv(q) * mDv(c * ns + d) < tau) continue;
+            const int ld = lv(d), ncd = ncart(ld);
+            int d3s[KNC][3];
+            for (int k = 0; k < ncd; ++k)
+              cart_comp(ld, k, d3s[k][0], d3s[k][1], d3s[k][2]);
+            const Real pp = pv(p), pq = pv(q);
+            Real X[3];
+            for (int dd = 0; dd < 3; ++dd)
+              X[dd] = Pv(p, dd) - Pv(q, dd);
+            const int np_e = la + lc + 1, nq_e = lb + ld + 1;
+            const int eszp = (la + 1) * (lc + 1) * np_e;
+            const int eszq = (lb + 1) * (ld + 1) * nq_e;
+            const int nB = np_e + nq_e - 1;
+            const int nsweep = tail_coeff != Real(0) ? nt + 1 : nt;
+            for (int it = 0; it < nsweep; ++it) {
+              Real theta, wt, prefd;
+              if (it < nt) {
+                const Real t = tv(it);
+                const Real Dden = pp * pq + t * t * (pp + pq);
+                theta = t * t * pp * pq / Dden;
+                prefd = pi / sqrt_(Dden);
+                wt = wv(it);
+              } else {
+                theta = pp * pq / (pp + pq);
+                prefd = sqrt_(pi / (pp + pq));
+                wt = tail_coeff;
+              }
+              // per-direction pair-pair 1D integrals over all component combos
+              Real g[3][KC1 * KC1 * KC1 * KC1];
+              Real B[4 * KLMAX + 1];
+              for (int dd = 0; dd < 3; ++dd) {
+                hermite_b(nB - 1, theta, X[dd], B);
+                const Real *Ep = &Ev(eoffv(p) + dd * eszp);
+                const Real *Eq = &Ev(eoffv(q) + dd * eszq);
+                for (int ia = 0; ia <= la; ++ia)
+                  for (int ic = 0; ic <= lc; ++ic)
+                    for (int ib = 0; ib <= lb; ++ib)
+                      for (int id = 0; id <= ld; ++id) {
+                        Real s = 0;
+                        for (int t = 0; t <= ia + ic; ++t) {
+                          const Real ep = Ep[(ia * (lc + 1) + ic) * np_e + t];
+                          for (int u = 0; u <= ib + id; ++u) {
+                            const Real term = ep * Eq[(ib * (ld + 1) + id) * nq_e + u] *
+                                              B[t + u];
+                            s += u % 2 ? -term : term;
+                          }
+                        }
+                        g[dd][((ia * (lc + 1) + ic) * (lb + 1) + ib) * (ld + 1) + id] =
+                            prefd * s;
+                      }
+              }
+              // contract with the density block
+              for (int ka = 0; ka < nca; ++ka)
+                for (int kb = 0; kb < ncb; ++kb) {
+                  Real s = 0;
+                  for (int kc = 0; kc < ncc; ++kc)
+                    for (int kd = 0; kd < ncd; ++kd) {
+                      Real v = wt;
+                      for (int dd = 0; dd < 3; ++dd)
+                        v *= g[dd][((a3s[ka][dd] * (lc + 1) + c3s[kc][dd]) * (lb + 1) +
+                                    b3s[kb][dd]) *
+                                       (ld + 1) +
+                                   d3s[kd][dd]];
+                      s += Dv((aov(c) + kc) * nao + aov(d) + kd) * v;
+                    }
+                  Kblk[ka * ncb + kb] += s;
+                }
+            }
+          }
+        }
+        for (int ka = 0; ka < nca; ++ka)
+          for (int kb = 0; kb < ncb; ++kb)
+            Kv((aov(a) + ka) * nao + aov(b) + kb) = Kblk[ka * ncb + kb];
+      });
+
+  auto hK = Kokkos::create_mirror_view(Kv);
+  Kokkos::deep_copy(hK, Kv);
+  for (std::size_t i = 0; i < static_cast<std::size_t>(nao) * nao; ++i)
+    K[i] = hK(i);
+}
+
+} // namespace detail
+
+} // namespace intti
