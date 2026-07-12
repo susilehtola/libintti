@@ -82,6 +82,72 @@ TEST(Batch, WorkspaceIsReused) {
   }
 }
 
+TEST(Batch, AccumulateContractedBlock) {
+  // 2-primitive contracted s and p shells: the contracted (AB|CD) block is
+  // one accumulating batch over the 16 primitive quartets
+  const double cA[3] = {0.0, 0.1, -0.3}, cB[3] = {0.5, -0.2, 0.4};
+  const double cC[3] = {1.0, 0.8, 0.0}, cD[3] = {-0.4, 0.3, 1.1};
+  const double za[2] = {0.8, 2.4}, ca[2] = {0.6, 0.5};
+  const double zb[2] = {1.3, 0.4}, cb[2] = {0.7, 0.4};
+  const double zc[2] = {2.1, 0.9}, cc[2] = {0.5, 0.6};
+  const double zd[2] = {0.35, 1.7}, cd[2] = {0.8, 0.3};
+  const int la = 1, lb = 0, lc = 1, ld = 0; // (pp|ss)-like block, 9 values
+  std::vector<intti::ShellPair<double>> bra_pairs, ket_pairs;
+  std::vector<double> bra_c, ket_c;
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 2; ++j) {
+      bra_pairs.push_back(intti::make_pair(Shell{za[i], {cA[0], cA[1], cA[2]}, la},
+                                           Shell{zb[j], {cB[0], cB[1], cB[2]}, lb}));
+      bra_c.push_back(ca[i] * cb[j]);
+      ket_pairs.push_back(intti::make_pair(Shell{zc[i], {cC[0], cC[1], cC[2]}, lc},
+                                           Shell{zd[j], {cD[0], cD[1], cD[2]}, ld}));
+      ket_c.push_back(cc[i] * cd[j]);
+    }
+  auto all_pairs = bra_pairs;
+  all_pairs.insert(all_pairs.end(), ket_pairs.begin(), ket_pairs.end());
+  auto tab = intti::make_pair_table(all_pairs);
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<double> coeff;
+  for (int ib = 0; ib < 4; ++ib)
+    for (int ik = 0; ik < 4; ++ik) {
+      quartets.push_back({ib, 4 + ik});
+      coeff.push_back(bra_c[ib] * ket_c[ik]);
+    }
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto batch = intti::make_batch(tab, quartets);
+  const int nout = 9;
+  Kokkos::View<double *> out("out", nout);
+  Kokkos::View<double *> cv("coeff", quartets.size());
+  Kokkos::View<int *> seg("seg", quartets.size());
+  {
+    auto hc = Kokkos::create_mirror_view(cv);
+    auto hs = Kokkos::create_mirror_view(seg);
+    for (std::size_t iq = 0; iq < quartets.size(); ++iq) {
+      hc(iq) = coeff[iq];
+      hs(iq) = 0; // all primitives accumulate into the single contracted block
+    }
+    Kokkos::deep_copy(cv, hc);
+    Kokkos::deep_copy(seg, hs);
+  }
+  intti::QuartetWorkspace<double> ws;
+  intti::eri_quartets_accumulate<double>(tab, batch, cv, seg, grid, out, ws);
+  auto oh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, out);
+  // reference: explicit weighted primitive sum
+  std::vector<double> ref(nout, 0.0);
+  for (std::size_t iq = 0; iq < quartets.size(); ++iq) {
+    double buf[nout];
+    intti::eri_quartet(all_pairs[quartets[iq].first], all_pairs[quartets[iq].second],
+                       grid, buf);
+    for (int k = 0; k < nout; ++k)
+      ref[k] += coeff[iq] * buf[k];
+  }
+  double scale = 0.0;
+  for (int k = 0; k < nout; ++k)
+    scale = std::max(scale, std::abs(ref[k]));
+  for (int k = 0; k < nout; ++k)
+    EXPECT_NEAR(oh(k), ref[k], 1e-13 * scale) << "component " << k;
+}
+
 TEST(Batch, LinLogGridWithTail) {
   // batched driver must apply the delta-function tail exactly like the
   // single-quartet driver on truncated grids

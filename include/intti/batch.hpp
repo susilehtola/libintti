@@ -164,12 +164,15 @@ template <class Real> struct QuartetWorkspace {
   }
 };
 
-/// Batched primitive Cartesian ERI quartets. out must have batch.nout_total
-/// entries; quartet iq's components are at [out_offset(iq), out_offset(iq+1)).
-template <class Real>
-void eri_quartets(const PairTable<Real> &pairs, const QuartetBatch<Real> &batch,
-                  const TGrid<Real> &grid, Kokkos::View<Real *> out,
-                  QuartetWorkspace<Real> &ws) {
+namespace detail {
+
+/// Shared body of the batched drivers. Accumulate=false: out(offset+k) = val;
+/// Accumulate=true: out(segment(iq)+k) += coeff(iq)*val (atomic).
+template <class Real, bool Accumulate>
+void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &batch,
+                       const TGrid<Real> &grid, Kokkos::View<Real *> out,
+                       QuartetWorkspace<Real> &ws, Kokkos::View<const Real *> coeff,
+                       Kokkos::View<const int *> segment) {
   static_assert(std::is_floating_point_v<Real>,
                 "batched driver requires a builtin floating-point type; use "
                 "eri_quartet() for class-type scalars");
@@ -308,10 +311,38 @@ void eri_quartets(const PairTable<Real> &pairs, const QuartetBatch<Real> &batch,
               val += tail_coeff * s1(cmb[0], 3 * jq) * s1(cmb[1], 3 * jq + 1) *
                      s1(cmb[2], 3 * jq + 2);
           }
-          out(offv(q0 + jq) + k) = val;
+          if constexpr (Accumulate)
+            Kokkos::atomic_add(&out(segment(q0 + jq) + k), coeff(q0 + jq) * val);
+          else
+            out(offv(q0 + jq) + k) = val;
         });
   }
   Kokkos::fence();
+}
+
+} // namespace detail
+
+/// Batched primitive Cartesian ERI quartets. out must have batch.nout_total
+/// entries; quartet iq's components are at [out_offset(iq), out_offset(iq+1)).
+template <class Real>
+void eri_quartets(const PairTable<Real> &pairs, const QuartetBatch<Real> &batch,
+                  const TGrid<Real> &grid, Kokkos::View<Real *> out,
+                  QuartetWorkspace<Real> &ws) {
+  detail::eri_quartets_impl<Real, false>(pairs, batch, grid, out, ws, {}, {});
+}
+
+/// Accumulating variant for contractions: out(segment(iq) + k) +=
+/// coeff(iq) * quartet(iq, k). Quartets sharing a segment must share their
+/// (la, lb, lc, ld) class; a contracted ERI block is one batch over the
+/// primitive product list with coefficient products as coeff.
+template <class Real>
+void eri_quartets_accumulate(const PairTable<Real> &pairs,
+                             const QuartetBatch<Real> &batch,
+                             Kokkos::View<const Real *> coeff,
+                             Kokkos::View<const int *> segment,
+                             const TGrid<Real> &grid, Kokkos::View<Real *> out,
+                             QuartetWorkspace<Real> &ws) {
+  detail::eri_quartets_impl<Real, true>(pairs, batch, grid, out, ws, coeff, segment);
 }
 
 } // namespace intti
