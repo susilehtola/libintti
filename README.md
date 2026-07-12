@@ -1,5 +1,7 @@
 # libintti
 
+<img src="assets/logo.svg" alt="libintti logo" width="180" align="right"/>
+
 Efficient quadrature code for tensor expressions in quantum chemistry.
 
 (*intti* is Finnish slang for the army; the integral is what the author did
