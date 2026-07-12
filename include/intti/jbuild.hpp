@@ -46,8 +46,8 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
                    const TGrid<Real> &grid, Real *J, const Real *Q = nullptr,
                    const Real *bound = nullptr, Real tau = Real(0),
                    int rank = 0, int nranks = 1) {
-  static_assert(std::is_floating_point_v<Real>,
-                "coulomb_build requires a builtin floating-point type in M4");
+  static_assert(kokkos_scalar_v<Real>,
+                "coulomb_build requires float, double or long double");
   const bool screen = tau > Real(0) && Q != nullptr && bound != nullptr;
   const int npair = pairs.npair;
   const int nt = grid.n();

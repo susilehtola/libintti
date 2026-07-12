@@ -210,7 +210,7 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
   }
 
   // device copies for builtin floating-point types
-  if constexpr (std::is_floating_point_v<Real>) {
+  if constexpr (kokkos_scalar_v<Real>) {
     grid.t_dev = Kokkos::View<Real *>("intti::tgrid::t", grid.t.size());
     grid.w_dev = Kokkos::View<Real *>("intti::tgrid::w", grid.w.size());
     auto th = Kokkos::create_mirror_view(grid.t_dev);

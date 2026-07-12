@@ -5,6 +5,7 @@
 #include <Kokkos_Core.hpp>
 
 #include "math.hpp"
+#include "traits.hpp"
 
 namespace intti {
 
@@ -42,27 +43,37 @@ template <class Real = double> struct PrimitiveShell {
 /// Gaussian-product-theorem data for a shell pair. This is the reuse unit of
 /// the library: per-(pair, t) intermediates are shared across all quartets in
 /// later J/K builds, so all integral drivers consume ShellPairs, never shells.
-template <class Real = double> struct ShellPair {
-  Real p;    ///< alpha + beta
-  Real P[3]; ///< product center (alpha A + beta B)/p
-  Real K[3]; ///< per-direction prefactor exp(-alpha beta/p (A_d - B_d)^2)
-  Real A[3], B[3];
+///
+/// The exponent p and the shell centres A, B are always REAL. The product
+/// centre P and the prefactor K carry the scalar type, which is complex for
+/// GIAOs (giao.hpp): multiplying a Gaussian by the London plane wave shifts
+/// its centre into the complex plane but leaves its exponent alone. Every
+/// downstream quantity built from exponents only (D, theta, rho, the
+/// pi/sqrt(D) prefactors) therefore stays real.
+template <class Scalar = double> struct ShellPair {
+  using R = real_t<Scalar>;
+  R p;         ///< alpha + beta
+  Scalar P[3]; ///< product centre (alpha A + beta B)/p, complex for GIAOs
+  Scalar K[3]; ///< per-direction prefactor, complex for GIAOs
+  R A[3], B[3];
   int la, lb;
 };
 
 /// Value of one Cartesian component (ka, kb) of a pair product at point r,
 /// via the Gaussian product theorem (only ShellPair data needed):
 ///   prod_d (r_d-A_d)^{a_d} (r_d-B_d)^{b_d} K_d exp(-p (r_d-P_d)^2).
-template <class Real>
-KOKKOS_INLINE_FUNCTION Real pair_component_value(const ShellPair<Real> &sp, int ka,
-                                                 int kb, const Real *r) {
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION Scalar pair_component_value(const ShellPair<Scalar> &sp, int ka,
+                                                   int kb, const real_t<Scalar> *r) {
+  using R = real_t<Scalar>;
   int a3[3], b3[3];
   cart_comp(sp.la, ka, a3[0], a3[1], a3[2]);
   cart_comp(sp.lb, kb, b3[0], b3[1], b3[2]);
-  Real val = 1;
+  Scalar val = Scalar(1);
   for (int d = 0; d < 3; ++d) {
-    const Real dA = r[d] - sp.A[d], dB = r[d] - sp.B[d], dP = r[d] - sp.P[d];
-    Real f = sp.K[d] * exp_(-sp.p * dP * dP);
+    const R dA = r[d] - sp.A[d], dB = r[d] - sp.B[d];
+    const Scalar dP = r[d] - sp.P[d];
+    Scalar f = sp.K[d] * exp_(Scalar(-sp.p * dP * dP));
     for (int j = 0; j < a3[d]; ++j)
       f *= dA;
     for (int j = 0; j < b3[d]; ++j)
@@ -74,6 +85,7 @@ KOKKOS_INLINE_FUNCTION Real pair_component_value(const ShellPair<Real> &sp, int 
 
 template <class Real>
 ShellPair<Real> make_pair(const PrimitiveShell<Real> &a, const PrimitiveShell<Real> &b) {
+  static_assert(!is_complex_v<Real>, "make_pair takes real shells; see make_giao_pair");
   ShellPair<Real> sp;
   sp.p = a.alpha + b.alpha;
   const Real mu = a.alpha * b.alpha / sp.p;

@@ -53,7 +53,7 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
                          const std::vector<Real> &Qex,
                          const PairTable<Real> &tab, int rank = 0,
                          int nranks = 1) {
-  static_assert(std::is_floating_point_v<Real>,
+  static_assert(kokkos_scalar_v<Real>,
                 "exchange_build requires a builtin floating-point type in M5");
   const int ns = static_cast<int>(shells.size());
   const int nt = grid.n();

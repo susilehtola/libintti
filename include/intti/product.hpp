@@ -266,7 +266,7 @@ void cloud_cloud_sums(const Cloud<Real> &a, const Cloud<Real> &b,
   const int nt = grid.n();
   quad = 0;
   kref = 0;
-  if constexpr (std::is_floating_point_v<Real>) {
+  if constexpr (kokkos_scalar_v<Real>) {
     Kokkos::View<Real *> pa("pa", 3 * na), pb("pb", 3 * nb), ga("ga", na), gb("gb", nb);
     Kokkos::View<Real *> tv("tv", nt), wv("wv", nt);
     auto ha = Kokkos::create_mirror_view(pa);
@@ -429,7 +429,7 @@ void psc_coaxial_sums(const PSCProduct<Real> &f, const PSCProduct<Real> &g,
   };
   quad = 0;
   kref = 0;
-  if constexpr (std::is_floating_point_v<Real>) {
+  if constexpr (kokkos_scalar_v<Real>) {
     const int mmax1 = f.mmax, mmax2 = g.mmax;
     Kokkos::View<Real *> z1v("z1", nn1), r1v("r1", nn1), w1v("w1", nn1);
     Kokkos::View<Real *> z2v("z2", nn2), r2v("r2", nn2), w2v("w2", nn2);

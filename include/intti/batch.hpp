@@ -21,8 +21,8 @@ namespace intti {
 /// class-type scalars (arbitrary precision) use the single-quartet
 /// eri_quartet() host path instead.
 template <class Real> struct PairTable {
-  static_assert(std::is_floating_point_v<Real>,
-                "PairTable requires a builtin floating-point type");
+  static_assert(kokkos_scalar_v<Real>,
+                "PairTable requires float, double or long double; complex and __float128 scalars use the serial eri_quartet() path");
   int npair{0};
   Kokkos::View<Real *> p;                          ///< alpha + beta
   Kokkos::View<Real *[3], Kokkos::LayoutLeft> P;   ///< product centers
@@ -145,8 +145,8 @@ void sort_by_class(const PairTable<Real> &pairs,
 /// Preallocated scratch for the batched driver; grows monotonically and is
 /// never shrunk, so repeated calls do not allocate (hot path).
 template <class Real> struct QuartetWorkspace {
-  static_assert(std::is_floating_point_v<Real>,
-                "QuartetWorkspace requires a builtin floating-point type");
+  static_assert(kokkos_scalar_v<Real>,
+                "QuartetWorkspace requires float, double or long double");
   int chunk{256}; ///< quartets processed per kernel sweep
   Kokkos::View<Real ***, Kokkos::LayoutLeft> f; ///< (nf, ncomb, 3*chunk)
   Kokkos::View<Real ***, Kokkos::LayoutLeft> g; ///< (nt, ncomb, 3*chunk)
@@ -173,7 +173,7 @@ void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &b
                        const TGrid<Real> &grid, Kokkos::View<Real *> out,
                        QuartetWorkspace<Real> &ws, Kokkos::View<const Real *> coeff,
                        Kokkos::View<const int *> segment) {
-  static_assert(std::is_floating_point_v<Real>,
+  static_assert(kokkos_scalar_v<Real>,
                 "batched driver requires a builtin floating-point type; use "
                 "eri_quartet() for class-type scalars");
   const int nt = grid.n();
