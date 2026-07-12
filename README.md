@@ -83,7 +83,8 @@ ctest --test-dir build
 ```
 
 Options: `INTTI_BUILD_TESTS` (default `ON`), `INTTI_ENABLE_MPI` (default
-`OFF`; placeholder for later milestones).
+`OFF`; distributes the Coulomb/exchange builds across ranks, see
+`include/intti/mpi.hpp`; requires an MPI C++ compiler/library).
 
 ## Status
 

@@ -33,9 +33,16 @@ template <class Real> struct ShellBasis;
 /// K_{a ka, b kb} = sum_{c kc, d kd} D_{c kc, d kd} (a ka, c kc | b kb, d kd).
 /// D and K are nao x nao row-major Cartesian AO matrices. Pairs (a c) and
 /// (b d) with Q_ac Q_bd max|D_cd| < tau are skipped.
+///
+/// MPI distribution (M8): when nranks > 1, each rank computes only the
+/// (a, b) shell blocks with (a*ns+b) % nranks == rank and leaves the rest
+/// zero; the owned sets are disjoint, so summing the per-rank K matrices
+/// (MPI_Allreduce) reproduces the serial result exactly. Defaults reproduce
+/// the serial (rank = 0, nranks = 1) behavior byte-for-byte.
 template <class Real>
 void exchange_build(const ShellBasis<Real> &basis, const Real *D,
-                    const TGrid<Real> &grid, Real *K, Real tau = Real(1e-12));
+                    const TGrid<Real> &grid, Real *K, Real tau = Real(1e-12),
+                    int rank = 0, int nranks = 1);
 
 namespace detail {
 
@@ -44,7 +51,8 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
                          const std::vector<int> &ao_off, int nao, const Real *D,
                          const TGrid<Real> &grid, Real *K, Real tau,
                          const std::vector<Real> &Qex,
-                         const PairTable<Real> &tab) {
+                         const PairTable<Real> &tab, int rank = 0,
+                         int nranks = 1) {
   static_assert(std::is_floating_point_v<Real>,
                 "exchange_build requires a builtin floating-point type in M5");
   const int ns = static_cast<int>(shells.size());
@@ -112,6 +120,7 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
   Kokkos::parallel_for(
       "intti::k::build", Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {ns, ns}),
       KOKKOS_LAMBDA(int a, int b) {
+        if (nranks > 1 && (a * ns + b) % nranks != rank) return;
         const int la = lv(a), lb = lv(b);
         const int nca = ncart(la), ncb = ncart(lb);
         Real Kblk[KNC * KNC];

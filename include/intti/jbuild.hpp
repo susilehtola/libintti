@@ -35,10 +35,17 @@ inline constexpr int JLMAX = 8;
 /// Optional screening: pass per-pair Schwarz factors Q and ket bounds
 /// bound[q] = Q_q * max|D_q|; ket pairs with Q_p * bound[q] < tau are
 /// skipped (tau = 0 or null pointers disable screening).
+///
+/// MPI distribution (M8): when nranks > 1, each rank computes only the
+/// bra pairs p with p % nranks == rank and leaves the rest zero; the owned
+/// sets are disjoint, so summing the per-rank J matrices (MPI_Allreduce)
+/// reproduces the serial result exactly. Defaults reproduce the serial
+/// (rank = 0, nranks = 1) behavior byte-for-byte.
 template <class Real>
 void coulomb_build(const PairTable<Real> &pairs, const Real *D,
                    const TGrid<Real> &grid, Real *J, const Real *Q = nullptr,
-                   const Real *bound = nullptr, Real tau = Real(0)) {
+                   const Real *bound = nullptr, Real tau = Real(0),
+                   int rank = 0, int nranks = 1) {
   static_assert(std::is_floating_point_v<Real>,
                 "coulomb_build requires a builtin floating-point type in M4");
   const bool screen = tau > Real(0) && Q != nullptr && bound != nullptr;
@@ -132,6 +139,7 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
         const int joff = hoffv(p);
         for (int i = 0; i < np1 * np1 * np1; ++i)
           jp(joff + i) = 0;
+        if (nranks > 1 && p % nranks != rank) return;
         const Real pp = pv(p);
         for (int q = 0; q < npair; ++q) {
           if (screen && Qv(p) * bv(q) < tau) continue;

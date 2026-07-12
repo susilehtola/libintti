@@ -85,9 +85,15 @@ std::vector<Real> schwarz(const PairTable<Real> &pairs,
 /// Coulomb matrix at the AO level: J = sum_cd D_cd (ab|cd), D and J are
 /// nao x nao row-major Cartesian AO matrices. Screening drops ket pairs
 /// whose Schwarz-bounded contribution falls below tau (0 = off).
+///
+/// MPI distribution (M8): rank/nranks partition the bra shell-pair index
+/// space (see jbuild.hpp::coulomb_build); defaults reproduce the serial
+/// result byte-for-byte. See mpi.hpp for the MPI_Allreduce-wrapped entry
+/// point.
 template <class Real>
 void coulomb_build(const ShellBasis<Real> &basis, const Real *D,
-                   const TGrid<Real> &grid, Real *J, Real tau = Real(0)) {
+                   const TGrid<Real> &grid, Real *J, Real tau = Real(0),
+                   int rank = 0, int nranks = 1) {
   std::vector<ShellPair<Real>> plist;
   std::vector<std::pair<int, int>> pshell;
   make_shell_pairs(basis, plist, pshell);
@@ -126,7 +132,7 @@ void coulomb_build(const ShellBasis<Real> &basis, const Real *D,
     Qp = Q.data();
     bp = bound.data();
   }
-  coulomb_build(tab, Dp.data(), grid, Jp.data(), Qp, bp, tau);
+  coulomb_build(tab, Dp.data(), grid, Jp.data(), Qp, bp, tau, rank, nranks);
   // scatter to the AO matrix (J is symmetric)
   for (int p = 0; p < npair; ++p) {
     const auto [i, j] = pshell[p];
@@ -142,7 +148,8 @@ void coulomb_build(const ShellBasis<Real> &basis, const Real *D,
 
 template <class Real>
 void exchange_build(const ShellBasis<Real> &basis, const Real *D,
-                    const TGrid<Real> &grid, Real *K, Real tau) {
+                    const TGrid<Real> &grid, Real *K, Real tau, int rank,
+                    int nranks) {
   const int ns = static_cast<int>(basis.shells.size());
   // full rectangular (a, c) pair set: the density index straddles the pairs
   std::vector<ShellPair<Real>> plist;
@@ -153,7 +160,7 @@ void exchange_build(const ShellBasis<Real> &basis, const Real *D,
   auto tab = make_pair_table(plist);
   auto Q = schwarz(tab, plist, grid);
   detail::exchange_build_impl(basis.shells, basis.ao_off, basis.nao, D, grid, K,
-                              tau, Q, tab);
+                              tau, Q, tab, rank, nranks);
 }
 
 } // namespace intti
