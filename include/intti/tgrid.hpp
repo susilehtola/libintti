@@ -90,6 +90,27 @@ void gauss_legendre(int n, Real a, Real b, Real *x, Real *w) {
   }
 }
 
+/// LinLog panel sizes for a given truncation point and target accuracy,
+/// from the M1 convergence study (heuristic: ~27 log-panel nodes per unit of
+/// ln t at eps ~ 1e-10, scaled with the accuracy demand).
+template <class Real = double>
+TGridSpec<Real> linlog_for(Real t_c, Real target_eps = Real(1e-10)) {
+  using std::ceil;
+  using std::log;
+  using std::log10;
+  TGridSpec<Real> spec;
+  spec.mapping = TMapping::LinLog;
+  spec.t_lin = 2;
+  spec.t_c = t_c;
+  const Real demand = -log10(target_eps) / 10; // 1.0 at eps = 1e-10
+  const Real f = demand < Real(0.5) ? Real(0.5) : demand;
+  spec.n_lin = static_cast<int>(ceil(50 * f));
+  const Real span = t_c > spec.t_lin ? log(t_c / spec.t_lin) : Real(0);
+  int nl = static_cast<int>(ceil(27 * f * span));
+  spec.n_log = nl < 20 ? 20 : nl;
+  return spec;
+}
+
 template <class Real = double>
 TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec = {}) {
   const Real pi = pi_v<Real>();

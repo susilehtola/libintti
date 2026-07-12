@@ -107,6 +107,13 @@ Options: `INTTI_BUILD_TESTS` (default `ON`), `INTTI_ENABLE_MPI` (default
   products enforce the truncated LinLog grid + delta tail regime, with t_c
   bounded by the spatial resolution (see the spurious-diagonal-capture note
   in `docs/psc.md`).
+- **M4:** Coulomb matrix build in Hermite t-space (`intti::coulomb_build`):
+  the density is contracted into per-pair Hermite tensors once, pairs couple
+  through the shared Gaussian-derivative arrays at each t node, and no
+  quartet is ever formed — O(nt·npairs²·L⁴). Also: contracted-shell
+  accumulation (`intti::eri_quartets_accumulate`) and automatic t_c
+  selection (`intti::resolution_tc`, `intti::linlog_for`) enforcing the
+  diagonal-capture rule.
 
 ## License
 

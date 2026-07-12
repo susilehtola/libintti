@@ -112,6 +112,36 @@ PSCGrid<Real> make_psc_grid(const Real a[3], const Real b[3], Real xi_max,
   return g;
 }
 
+/// Truncation point t_c that a PSC grid can support without spurious
+/// diagonal capture of the delta contribution (docs/psc.md): the kernel
+/// width 1/t must stay above the node spacing in the region carrying the
+/// product mass. h is taken as the largest nearest-neighbor spacing in the
+/// (z, rho) half-plane over the inner part of the xi range (the far tail
+/// carries no mass); the prefactor is calibrated by
+/// Interaction.TailCorrectionMatters.
+template <class Real> Real resolution_tc(const PSCGrid<Real> &g) {
+  using std::sqrt;
+  Real hmax = 0;
+  const int inner = g.n_xi / 4 > 2 ? g.n_xi / 4 : 2; // mass-carrying xi rows
+  for (int i = 0; i + 1 < inner; ++i)
+    for (int j = 0; j < g.n_eta; ++j) {
+      const int k = i * g.n_eta + j, k2 = (i + 1) * g.n_eta + j;
+      const Real dz = g.zloc[k] - g.zloc[k2];
+      const Real dr = g.rho[k] - g.rho[k2];
+      const Real h = sqrt(dz * dz + dr * dr);
+      if (h > hmax) hmax = h;
+    }
+  for (int i = 0; i < inner; ++i)
+    for (int j = 0; j + 1 < g.n_eta; ++j) {
+      const int k = i * g.n_eta + j, k2 = i * g.n_eta + j + 1;
+      const Real dz = g.zloc[k] - g.zloc[k2];
+      const Real dr = g.rho[k] - g.rho[k2];
+      const Real h = sqrt(dz * dz + dr * dr);
+      if (h > hmax) hmax = h;
+    }
+  return Real(3) / hmax;
+}
+
 /// Two-center product on a PSC grid: complex Fourier components
 /// f_m(node) = (1/(2 pi)) int chi e^{-i m phi} dphi, m = -mmax..mmax (exact
 /// truncation, mmax = l_a + l_b). Stored m-major at index (m+mmax)*nnode+node.

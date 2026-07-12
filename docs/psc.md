@@ -98,8 +98,11 @@ products it is an O(π S/t_c²) error with the *correction applied*.
 Rule: **t_c must be small enough that the spatial grids resolve every
 retained t node** (t_c · h_min ≲ 1). Then the raw [0, t_c] sum is clean and
 the delta correction is exactly the missing tail. This is enforced by test
-(`Interaction.TailCorrectionMatters`) and must be respected by the automatic
-t_c heuristics when they land (M4): t_c from grid resolution, never larger.
+(`Interaction.TailCorrectionMatters`). The automatic helpers implement it:
+`intti::resolution_tc(grid)` (include/intti/product.hpp) derives t_c = 3/h
+from the largest node spacing in the mass-carrying region, and
+`intti::linlog_for(t_c, eps)` (include/intti/tgrid.hpp) sizes the panels;
+`Interaction.ResolutionTcHeuristic` verifies the combination end to end.
 
 ## Consequences for M3
 

@@ -139,6 +139,24 @@ TEST(Interaction, MixedGTOxPSC) {
   EXPECT_NEAR(v, exact, 1e-5 * std::abs(exact));
 }
 
+TEST(Interaction, ResolutionTcHeuristic) {
+  // the automatic t_c must land in the safe regime for the overlapping
+  // configuration of TailCorrectionMatters without hand tuning
+  const auto bra = pair1(), ket = intti::make_pair(Shell{1.1, {0.0, 0.0, -0.5}, 0},
+                                                   Shell{0.6, {0.0, 0.0, 0.9}, 0});
+  const double exact = reference(GTO{bra, 0, 0}, GTO{ket, 0, 0});
+  auto g1 = intti::make_psc_grid(bra.A, bra.B, intti::psc_xi_max(0.9, 1.4), 32, 32);
+  auto g2 = intti::make_psc_grid(ket.A, ket.B, intti::psc_xi_max(0.6, 1.4), 32, 32);
+  auto f1 = intti::psc_product(bra, 0, 0, g1);
+  auto f2 = intti::psc_product(ket, 0, 0, g2);
+  const double tc = std::min(intti::resolution_tc(g1), intti::resolution_tc(g2));
+  EXPECT_GT(tc, 2.0);
+  EXPECT_LT(tc, 20.0); // must stay below the demonstrated failure point
+  auto grid = intti::make_tgrid(intti::coulomb(), intti::linlog_for(tc));
+  const double v = intti::interaction<double>(PF{f1}, PF{f2}, grid);
+  EXPECT_NEAR(v, exact, 5e-3 * std::abs(exact));
+}
+
 TEST(Interaction, MobiusWithGridProductThrows) {
   const auto ket = pair2();
   auto g2 = intti::make_psc_grid(ket.A, ket.B, intti::psc_xi_max(0.6, 1.0), 16, 16);
