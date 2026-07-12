@@ -8,6 +8,11 @@ option(INTTI_BUILD_TESTS "Build unit tests" ON)
 option(INTTI_ENABLE_MPI "Enable MPI support (placeholder, used from later milestones)" OFF)
 option(INTTI_ENABLE_CHOLESKY "Enable the Cholesky decomposition module (needs LAPACK)" ON)
 
+# The libcint facade (intti_cint) is a shared library. When Kokkos is fetched
+# rather than found, it builds as a static archive, and linking a non-PIC
+# archive into a shared object fails; build everything position-independent.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 find_package(Kokkos 4.0 QUIET)
 if(Kokkos_FOUND)
   message(STATUS "Using system Kokkos ${Kokkos_VERSION}")
