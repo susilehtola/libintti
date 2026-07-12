@@ -71,14 +71,27 @@ structure demonstrated in docs/psc.md). Oracle: matches the scalar
 `interaction` to 1e-13; target ≥10× on a naux² PSC Gram matrix. Risk:
 memory/accuracy tradeoffs in kernel-matrix caching need judgment.
 
-## M10 — GPU enablement  [delegable: MEDIUM for the mechanics]
+## M10 — GPU enablement  [BLOCKED on hardware — do not attempt runtime claims here]
 
-Replace the per-thread stack arrays in the hot kernels (batch.hpp phase G,
-jbuild.hpp phase 2, kbuild.hpp) with team scratch, and enable a HIP/CUDA
-Kokkos backend. NOTE: this machine has ROCm installed (`module avail` shows
-rocm/rocm-7.1 and gfx targets), so runtime validation on real hardware is
-possible — do not settle for a compile-only check. Oracle: every existing
-test passes with the GPU backend; results match the host backend to 1e-13.
+Work: replace the per-thread stack arrays in the hot kernels (batch.hpp
+phase G, jbuild.hpp phase 2, kbuild.hpp — they currently size fixed arrays
+off LMAX/JLMAX/KLMAX) with Kokkos team scratch, so a device backend can run
+them without blowing per-thread register/stack limits. This refactor is
+worth doing on its own and is verifiable on the host backend (results must
+be unchanged).
+
+**Hardware reality on the development machine (checked 2026-07-12):** it is
+an Intel laptop — Alder Lake Iris Xe integrated graphics only. There is *no*
+AMD GPU (`/dev/kfd` does not exist), so the installed `rocm/*` modules are
+unusable; there is no CUDA device; no oneAPI/SYCL toolchain is installed;
+and the system Kokkos is built with OPENMP and SERIAL backends only.
+
+Therefore: a GPU backend **cannot be validated here**. Do not claim GPU
+correctness or performance from this machine. Either (a) do only the
+team-scratch refactor, validated on the host backend, or (b) run the GPU
+work on a machine with a real discrete GPU. An Iris Xe via a SYCL backend
+would at best exercise the device code paths; it is not a meaningful
+performance target for J/K builds.
 
 ## M11 — optimized quadrature tooling  [delegable: LOW — strong model]
 
