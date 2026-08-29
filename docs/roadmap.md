@@ -18,7 +18,10 @@ approved plan) is under way and mostly delivered:
   geometric derivatives (`geoderiv.hpp`) done. GIAO ∂/∂B started (`giao.hpp`):
   complex overlap S(B) in a finite field and the analytic dS/dB at B=0, vs
   PySCF `int1e_igovlp` (2.6e-16) and finite difference of S(B). Remaining:
-  RI/2e gradients into the Fock build, Hessians, and dS/dB for T and V.
+  RI/2e gradients into the Fock build, Hessians, and dT/dB (kinetic, where the
+  operator also differentiates the London phase). GIAO dV/dB done: complex
+  nuclear V(B) and the analytic dV/dB (multiplicative operator, so phase-only
+  like the overlap), vs PySCF int1e_ignuc (1.2e-14) and finite difference.
 
 **Ground rules (binding for any implementer):** every deliverable has a hard
 oracle (PySCF or analytic) *and* an independent second check (finite

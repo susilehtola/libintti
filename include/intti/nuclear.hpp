@@ -113,6 +113,96 @@ void attraction_accumulate(const ShellBasis<Real> &basis,
     }
 }
 
+/// Position-weighted nuclear attraction <a| x_c V |b> for c = x, y, z, with V
+/// the point-charge Coulomb potential of `centers` and x_c the ABSOLUTE
+/// coordinate (moment about the origin). Built by promoting the bra angular
+/// momentum by one unit: x_c = (x_c - A_c) + A_c, so the first piece raises the
+/// bra index and the second is A_c times the base attraction. Output M[c] is
+/// nao x nao row-major. This is the GIAO nuclear field-derivative primitive.
+template <class Real>
+void nuclear_moment_accumulate(const ShellBasis<Real> &basis,
+                               const std::vector<PointCharge<Real>> &centers,
+                               const TGrid<Real> &grid, Real tau, Real *M0,
+                               Real *M1, Real *M2) {
+  const int nao = basis.nao;
+  const int nt = grid.n();
+  const Real pi = pi_v<Real>();
+  const int ns = static_cast<int>(basis.shells.size());
+  const bool screen = tau > Real(0);
+  Real *Mc[3] = {M0, M1, M2};
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int la = sa.l, lb = sb.l, lax = la + 1;
+      const int esz = (lax + 1) * (lb + 1) * (lax + lb + 1);
+      const Real p = sa.alpha + sb.alpha;
+      const Real mu = sa.alpha * sb.alpha / p;
+      Real Pd[3], expmu = 1;
+      std::vector<Real> E(static_cast<std::size_t>(3) * esz);
+      for (int d = 0; d < 3; ++d) {
+        Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
+        const Real ab = sa.center[d] - sb.center[d];
+        const Real Kd = exp_(-mu * ab * ab);
+        expmu *= Kd;
+        e_coeffs(lax, lb, p, Pd[d] - sa.center[d], Pd[d] - sb.center[d], Kd,
+                 E.data() + d * esz);
+      }
+      const Real pair_bound = (2 * pi / p) * expmu;
+      const int nca = ncart(la), ncb = ncart(lb);
+      std::vector<Real> acc0(static_cast<std::size_t>(nca) * ncb, Real(0));
+      std::vector<Real> acc[3] = {acc0, acc0, acc0};
+      std::vector<Real> Bx(lax + lb + 1), By(lax + lb + 1), Bz(lax + lb + 1);
+      const int ntab = lax + lb + 1;
+      for (const auto &c : centers) {
+        if (screen) {
+          Real d2 = 0;
+          for (int d = 0; d < 3; ++d) d2 += (Pd[d] - c.R[d]) * (Pd[d] - c.R[d]);
+          using std::sqrt;
+          const Real fb = d2 * p > Real(1) ? Real(0.5) * sqrt(pi / (p * d2)) : Real(1);
+          if (std::abs(c.weight) * pair_bound * fb < tau) continue;
+        }
+        for (int it = 0; it < nt; ++it) {
+          const Real t = grid.t[it];
+          const Real denom = p + t * t;
+          const Real theta = p * t * t / denom;
+          const Real pref = sqrt_(pi / denom);
+          hermite_b(lax + lb, theta, Pd[0] - c.R[0], Bx.data());
+          hermite_b(lax + lb, theta, Pd[1] - c.R[1], By.data());
+          hermite_b(lax + lb, theta, Pd[2] - c.R[2], Bz.data());
+          const Real wt = grid.w[it] * c.weight;
+          const Real *Bd[3] = {Bx.data(), By.data(), Bz.data()};
+          for (int ka = 0; ka < nca; ++ka) {
+            int a3[3];
+            cart_comp(la, ka, a3[0], a3[1], a3[2]);
+            for (int kb = 0; kb < ncb; ++kb) {
+              int b3[3];
+              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+              // gd(d, ish): 1D factor with the bra index raised by ish in dir d
+              auto gd = [&](int d, int ish) {
+                const int i = a3[d] + ish;
+                const Real *Ed = E.data() + d * esz + (i * (lb + 1) + b3[d]) * ntab;
+                Real s = 0;
+                for (int tt = 0; tt <= i + b3[d]; ++tt) s += Ed[tt] * Bd[d][tt];
+                return pref * s;
+              };
+              const Real g0 = gd(0, 0), g1 = gd(1, 0), g2 = gd(2, 0);
+              const Real base = g0 * g1 * g2;
+              // <mu| x_c V |nu> = <mu^{+c}|V|nu> + A_c <mu|V|nu>
+              acc[0][ka * ncb + kb] += wt * (gd(0, 1) * g1 * g2 + sa.center[0] * base);
+              acc[1][ka * ncb + kb] += wt * (g0 * gd(1, 1) * g2 + sa.center[1] * base);
+              acc[2][ka * ncb + kb] += wt * (g0 * g1 * gd(2, 1) + sa.center[2] * base);
+            }
+          }
+        }
+      }
+      for (int c = 0; c < 3; ++c)
+        for (int ka = 0; ka < nca; ++ka)
+          for (int kb = 0; kb < ncb; ++kb)
+            Mc[c][(basis.ao_off[a] + ka) * nao + basis.ao_off[b] + kb] +=
+                acc[c][ka * ncb + kb];
+    }
+}
+
 } // namespace detail
 
 /// Nuclear attraction matrix V_ab = -sum_C Z_C <a|1/|r-R_C||b> (matches
@@ -125,6 +215,22 @@ std::vector<Real> nuclear_matrix(const ShellBasis<Real> &basis,
   // charges here already carry weight = -Z (caller sets it); provide a helper
   detail::attraction_accumulate(basis, charges, grid, tau, V.data());
   return V;
+}
+
+/// Position-weighted nuclear attraction {<a|x V|b>, <a|y V|b>, <a|z V|b>}
+/// about the coordinate origin (the GIAO nuclear field-derivative primitive).
+/// `charges` carry the operator weight (use nuclei_as_charges for -Z).
+template <class Real>
+std::array<std::vector<Real>, 3>
+nuclear_moment_matrices(const ShellBasis<Real> &basis,
+                        const std::vector<PointCharge<Real>> &charges,
+                        const TGrid<Real> &grid, Real tau = Real(0)) {
+  const std::size_t n2 = static_cast<std::size_t>(basis.nao) * basis.nao;
+  std::array<std::vector<Real>, 3> M;
+  for (auto &m : M) m.assign(n2, Real(0));
+  detail::nuclear_moment_accumulate(basis, charges, grid, tau, M[0].data(),
+                                    M[1].data(), M[2].data());
+  return M;
 }
 
 /// Convenience: build charges with weight = -Z from (Z, R) nuclei.

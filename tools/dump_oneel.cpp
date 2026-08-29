@@ -31,12 +31,20 @@ int main(int argc, char **argv) {
   }
   Kokkos::ScopeGuard guard(argc, argv);
   std::vector<intti::PrimitiveShell<double>> shells;
+  std::vector<intti::PointCharge<double>> nuclei; // "Q x y z Z" lines: weight -Z
   {
     std::ifstream in(argv[1]);
     std::string line;
     while (std::getline(in, line)) {
       if (line.empty() || line[0] == '#') continue;
       std::istringstream ss(line);
+      if (line[0] == 'Q') {
+        char q;
+        double x, y, z, Z;
+        ss >> q >> x >> y >> z >> Z;
+        nuclei.push_back({-Z, {x, y, z}});
+        continue;
+      }
       double x, y, z, alpha;
       int l;
       ss >> x >> y >> z >> l >> alpha;
@@ -92,6 +100,14 @@ int main(int argc, char **argv) {
   for (int d = 0; d < 3; ++d) {
     std::vector<double> im(dSB[d].size());
     for (std::size_t i = 0; i < im.size(); ++i) im[i] = dSB[d][i].imag();
+    write_norm(im);
+  }
+  // GIAO nuclear-attraction field derivative dV/dB_k at B=0 (imaginary part),
+  // compared to PySCF int1e_ignuc. Uses the "Q x y z Z" nuclei from the spec.
+  auto dVB = intti::giao_nuclear_dB(basis, nuclei, grid);
+  for (int d = 0; d < 3; ++d) {
+    std::vector<double> im(dVB[d].size());
+    for (std::size_t i = 0; i < im.size(); ++i) im[i] = dVB[d][i].imag();
     write_norm(im);
   }
   std::printf("nao %d\n", nao);

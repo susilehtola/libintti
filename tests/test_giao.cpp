@@ -224,4 +224,45 @@ TEST(GIAO, OverlapFieldDerivativeHermitian) {
   }
 }
 
+TEST(GIAO, NuclearZeroFieldRealMatch) {
+  auto bas = giao_basis();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PointCharge<double>> chg{{-1.0, {0.0, 0.1, -0.3}},
+                                              {-9.0, {0.5, -0.2, 0.4}}};
+  const double Bf[3] = {0.0, 0.0, 0.0};
+  auto Vc = intti::giao_nuclear(bas, chg, grid, Bf);
+  auto Vr = intti::nuclear_matrix(bas, chg, grid);
+  double mx = 0, dev = 0;
+  for (std::size_t i = 0; i < Vr.size(); ++i) {
+    mx = std::max(mx, std::abs(Vr[i]));
+    dev = std::max(dev, std::abs(Vc[i].real() - Vr[i]));
+    dev = std::max(dev, std::abs(Vc[i].imag()));
+  }
+  EXPECT_LT(dev, 1e-13 * mx);
+}
+
+TEST(GIAO, NuclearFieldDerivativeVsFiniteDiff) {
+  auto bas = giao_basis();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PointCharge<double>> chg{{-1.0, {0.0, 0.1, -0.3}},
+                                              {-9.0, {0.5, -0.2, 0.4}}};
+  auto dV = intti::giao_nuclear_dB(bas, chg, grid);
+  const double h = 1e-4;
+  double worst = 0, scale = 0;
+  for (int k = 0; k < 3; ++k) {
+    double Bp[3] = {0, 0, 0}, Bm[3] = {0, 0, 0};
+    Bp[k] = h;
+    Bm[k] = -h;
+    auto Vp = intti::giao_nuclear(bas, chg, grid, Bp);
+    auto Vm = intti::giao_nuclear(bas, chg, grid, Bm);
+    for (std::size_t i = 0; i < Vp.size(); ++i) {
+      const C fd = (Vp[i] - Vm[i]) / (2.0 * h);
+      worst = std::max(worst, std::abs(fd - dV[k][i]));
+      scale = std::max(scale, std::abs(dV[k][i]));
+    }
+  }
+  EXPECT_GT(scale, 1e-3) << "derivative must be nonzero";
+  EXPECT_LT(worst, 1e-7 * (scale + 1)) << "analytic dV/dB != finite difference";
+}
+
 } // namespace

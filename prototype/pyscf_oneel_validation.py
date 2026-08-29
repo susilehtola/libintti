@@ -21,10 +21,15 @@ SHELLS = [(0, 0, 1.2), (0, 1, 0.8), (0, 2, 0.9), (0, 3, 0.7),
           (1, 0, 0.5), (1, 1, 0.6), (1, 2, 0.45)]
 
 
-def build_mol():
+# real elements for the charged copy used by int1e_ignuc (AO basis is identical
+# to the ghost molecule; only the nuclear charges differ). Even total Z.
+CHARGED_SYMS = ["Ne", "C"]  # Z = 10, 6 on CENTERS[0], CENTERS[1]
+
+
+def build_mol(charged=False):
     basis, atoms = {}, []
     for ic, c in enumerate(CENTERS):
-        sym = f"GHOST{ic + 1}"
+        sym = CHARGED_SYMS[ic] if charged else f"GHOST{ic + 1}"
         atoms.append(f"{sym} {c[0]} {c[1]} {c[2]}")
         basis[sym] = [[l, [a, 1.0]] for (jc, l, a) in SHELLS if jc == ic]
     mol = gto.M(atom="; ".join(atoms), basis=basis, unit="Bohr", cart=True, spin=None)
@@ -35,19 +40,22 @@ def build_mol():
 def libintti(dumper, workdir):
     spec = os.path.join(workdir, "shells1e.txt")
     out = os.path.join(workdir, "oneel.bin")
+    ZC = {"Ne": 10.0, "C": 6.0}
     with open(spec, "w") as f:
         for (ic, l, a) in SHELLS:
             c = CENTERS[ic]
             f.write(f"{c[0]} {c[1]} {c[2]} {l} {a}\n")
+        for ic, c in enumerate(CENTERS):  # nuclei for int1e_ignuc
+            f.write(f"Q {c[0]} {c[1]} {c[2]} {ZC[CHARGED_SYMS[ic]]}\n")
     r = subprocess.run([dumper, spec, out], capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"dumper failed: {r.stderr}")
     nao = int(r.stdout.split()[-1])
     data = np.fromfile(out, dtype=np.float64)
     n2 = nao * nao
-    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(28)]
+    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(31)]
     # S, T, dipole(3), quad(6), rinv@p0, rinv@p1, ipovlp(3), ipkin(3),
-    # iprinv@p0(3), angmom Lx,Ly,Lz(3), giao dS/dB_x,y,z (3)
+    # iprinv@p0(3), angmom Lx,Ly,Lz(3), giao dS/dB_x,y,z(3), giao dV/dB_x,y,z(3)
     return nao, blocks
 
 
@@ -100,6 +108,15 @@ def main():
         gref, ggot = igovlp[d], B[25 + d]
         refs[f"dSdB_{ax}"] = (gref, ggot if np.abs(ggot - gref).max()
                               <= np.abs(ggot + gref).max() else -ggot)
+    # GIAO nuclear-attraction field derivative dV/dB vs int1e_ignuc, on the
+    # charged copy of the molecule (identical AO basis, real nuclear charges).
+    molc = build_mol(charged=True)
+    molc.set_common_orig([0.0, 0.0, 0.0])
+    ignuc = molc.intor("int1e_ignuc_cart")    # (3, nao, nao)
+    for d, ax in enumerate("xyz"):
+        vref, vgot = ignuc[d], B[28 + d]
+        refs[f"dVdB_{ax}"] = (vref, vgot if np.abs(vgot - vref).max()
+                              <= np.abs(vgot + vref).max() else -vgot)
     worst = 0.0
     ok = True
     for name, (ref, got) in refs.items():

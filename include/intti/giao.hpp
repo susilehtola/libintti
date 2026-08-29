@@ -42,7 +42,9 @@
 #include "gto.hpp"
 #include "hermite1d.hpp"
 #include "math.hpp"
+#include "nuclear.hpp"
 #include "oneel.hpp"
+#include "tgrid.hpp"
 #include "traits.hpp"
 
 namespace intti {
@@ -206,6 +208,107 @@ giao_overlap_dB(const ShellBasis<Real> &basis) {
       }
     }
   return dS;
+}
+
+/// Complex GIAO nuclear-attraction matrix V(B) = <omega_mu| sum_C w_C/|r-R_C|
+/// |omega_nu> in a finite field B. The London phase shifts the product centre
+/// into the complex plane (make_giao_pair), so the ordinary MD + t-quadrature
+/// nuclear machinery runs unchanged on complex scalars. Reduces to the real
+/// nuclear_matrix at B = 0. Used to finite-difference giao_nuclear_dB.
+template <class Real>
+std::vector<std::complex<Real>>
+giao_nuclear(const ShellBasis<Real> &basis,
+             const std::vector<PointCharge<Real>> &charges,
+             const TGrid<Real> &grid, const Real B[3]) {
+  using C = std::complex<Real>;
+  static_assert(!is_complex_v<Real>, "giao_nuclear takes a real basis");
+  const int nao = basis.nao, nt = grid.n();
+  const Real pi = pi_v<Real>();
+  std::vector<C> V(static_cast<std::size_t>(nao) * nao, C(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const auto sp = make_giao_pair(sa, sb, B);
+      const int la = sa.l, lb = sb.l, esz = (la + 1) * (lb + 1) * (la + lb + 1);
+      const Real p = sp.p;
+      std::vector<C> E(static_cast<std::size_t>(3) * esz);
+      for (int d = 0; d < 3; ++d)
+        e_coeffs(la, lb, p, sp.P[d] - C(sa.center[d]), sp.P[d] - C(sb.center[d]),
+                 sp.K[d], E.data() + d * esz);
+      const int nca = ncart(la), ncb = ncart(lb), ntab = la + lb + 1;
+      std::vector<C> acc(static_cast<std::size_t>(nca) * ncb, C(0));
+      std::vector<C> Bx(ntab), By(ntab), Bz(ntab);
+      for (const auto &c : charges) {
+        for (int it = 0; it < nt; ++it) {
+          const Real t = grid.t[it], denom = p + t * t;
+          const Real theta = p * t * t / denom, pref = sqrt_(pi / denom);
+          hermite_b(la + lb, theta, sp.P[0] - C(c.R[0]), Bx.data());
+          hermite_b(la + lb, theta, sp.P[1] - C(c.R[1]), By.data());
+          hermite_b(la + lb, theta, sp.P[2] - C(c.R[2]), Bz.data());
+          const Real wt = grid.w[it] * c.weight;
+          const C *Bd[3] = {Bx.data(), By.data(), Bz.data()};
+          for (int ka = 0; ka < nca; ++ka) {
+            int a3[3];
+            cart_comp(la, ka, a3[0], a3[1], a3[2]);
+            for (int kb = 0; kb < ncb; ++kb) {
+              int b3[3];
+              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+              auto gd = [&](int d) {
+                const C *Ed = E.data() + d * esz + (a3[d] * (lb + 1) + b3[d]) * ntab;
+                C s(0);
+                for (int tt = 0; tt <= a3[d] + b3[d]; ++tt) s += Ed[tt] * Bd[d][tt];
+                return C(pref) * s;
+              };
+              acc[ka * ncb + kb] += C(wt) * gd(0) * gd(1) * gd(2);
+            }
+          }
+        }
+      }
+      for (int ka = 0; ka < nca; ++ka)
+        for (int kb = 0; kb < ncb; ++kb)
+          V[(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
+              acc[ka * ncb + kb];
+    }
+  return V;
+}
+
+/// Analytic magnetic-field derivative dV/dB_k of the GIAO nuclear-attraction
+/// matrix at B = 0. The nuclear potential is a multiplicative operator, so the
+/// London phase is differentiated exactly as for the overlap:
+///   dV_munu/dB_k = (i/2) [e_k x (R_mu - R_nu)] . <mu| r V |nu>,
+/// with <mu| r V |nu> the position-weighted nuclear attraction
+/// (nuclear_moment_matrices). Returns {dV/dB_x, dV/dB_y, dV/dB_z}. `charges`
+/// carry the operator weight (nuclei_as_charges gives -Z, matching int1e_nuc).
+template <class Real>
+std::array<std::vector<std::complex<Real>>, 3>
+giao_nuclear_dB(const ShellBasis<Real> &basis,
+                const std::vector<PointCharge<Real>> &charges,
+                const TGrid<Real> &grid, Real tau = Real(0)) {
+  using C = std::complex<Real>;
+  static_assert(!is_complex_v<Real>, "giao_nuclear_dB takes a real basis");
+  const int nao = basis.nao;
+  const auto M = nuclear_moment_matrices(basis, charges, grid, tau); // <mu|x_c V|nu>
+  std::array<std::vector<C>, 3> dV;
+  for (auto &m : dV) m.assign(static_cast<std::size_t>(nao) * nao, C(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  const C half_i(Real(0), Real(0.5));
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const Real dv[3] = {sa.center[0] - sb.center[0], sa.center[1] - sb.center[1],
+                          sa.center[2] - sb.center[2]};
+      for (int ka = 0; ka < ncart(sa.l); ++ka)
+        for (int kb = 0; kb < ncart(sb.l); ++kb) {
+          const std::size_t idx =
+              (basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb;
+          const Real Mx = M[0][idx], My = M[1][idx], Mz = M[2][idx];
+          dV[0][idx] = half_i * (-dv[2] * My + dv[1] * Mz);
+          dV[1][idx] = half_i * (dv[2] * Mx - dv[0] * Mz);
+          dV[2][idx] = half_i * (-dv[1] * Mx + dv[0] * My);
+        }
+    }
+  return dV;
 }
 
 } // namespace intti
