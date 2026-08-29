@@ -45,8 +45,9 @@ def libintti(dumper, workdir):
     nao = int(r.stdout.split()[-1])
     data = np.fromfile(out, dtype=np.float64)
     n2 = nao * nao
-    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(13)]
-    # S, T, dx,dy,dz, qxx,qxy,qxz,qyy,qyz,qzz, rinv@p0, rinv@p1
+    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(19)]
+    # S, T, dx,dy,dz, qxx,qxy,qxz,qyy,qyz,qzz, rinv@p0, rinv@p1,
+    # ipovlp x,y,z, ipkin x,y,z
     return nao, blocks
 
 
@@ -75,6 +76,11 @@ def main():
     for i, pt in enumerate(RINV_POINTS):
         mol.set_rinv_origin(pt)
         refs[f"rinv@p{i}"] = (mol.intor("int1e_rinv_cart"), B[11 + i])
+    ipovlp = mol.intor("int1e_ipovlp_cart")   # (3, nao, nao)
+    ipkin = mol.intor("int1e_ipkin_cart")
+    for d, ax in enumerate("xyz"):
+        refs[f"ipovlp_{ax}"] = (ipovlp[d], B[13 + d])
+        refs[f"ipkin_{ax}"] = (ipkin[d], B[16 + d])
     worst = 0.0
     ok = True
     for name, (ref, got) in refs.items():

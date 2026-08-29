@@ -17,6 +17,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include "intti/deriv.hpp"
 #include "intti/normalization.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/oneel.hpp"
@@ -71,6 +72,11 @@ int main(int argc, char **argv) {
   std::vector<std::array<double, 3>> pts = {{0.0, 0.0, 0.4}, {0.2, -0.1, 0.9}};
   auto Vp = intti::potential_matrices(basis, pts, grid);
   for (auto &V : Vp) write_norm(V);
+  // gradient matrices <nabla mu|nu> (int1e_ipovlp) and <nabla mu|T|nu> (ipkin)
+  auto dS = intti::overlap_deriv(basis);
+  auto dT = intti::kinetic_deriv(basis);
+  for (int d = 0; d < 3; ++d) write_norm(dS[d]);
+  for (int d = 0; d < 3; ++d) write_norm(dT[d]);
   std::printf("nao %d\n", nao);
   return 0;
 }
