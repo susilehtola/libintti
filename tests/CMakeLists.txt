@@ -29,6 +29,9 @@ add_executable(intti_tests
   test_nuclear.cpp
   test_ncenter.cpp)
 if(INTTI_ENABLE_CHOLESKY)
+  target_sources(intti_tests PRIVATE test_ri.cpp)
+endif()
+if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_cholesky.cpp)
 endif()
 target_link_libraries(intti_tests PRIVATE intti::intti GTest::gtest)
