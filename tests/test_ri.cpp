@@ -151,4 +151,31 @@ TEST(RI, ApproximatesExactJK) {
   EXPECT_LT(eK, 2e-3 * sK) << "RI-K should approximate exact K";
 }
 
+TEST(RI, OccDrivenExchangeMatchesDensityDriven) {
+  // ri_k_occ (orbital-driven) must equal ri_jk's K for D = sum_i C_i C_i^T
+  auto orb = orb_basis(), aux = aux_basis();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto fit = intti::ri_fit(orb, aux, grid);
+  const int nao = orb.nao, nocc = 3;
+  std::mt19937 rng(19);
+  std::normal_distribution<double> nd;
+  std::vector<double> C(static_cast<std::size_t>(nao) * nocc);
+  for (auto &x : C) x = nd(rng);
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int mu = 0; mu < nao; ++mu)
+    for (int nu = 0; nu < nao; ++nu)
+      for (int i = 0; i < nocc; ++i)
+        D[mu * nao + nu] += C[mu * nocc + i] * C[nu * nocc + i];
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  std::vector<double> Kd(n2), Ko(n2);
+  intti::ri_jk(fit, D.data(), static_cast<double *>(nullptr), Kd.data());
+  intti::ri_k_occ(fit, C.data(), nocc, Ko.data());
+  double md = 0, mx = 0;
+  for (std::size_t i = 0; i < n2; ++i) {
+    md = std::max(md, std::abs(Kd[i] - Ko[i]));
+    mx = std::max(mx, std::abs(Kd[i]));
+  }
+  EXPECT_LT(md, 1e-12 * mx);
+}
+
 } // namespace

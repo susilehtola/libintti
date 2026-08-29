@@ -120,4 +120,38 @@ void ri_jk(const RIFit<Real> &fit, const Real *D, Real *J, Real *K) {
   }
 }
 
+/// Occupation-driven RI exchange: the "optimal" RI-K contraction. Given
+/// occupied MO coefficients C (nao x nocc, row-major C[mu*nocc+i]), contract
+/// the fit vectors with the orbitals early (half-transform W_{i mu}^P =
+/// sum_nu B_{mu nu}^P C_{nu i}) so the cost scales with nocc, not nao:
+///   K_{mu nu} = sum_P sum_i W_{i mu}^P W_{i nu}^P.
+/// Identical to ri_jk's K for D = sum_i C_i C_i^T, but cheaper when
+/// nocc < nao and the natural form for orbital-driven methods.
+template <class Real>
+void ri_k_occ(const RIFit<Real> &fit, const Real *C, int nocc, Real *K) {
+  const int nao = fit.nao, naux = fit.naux;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  for (std::size_t i = 0; i < N; ++i)
+    K[i] = 0;
+  std::vector<Real> W(static_cast<std::size_t>(nocc) * nao); // per P
+  for (int P = 0; P < naux; ++P) {
+    for (int i = 0; i < nocc; ++i)
+      for (int mu = 0; mu < nao; ++mu) {
+        Real s = 0;
+        for (int nu = 0; nu < nao; ++nu)
+          s += fit.B[(static_cast<std::size_t>(mu) * nao + nu) * naux + P] *
+               C[static_cast<std::size_t>(nu) * nocc + i];
+        W[static_cast<std::size_t>(i) * nao + mu] = s;
+      }
+    for (int mu = 0; mu < nao; ++mu)
+      for (int nu = 0; nu < nao; ++nu) {
+        Real s = 0;
+        for (int i = 0; i < nocc; ++i)
+          s += W[static_cast<std::size_t>(i) * nao + mu] *
+               W[static_cast<std::size_t>(i) * nao + nu];
+        K[static_cast<std::size_t>(mu) * nao + nu] += s;
+      }
+  }
+}
+
 } // namespace intti
