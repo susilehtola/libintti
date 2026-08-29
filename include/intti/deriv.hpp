@@ -19,7 +19,11 @@
 
 #include "fock.hpp"
 #include "gto.hpp"
-#include "oneel.hpp" // detail::overlap_1d, kinetic_1d
+#include "hermite1d.hpp"
+#include "math.hpp"
+#include "nuclear.hpp" // PointCharge
+#include "oneel.hpp"   // detail::overlap_1d, kinetic_1d
+#include "tgrid.hpp"
 
 namespace intti {
 
@@ -134,6 +138,92 @@ std::array<std::vector<Real>, 3> kinetic_deriv(const ShellBasis<Real> &basis) {
                       S(0, ax, bx) * S(1, ay, by) * DT(2, az, bz);
         }
       }
+    }
+  return G;
+}
+
+/// Nuclear-attraction gradient <nabla mu | sum_C w_C/|r-R_C| | nu>: three
+/// nao x nao matrices. With charges carrying w = -Z this is PySCF int1e_ipnuc
+/// (the bra-gradient piece of the nuclear-attraction force; the
+/// Hellmann-Feynman dR_C term is separate).
+template <class Real>
+std::array<std::vector<Real>, 3>
+nuclear_deriv(const ShellBasis<Real> &basis,
+              const std::vector<PointCharge<Real>> &charges,
+              const TGrid<Real> &grid) {
+  const int nao = basis.nao;
+  std::array<std::vector<Real>, 3> G;
+  for (auto &g : G) g.assign(static_cast<std::size_t>(nao) * nao, Real(0));
+  const Real pi = pi_v<Real>();
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nt = grid.n();
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int la = sa.l, lb = sb.l, lae = la + 1; // bra extended by one
+      const Real p = sa.alpha + sb.alpha, mu = sa.alpha * sb.alpha / p;
+      const int esz = (lae + 1) * (lb + 1) * (lae + lb + 1);
+      Real Pd[3];
+      std::vector<Real> E(static_cast<std::size_t>(3) * esz);
+      for (int d = 0; d < 3; ++d) {
+        Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
+        const Real ab = sa.center[d] - sb.center[d];
+        e_coeffs(lae, lb, p, Pd[d] - sa.center[d], Pd[d] - sb.center[d],
+                 exp_(-mu * ab * ab), E.data() + d * esz);
+      }
+      const int nca = ncart(la), ncb = ncart(lb);
+      std::array<std::vector<Real>, 3> acc;
+      for (auto &x : acc) x.assign(static_cast<std::size_t>(nca) * ncb, Real(0));
+      // 1D nuclear factor g1[d][k*(lb+1)+j] with bra power k (0..lae), summed
+      // over t and charges, but the derivative mixes k so keep per-t.
+      std::vector<Real> B(lae + lb + 1);
+      const int stride = lb + 1;
+      std::vector<Real> g1[3];
+      for (int d = 0; d < 3; ++d)
+        g1[d].assign(static_cast<std::size_t>(lae + 1) * stride, Real(0));
+      for (const auto &c : charges)
+        for (int it = 0; it < nt; ++it) {
+          const Real t = grid.t[it], denom = p + t * t;
+          const Real theta = p * t * t / denom, pref = sqrt_(pi / denom);
+          const Real wt = grid.w[it] * c.weight;
+          for (int d = 0; d < 3; ++d) {
+            hermite_b(lae + lb, theta, Pd[d] - c.R[d], B.data());
+            const Real *Ed = E.data() + d * esz;
+            for (int k = 0; k <= lae; ++k)
+              for (int j = 0; j <= lb; ++j) {
+                Real s = 0;
+                for (int tau = 0; tau <= k + j; ++tau)
+                  s += Ed[(k * (lb + 1) + j) * (lae + lb + 1) + tau] * B[tau];
+                g1[d][k * stride + j] = pref * s;
+              }
+          }
+          auto g = [&](int d, int k, int j) { return g1[d][k * stride + j]; };
+          for (int ka = 0; ka < nca; ++ka) {
+            int a3[3];
+            cart_comp(la, ka, a3[0], a3[1], a3[2]);
+            for (int kb = 0; kb < ncb; ++kb) {
+              int b3[3];
+              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+              // d/dx acting on bra: l*g(a-1) - 2alpha*g(a+1)
+              Real Dx = -2 * sa.alpha * g(0, a3[0] + 1, b3[0]);
+              if (a3[0] >= 1) Dx += Real(a3[0]) * g(0, a3[0] - 1, b3[0]);
+              Real Dy = -2 * sa.alpha * g(1, a3[1] + 1, b3[1]);
+              if (a3[1] >= 1) Dy += Real(a3[1]) * g(1, a3[1] - 1, b3[1]);
+              Real Dz = -2 * sa.alpha * g(2, a3[2] + 1, b3[2]);
+              if (a3[2] >= 1) Dz += Real(a3[2]) * g(2, a3[2] - 1, b3[2]);
+              const Real gx = g(0, a3[0], b3[0]), gy = g(1, a3[1], b3[1]),
+                         gz = g(2, a3[2], b3[2]);
+              acc[0][ka * ncb + kb] += wt * Dx * gy * gz;
+              acc[1][ka * ncb + kb] += wt * gx * Dy * gz;
+              acc[2][ka * ncb + kb] += wt * gx * gy * Dz;
+            }
+          }
+        }
+      for (int d = 0; d < 3; ++d)
+        for (int ka = 0; ka < nca; ++ka)
+          for (int kb = 0; kb < ncb; ++kb)
+            G[d][(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) +
+                 basis.ao_off[b] + kb] = acc[d][ka * ncb + kb];
     }
   return G;
 }

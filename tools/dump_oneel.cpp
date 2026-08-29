@@ -18,6 +18,7 @@
 #include <Kokkos_Core.hpp>
 
 #include "intti/deriv.hpp"
+#include "intti/nuclear.hpp"
 #include "intti/normalization.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/oneel.hpp"
@@ -77,6 +78,10 @@ int main(int argc, char **argv) {
   auto dT = intti::kinetic_deriv(basis);
   for (int d = 0; d < 3; ++d) write_norm(dS[d]);
   for (int d = 0; d < 3; ++d) write_norm(dT[d]);
+  // nuclear-attraction gradient <nabla mu|1/|r-p0||nu> (int1e_iprinv @ p0)
+  std::vector<intti::PointCharge<double>> one{{1.0, {pts[0][0], pts[0][1], pts[0][2]}}};
+  auto dV = intti::nuclear_deriv(basis, one, grid);
+  for (int d = 0; d < 3; ++d) write_norm(dV[d]);
   std::printf("nao %d\n", nao);
   return 0;
 }
