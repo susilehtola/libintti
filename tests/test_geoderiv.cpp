@@ -26,6 +26,9 @@ const double A0[3] = {0.1, -0.2, 0.3}, B0[3] = {0.5, 0.4, -0.6};
 std::vector<double> Smat(const double A[3], const double B[3]) {
   return intti::overlap_matrix(intti::make_basis(shells(A, B)));
 }
+std::vector<double> Tmat(const double A[3], const double B[3]) {
+  return intti::kinetic_matrix(intti::make_basis(shells(A, B)));
+}
 
 TEST(GeoDeriv, Order1MatchesGradient) {
   // <nabla_x mu|nu> (the shift) must equal M16a overlap_deriv
@@ -86,6 +89,38 @@ TEST(GeoDeriv, HessianBraBraVsFiniteDifference) {
       const int idx = mu * nao + nu;
       const double fd = fd2(Smat, idx, nao, 0, true, 1, true, h); // A_x, A_y
       EXPECT_NEAR(G[idx], fd, 1e-5 * (std::abs(fd) + 1.0)) << "mu=" << mu << " nu=" << nu;
+    }
+}
+
+TEST(GeoDeriv, KineticOrder1MatchesGradient) {
+  auto bas = intti::make_basis(shells(A0, B0));
+  auto Gref = intti::kinetic_deriv(bas);
+  for (int d = 0; d < 3; ++d) {
+    std::array<int, 3> na{0, 0, 0}, nb{0, 0, 0};
+    na[d] = 1;
+    auto G = intti::kinetic_geoderiv(bas, na, nb);
+    double md = 0, mx = 0;
+    for (std::size_t i = 0; i < G.size(); ++i) {
+      md = std::max(md, std::abs(G[i] - Gref[d][i]));
+      mx = std::max(mx, std::abs(Gref[d][i]));
+    }
+    EXPECT_LT(md, 1e-12 * mx) << "d=" << d;
+  }
+}
+
+TEST(GeoDeriv, KineticHessianVsFiniteDifference) {
+  auto bas = intti::make_basis(shells(A0, B0));
+  const int nao = bas.nao;
+  auto Gbk = intti::kinetic_geoderiv(bas, {1, 0, 0}, {0, 1, 0}); // A_x B_y
+  auto Gbb = intti::kinetic_geoderiv(bas, {1, 1, 0}, {0, 0, 0}); // A_x A_y
+  const double h = 1e-4;
+  for (int mu = 0; mu < 3; ++mu)
+    for (int nu = 3; nu < nao; ++nu) {
+      const int idx = mu * nao + nu;
+      const double fbk = fd2(Tmat, idx, nao, 0, true, 1, false, h);
+      const double fbb = fd2(Tmat, idx, nao, 0, true, 1, true, h);
+      EXPECT_NEAR(Gbk[idx], fbk, 1e-5 * (std::abs(fbk) + 1.0)) << "bk mu=" << mu;
+      EXPECT_NEAR(Gbb[idx], fbb, 1e-5 * (std::abs(fbb) + 1.0)) << "bb mu=" << mu;
     }
 }
 

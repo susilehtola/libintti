@@ -63,6 +63,29 @@ void shift_ket(const std::vector<Real> &F, int ldF, int ib, int jb, Real beta,
     }
 }
 
+/// Apply na bra-shifts then nb ket-shifts to a 1D factor table F stored as
+/// (ib0+1) x (jb0+1) row-major; returns the reduced (ib0-na+1) x (jb0-nb+1)
+/// table. This is the shift core reused by every operator.
+template <class Real>
+std::vector<Real> apply_shifts(std::vector<Real> F, int ib0, int jb0, int na,
+                               int nb, Real alpha, Real beta) {
+  int ib = ib0, jb = jb0, ld = jb0 + 1;
+  std::vector<Real> nxt;
+  for (int k = 0; k < na; ++k) {
+    shift_bra(F, ld, ib, jb, alpha, nxt);
+    --ib;
+    ld = jb + 1;
+    F = nxt;
+  }
+  for (int k = 0; k < nb; ++k) {
+    shift_ket(F, ld, ib, jb, beta, nxt);
+    --jb;
+    ld = jb + 1;
+    F = nxt;
+  }
+  return F;
+}
+
 /// 1D overlap factor differentiated na times on the bra centre and nb times on
 /// the ket centre; returns a (la+1) x (lb+1) table (row-major).
 template <class Real>
@@ -70,22 +93,8 @@ std::vector<Real> overlap_1d_deriv(Real alpha, Real A, Real beta, Real B, int la
                                    int lb, int na, int nb) {
   std::vector<Real> s;
   int lbx;
-  overlap_1d(alpha, A, beta, B, la, lb, na, nb, s, lbx); // s: (la+na+1)x(lbx+1), lbx=lb+nb
-  int ib = la + na, jb = lb + nb, ld = lbx + 1;
-  std::vector<Real> cur = s, nxt;
-  for (int k = 0; k < na; ++k) {
-    shift_bra(cur, ld, ib, jb, alpha, nxt);
-    --ib;
-    ld = jb + 1;
-    cur = nxt;
-  }
-  for (int k = 0; k < nb; ++k) {
-    shift_ket(cur, ld, ib, jb, beta, nxt);
-    --jb;
-    ld = jb + 1;
-    cur = nxt;
-  }
-  return cur; // (la+1) x (lb+1)
+  overlap_1d(alpha, A, beta, B, la, lb, na, nb, s, lbx); // s: (la+na+1)x(lbx+1)
+  return apply_shifts(std::move(s), la + na, lb + nb, na, nb, alpha, beta);
 }
 
 } // namespace detail
@@ -118,6 +127,52 @@ std::vector<Real> overlap_geoderiv(const ShellBasis<Real> &basis,
           G[(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
               f[0][a3[0] * lb1 + b3[0]] * f[1][a3[1] * lb1 + b3[1]] *
               f[2][a3[2] * lb1 + b3[2]];
+        }
+      }
+    }
+  return G;
+}
+
+/// Geometric derivative of the kinetic-energy matrix, d^na_A d^nb_B T. The
+/// same shift core applied to the overlap and kinetic 1D factors of
+/// T = Tx Sy Sz + Sx Ty Sz + Sx Sy Tz.
+template <class Real>
+std::vector<Real> kinetic_geoderiv(const ShellBasis<Real> &basis,
+                                   const std::array<int, 3> &na,
+                                   const std::array<int, 3> &nb) {
+  const int nao = basis.nao;
+  std::vector<Real> G(static_cast<std::size_t>(nao) * nao, Real(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
+      std::vector<Real> Sf[3], Tf[3]; // shifted 1D overlap and kinetic factors
+      for (int d = 0; d < 3; ++d) {
+        std::vector<Real> s2, sS;
+        int lbx2, lbxS;
+        // overlap for the kinetic recursion (ket +2) and for the S factors
+        detail::overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb,
+                           na[d], nb[d] + 2, s2, lbx2);
+        detail::overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb,
+                           na[d], nb[d], sS, lbxS);
+        std::vector<Real> t1;
+        detail::kinetic_1d(s2, lbx2, la + na[d], lb + nb[d], sb.alpha, t1);
+        Sf[d] = detail::apply_shifts(std::move(sS), la + na[d], lb + nb[d], na[d],
+                                     nb[d], sa.alpha, sb.alpha);
+        Tf[d] = detail::apply_shifts(std::move(t1), la + na[d], lb + nb[d], na[d],
+                                     nb[d], sa.alpha, sb.alpha);
+      }
+      for (int ka = 0; ka < ncart(la); ++ka) {
+        int a3[3];
+        cart_comp(la, ka, a3[0], a3[1], a3[2]);
+        for (int kb = 0; kb < ncart(lb); ++kb) {
+          int b3[3];
+          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+          auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
+          auto T = [&](int d) { return Tf[d][a3[d] * lb1 + b3[d]]; };
+          G[(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
+              T(0) * S(1) * S(2) + S(0) * T(1) * S(2) + S(0) * S(1) * T(2);
         }
       }
     }
