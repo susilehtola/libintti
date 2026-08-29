@@ -45,8 +45,12 @@ def libintti(dumper, workdir):
     nao = int(r.stdout.split()[-1])
     data = np.fromfile(out, dtype=np.float64)
     n2 = nao * nao
-    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(11)]
-    return nao, blocks   # S, T, dx,dy,dz, qxx,qxy,qxz,qyy,qyz,qzz
+    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(13)]
+    # S, T, dx,dy,dz, qxx,qxy,qxz,qyy,qyz,qzz, rinv@p0, rinv@p1
+    return nao, blocks
+
+
+RINV_POINTS = [(0.0, 0.0, 0.4), (0.2, -0.1, 0.9)]
 
 
 def main():
@@ -68,6 +72,9 @@ def main():
         "quad_xx":   (rr[0], B[5]), "quad_xy": (rr[1], B[6]), "quad_xz": (rr[2], B[7]),
         "quad_yy":   (rr[4], B[8]), "quad_yz": (rr[5], B[9]), "quad_zz": (rr[8], B[10]),
     }
+    for i, pt in enumerate(RINV_POINTS):
+        mol.set_rinv_origin(pt)
+        refs[f"rinv@p{i}"] = (mol.intor("int1e_rinv_cart"), B[11 + i])
     worst = 0.0
     ok = True
     for name, (ref, got) in refs.items():

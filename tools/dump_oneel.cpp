@@ -18,6 +18,7 @@
 #include <Kokkos_Core.hpp>
 
 #include "intti/normalization.hpp"
+#include "intti/nuclear.hpp"
 #include "intti/oneel.hpp"
 
 int main(int argc, char **argv) {
@@ -65,6 +66,11 @@ int main(int argc, char **argv) {
   write_norm(T);
   for (int c = 1; c <= 3; ++c) write_norm(M[c]);   // dipole x,y,z
   for (int c = 4; c <= 9; ++c) write_norm(M[c]);   // quadrupole xx,xy,xz,yy,yz,zz
+  // Coulomb-potential collocation at two points (validated vs int1e_rinv)
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<std::array<double, 3>> pts = {{0.0, 0.0, 0.4}, {0.2, -0.1, 0.9}};
+  auto Vp = intti::potential_matrices(basis, pts, grid);
+  for (auto &V : Vp) write_norm(V);
   std::printf("nao %d\n", nao);
   return 0;
 }
