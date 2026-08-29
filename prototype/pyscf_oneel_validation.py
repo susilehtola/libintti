@@ -45,9 +45,9 @@ def libintti(dumper, workdir):
     nao = int(r.stdout.split()[-1])
     data = np.fromfile(out, dtype=np.float64)
     n2 = nao * nao
-    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(25)]
+    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(28)]
     # S, T, dipole(3), quad(6), rinv@p0, rinv@p1, ipovlp(3), ipkin(3),
-    # iprinv@p0(3), angmom Lx,Ly,Lz(3)
+    # iprinv@p0(3), angmom Lx,Ly,Lz(3), giao dS/dB_x,y,z (3)
     return nao, blocks
 
 
@@ -89,12 +89,17 @@ def main():
     # common gauge origin; compare up to an overall sign per component.
     mol.set_common_orig([0.0, 0.0, 0.0])
     irxp = mol.intor("int1e_cg_irxp_cart")    # (3, nao, nao)
+    igovlp = mol.intor("int1e_igovlp_cart")   # (3, nao, nao): GIAO dS/dB
     for d, ax in enumerate("xyz"):
         ref, got = irxp[d], B[22 + d]
-        sc = max(np.abs(ref).max(), 1e-12)
         # compare up to overall sign (convention)
         refs[f"L{ax}"] = (ref, got if np.abs(got - ref).max() <= np.abs(got + ref).max()
                           else -got)
+        # GIAO overlap field derivative: our Im(dS/dB) vs PySCF int1e_igovlp,
+        # equal up to the overall -i phase convention (see giao.hpp)
+        gref, ggot = igovlp[d], B[25 + d]
+        refs[f"dSdB_{ax}"] = (gref, ggot if np.abs(ggot - gref).max()
+                              <= np.abs(ggot + gref).max() else -ggot)
     worst = 0.0
     ok = True
     for name, (ref, got) in refs.items():

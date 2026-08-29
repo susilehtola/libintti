@@ -14,8 +14,11 @@ approved plan) is under way and mostly delivered:
 - **M14 done** — local & locally range-separated exchange energy density, `localhybrid.hpp`.
 - **M16 (in progress)** — derivative integrals, `deriv.hpp`: one-electron
   gradient set complete (overlap/kinetic/nuclear, vs PySCF `int1e_ip*` and
-  finite difference). Remaining: two-electron/RI gradients, Hessians, ∂/∂B
-  GIAO field derivatives (forces + frequencies = the black-box goal).
+  finite difference); two-electron gradient (`erigrad.hpp`) and arbitrary-order
+  geometric derivatives (`geoderiv.hpp`) done. GIAO ∂/∂B started (`giao.hpp`):
+  complex overlap S(B) in a finite field and the analytic dS/dB at B=0, vs
+  PySCF `int1e_igovlp` (2.6e-16) and finite difference of S(B). Remaining:
+  RI/2e gradients into the Fock build, Hessians, and dS/dB for T and V.
 
 **Ground rules (binding for any implementer):** every deliverable has a hard
 oracle (PySCF or analytic) *and* an independent second check (finite

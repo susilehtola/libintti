@@ -159,4 +159,69 @@ TEST(GIAO, BraSwapConjugates) {
   EXPECT_GT(std::abs(v_abcd.imag()), 1e-6 * std::abs(v_abcd));
 }
 
+intti::ShellBasis<double> giao_basis() {
+  return intti::make_basis<double>({
+      {0.9, {kA[0], kA[1], kA[2]}, 0},
+      {1.3, {kB[0], kB[1], kB[2]}, 1},
+      {0.6, {kC[0], kC[1], kC[2]}, 2},
+  });
+}
+
+TEST(GIAO, OverlapZeroFieldRealMatch) {
+  auto bas = giao_basis();
+  const double Bf[3] = {0.0, 0.0, 0.0};
+  auto Sc = intti::giao_overlap(bas, Bf);
+  auto Sr = intti::overlap_matrix(bas);
+  double mx = 0, dev = 0;
+  for (std::size_t i = 0; i < Sr.size(); ++i) {
+    mx = std::max(mx, std::abs(Sr[i]));
+    dev = std::max(dev, std::abs(Sc[i].real() - Sr[i]));
+    dev = std::max(dev, std::abs(Sc[i].imag()));
+  }
+  EXPECT_LT(dev, 1e-14 * mx);
+}
+
+TEST(GIAO, OverlapFieldDerivativeVsFiniteDiff) {
+  // analytic dS/dB_k against a central finite difference of the complex GIAO
+  // overlap in each field direction (independent second check)
+  auto bas = giao_basis();
+  auto dS = intti::giao_overlap_dB(bas);
+  const double h = 1e-4;
+  double worst = 0, scale = 0;
+  for (int k = 0; k < 3; ++k) {
+    double Bp[3] = {0, 0, 0}, Bm[3] = {0, 0, 0};
+    Bp[k] = h;
+    Bm[k] = -h;
+    auto Sp = intti::giao_overlap(bas, Bp);
+    auto Sm = intti::giao_overlap(bas, Bm);
+    for (std::size_t i = 0; i < Sp.size(); ++i) {
+      const C fd = (Sp[i] - Sm[i]) / (2.0 * h);
+      worst = std::max(worst, std::abs(fd - dS[k][i]));
+      scale = std::max(scale, std::abs(dS[k][i]));
+    }
+  }
+  EXPECT_GT(scale, 1e-3) << "derivative must be nonzero";
+  EXPECT_LT(worst, 1e-8 * (scale + 1)) << "analytic dS/dB != finite difference";
+}
+
+TEST(GIAO, OverlapFieldDerivativeHermitian) {
+  // S(B) is Hermitian for all B, so dS/dB_k is Hermitian; being purely
+  // imaginary, its imaginary part is therefore antisymmetric (a i = -a^T i)
+  auto bas = giao_basis();
+  auto dS = intti::giao_overlap_dB(bas);
+  const int n = bas.nao;
+  for (int k = 0; k < 3; ++k) {
+    double remax = 0, asym = 0, mx = 0;
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) {
+        remax = std::max(remax, std::abs(dS[k][i * n + j].real()));
+        asym = std::max(asym,
+                        std::abs(dS[k][i * n + j].imag() + dS[k][j * n + i].imag()));
+        mx = std::max(mx, std::abs(dS[k][i * n + j].imag()));
+      }
+    EXPECT_LT(remax, 1e-14) << "component " << k << " not purely imaginary";
+    EXPECT_LT(asym, 1e-13 * (mx + 1)) << "component " << k << " not Hermitian";
+  }
+}
+
 } // namespace

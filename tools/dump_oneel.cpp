@@ -18,6 +18,7 @@
 #include <Kokkos_Core.hpp>
 
 #include "intti/deriv.hpp"
+#include "intti/giao.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/normalization.hpp"
 #include "intti/nuclear.hpp"
@@ -85,6 +86,14 @@ int main(int argc, char **argv) {
   // angular momentum <mu|(r-O) x nabla|nu> about origin
   auto Lm = intti::angular_momentum(basis, origin);
   for (int d = 0; d < 3; ++d) write_norm(Lm[d]);
+  // GIAO overlap field derivative dS/dB_k at B=0 (imaginary part; the real
+  // part vanishes). Compared to PySCF int1e_igovlp (up to the -i convention).
+  auto dSB = intti::giao_overlap_dB(basis);
+  for (int d = 0; d < 3; ++d) {
+    std::vector<double> im(dSB[d].size());
+    for (std::size_t i = 0; i < im.size(); ++i) im[i] = dSB[d][i].imag();
+    write_norm(im);
+  }
   std::printf("nao %d\n", nao);
   return 0;
 }
