@@ -26,7 +26,8 @@ add_executable(intti_tests
   test_cdjk.cpp
   test_giao.cpp
   test_oneel.cpp
-  test_nuclear.cpp)
+  test_nuclear.cpp
+  test_ncenter.cpp)
 if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_cholesky.cpp)
 endif()

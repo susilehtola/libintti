@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 Susi Lehtola
+#pragma once
+
+// Two- and three-center Coulomb integrals -- the RI (density-fitting) core.
+// An auxiliary function P is treated as a shell paired with a zero-exponent
+// unit-s "ghost" at the same centre (beta=0 => p=alpha, K=1: the libcint
+// int2c2e/int3c2e trick), so both reduce to the ordinary quartet engine:
+//   (P|Q)   = quartet( (P,ghost), (Q,ghost) )
+//   (mu nu|P) = quartet( (mu,nu),  (P,ghost) ).
+// Matrix/tensor-level API only: whole (P|Q) matrix and (mu nu|P) tensor.
+
+#include <cstddef>
+#include <vector>
+
+#include "fock.hpp"
+#include "gto.hpp"
+#include "quartet.hpp"
+#include "tgrid.hpp"
+
+namespace intti {
+
+namespace detail {
+/// A shell paired with a zero-exponent unit-s ghost at the same centre.
+template <class Real>
+ShellPair<Real> ghost_pair(const PrimitiveShell<Real> &s) {
+  PrimitiveShell<Real> ghost{Real(0), {s.center[0], s.center[1], s.center[2]}, 0};
+  return make_pair(s, ghost);
+}
+} // namespace detail
+
+/// Two-center Coulomb metric (P|Q) over an auxiliary basis: naux x naux,
+/// row-major, primitive Cartesian, unnormalized.
+template <class Real>
+std::vector<Real> coulomb_2c(const ShellBasis<Real> &aux, const TGrid<Real> &grid) {
+  const int naux = aux.nao;
+  std::vector<Real> M(static_cast<std::size_t>(naux) * naux, Real(0));
+  const int ns = static_cast<int>(aux.shells.size());
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      auto bra = detail::ghost_pair(aux.shells[a]);
+      auto ket = detail::ghost_pair(aux.shells[b]);
+      const int nP = ncart(aux.shells[a].l), nQ = ncart(aux.shells[b].l);
+      std::vector<Real> blk(static_cast<std::size_t>(nP) * nQ);
+      eri_quartet(bra, ket, grid, blk.data());
+      for (int kP = 0; kP < nP; ++kP)
+        for (int kQ = 0; kQ < nQ; ++kQ)
+          M[(aux.ao_off[a] + kP) * naux + aux.ao_off[b] + kQ] = blk[kP * nQ + kQ];
+    }
+  return M;
+}
+
+/// Three-center Coulomb (mu nu | P): row-major (mu, nu, P) tensor of size
+/// nao*nao*naux, primitive Cartesian, unnormalized.
+template <class Real>
+std::vector<Real> coulomb_3c(const ShellBasis<Real> &orb,
+                             const ShellBasis<Real> &aux, const TGrid<Real> &grid) {
+  const int nao = orb.nao, naux = aux.nao;
+  std::vector<Real> T(static_cast<std::size_t>(nao) * nao * naux, Real(0));
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  for (int m = 0; m < nso; ++m)
+    for (int n = 0; n < nso; ++n) {
+      auto bra = make_pair(orb.shells[m], orb.shells[n]);
+      const int nm = ncart(orb.shells[m].l), nn = ncart(orb.shells[n].l);
+      for (int a = 0; a < nsa; ++a) {
+        auto ket = detail::ghost_pair(aux.shells[a]);
+        const int nP = ncart(aux.shells[a].l);
+        std::vector<Real> blk(static_cast<std::size_t>(nm) * nn * nP);
+        eri_quartet(bra, ket, grid, blk.data());
+        for (int km = 0; km < nm; ++km)
+          for (int kn = 0; kn < nn; ++kn)
+            for (int kP = 0; kP < nP; ++kP)
+              T[((static_cast<std::size_t>(orb.ao_off[m] + km) * nao +
+                  orb.ao_off[n] + kn) *
+                 naux) +
+                aux.ao_off[a] + kP] = blk[(km * nn + kn) * nP + kP];
+      }
+    }
+  return T;
+}
+
+} // namespace intti

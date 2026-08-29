@@ -71,6 +71,8 @@ if(INTTI_BUILD_TESTS)
   target_link_libraries(intti_dump_eri PRIVATE intti::intti)
   add_executable(intti_dump_oneel tools/dump_oneel.cpp)
   target_link_libraries(intti_dump_oneel PRIVATE intti::intti)
+  add_executable(intti_dump_ri tools/dump_ri.cpp)
+  target_link_libraries(intti_dump_ri PRIVATE intti::intti)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_FOUND)
     execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pyscf"
@@ -85,6 +87,9 @@ if(INTTI_BUILD_TESTS)
       add_test(NAME PySCFValidationOneEl
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/prototype/pyscf_oneel_validation.py
                 $<TARGET_FILE:intti_dump_oneel> ${CMAKE_CURRENT_BINARY_DIR})
+      add_test(NAME PySCFValidationRI
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/prototype/pyscf_ri_validation.py
+                $<TARGET_FILE:intti_dump_ri> ${CMAKE_CURRENT_BINARY_DIR})
       message(STATUS "PySCF found - cross-validation tests enabled")
     else()
       message(STATUS "PySCF not found - cross-validation test skipped")
