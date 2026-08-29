@@ -9,6 +9,8 @@
 
 #include "intti/deriv.hpp"
 #include "intti/geoderiv.hpp"
+#include "intti/nuclear.hpp"
+#include "intti/tgrid.hpp"
 
 namespace {
 
@@ -121,6 +123,41 @@ TEST(GeoDeriv, KineticHessianVsFiniteDifference) {
       const double fbb = fd2(Tmat, idx, nao, 0, true, 1, true, h);
       EXPECT_NEAR(Gbk[idx], fbk, 1e-5 * (std::abs(fbk) + 1.0)) << "bk mu=" << mu;
       EXPECT_NEAR(Gbb[idx], fbb, 1e-5 * (std::abs(fbb) + 1.0)) << "bb mu=" << mu;
+    }
+}
+
+TEST(GeoDeriv, NuclearOrder1AndHessian) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PointCharge<double>> ch{{-1.0, {0.0, 0.0, 0.9}}};
+  auto bas = intti::make_basis(shells(A0, B0));
+  const int nao = bas.nao;
+  // order 1 == M16b nuclear_deriv
+  auto Gref = intti::nuclear_deriv(bas, ch, grid);
+  for (int d = 0; d < 3; ++d) {
+    std::array<int, 3> na{0, 0, 0}, nb{0, 0, 0};
+    na[d] = 1;
+    auto G = intti::nuclear_geoderiv(bas, ch, grid, na, nb);
+    double md = 0, mx = 0;
+    for (std::size_t i = 0; i < G.size(); ++i) {
+      md = std::max(md, std::abs(G[i] - Gref[d][i]));
+      mx = std::max(mx, std::abs(Gref[d][i]));
+    }
+    EXPECT_LT(md, 1e-11 * mx) << "d=" << d;
+  }
+  // Hessian bra-ket and bra-bra vs finite difference of nuclear_matrix
+  auto Vof = [&](const double A[3], const double B[3]) {
+    return intti::nuclear_matrix(intti::make_basis(shells(A, B)), ch, grid);
+  };
+  auto Gbk = intti::nuclear_geoderiv(bas, ch, grid, {1, 0, 0}, {0, 1, 0});
+  auto Gbb = intti::nuclear_geoderiv(bas, ch, grid, {1, 1, 0}, {0, 0, 0});
+  const double h = 1e-4;
+  for (int mu = 0; mu < 3; ++mu)
+    for (int nu = 3; nu < nao; ++nu) {
+      const int idx = mu * nao + nu;
+      EXPECT_NEAR(Gbk[idx], fd2(Vof, idx, nao, 0, true, 1, false, h),
+                  1e-5 * (std::abs(Gbk[idx]) + 1.0)) << "bk mu=" << mu;
+      EXPECT_NEAR(Gbb[idx], fd2(Vof, idx, nao, 0, true, 1, true, h),
+                  1e-5 * (std::abs(Gbb[idx]) + 1.0)) << "bb mu=" << mu;
     }
 }
 

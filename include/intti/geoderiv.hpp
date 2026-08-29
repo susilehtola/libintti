@@ -22,13 +22,18 @@
 // order 2). The same shift applied to the kinetic / nuclear / ERI 1D factors
 // gives their derivatives identically.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <vector>
 
 #include "fock.hpp"
 #include "gto.hpp"
-#include "oneel.hpp" // detail::overlap_1d
+#include "hermite1d.hpp"
+#include "math.hpp"
+#include "nuclear.hpp" // PointCharge
+#include "oneel.hpp"   // detail::overlap_1d
+#include "tgrid.hpp"
 
 namespace intti {
 
@@ -175,6 +180,82 @@ std::vector<Real> kinetic_geoderiv(const ShellBasis<Real> &basis,
               T(0) * S(1) * S(2) + S(0) * T(1) * S(2) + S(0) * S(1) * T(2);
         }
       }
+    }
+  return G;
+}
+
+/// Geometric derivative of the nuclear-attraction matrix,
+/// d^na_A d^nb_B <a| sum_C w_C/|r-R_C| |b>. The kernel-based (t-quadrature)
+/// operator: the shift core is applied to the nuclear 1D factor g_d(t) at
+/// each t node (differentiation analytic per node), then summed over t.
+template <class Real>
+std::vector<Real> nuclear_geoderiv(const ShellBasis<Real> &basis,
+                                   const std::vector<PointCharge<Real>> &charges,
+                                   const TGrid<Real> &grid,
+                                   const std::array<int, 3> &na,
+                                   const std::array<int, 3> &nb) {
+  const int nao = basis.nao;
+  std::vector<Real> G(static_cast<std::size_t>(nao) * nao, Real(0));
+  const Real pi = pi_v<Real>();
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nt = grid.n();
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
+      const int lae[3] = {la + na[0], la + na[1], la + na[2]};
+      const int lbe[3] = {lb + nb[0], lb + nb[1], lb + nb[2]};
+      const Real p = sa.alpha + sb.alpha, mu = sa.alpha * sb.alpha / p;
+      Real Pd[3];
+      std::vector<Real> E[3];
+      for (int d = 0; d < 3; ++d) {
+        Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
+        const Real ab = sa.center[d] - sb.center[d];
+        E[d].assign(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1) * (lae[d] + lbe[d] + 1),
+                    Real(0));
+        e_coeffs(lae[d], lbe[d], p, Pd[d] - sa.center[d], Pd[d] - sb.center[d],
+                 exp_(-mu * ab * ab), E[d].data());
+      }
+      const int nca = ncart(la), ncb = ncart(lb);
+      std::vector<Real> acc(static_cast<std::size_t>(nca) * ncb, Real(0));
+      std::vector<Real> Bv(la + lb + std::max({na[0], na[1], na[2], nb[0], nb[1], nb[2]}) * 2 + 1);
+      for (const auto &c : charges)
+        for (int it = 0; it < nt; ++it) {
+          const Real t = grid.t[it], denom = p + t * t;
+          const Real theta = p * t * t / denom, pref = sqrt_(pi / denom);
+          const Real wt = grid.w[it] * c.weight;
+          // per direction: build g_d table then apply the derivative shifts
+          std::vector<Real> gsh[3];
+          for (int d = 0; d < 3; ++d) {
+            const int L = lae[d] + lbe[d];
+            hermite_b(L, theta, Pd[d] - c.R[d], Bv.data());
+            std::vector<Real> g(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1));
+            for (int i = 0; i <= lae[d]; ++i)
+              for (int j = 0; j <= lbe[d]; ++j) {
+                Real s = 0;
+                for (int tau = 0; tau <= i + j; ++tau)
+                  s += E[d][(i * (lbe[d] + 1) + j) * (L + 1) + tau] * Bv[tau];
+                g[i * (lbe[d] + 1) + j] = pref * s;
+              }
+            gsh[d] = detail::apply_shifts(std::move(g), lae[d], lbe[d], na[d], nb[d],
+                                          sa.alpha, sb.alpha);
+          }
+          for (int ka = 0; ka < nca; ++ka) {
+            int a3[3];
+            cart_comp(la, ka, a3[0], a3[1], a3[2]);
+            for (int kb = 0; kb < ncb; ++kb) {
+              int b3[3];
+              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+              acc[ka * ncb + kb] += wt * gsh[0][a3[0] * lb1 + b3[0]] *
+                                    gsh[1][a3[1] * lb1 + b3[1]] *
+                                    gsh[2][a3[2] * lb1 + b3[2]];
+            }
+          }
+        }
+      for (int ka = 0; ka < nca; ++ka)
+        for (int kb = 0; kb < ncb; ++kb)
+          G[(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
+              acc[ka * ncb + kb];
     }
   return G;
 }
