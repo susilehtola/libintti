@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BSD-3-Clause
 // Copyright (C) 2026 Susi Lehtola
 
 // Implementation of the libcint-compatible C facade (include/intti/cint.h).

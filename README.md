@@ -2,11 +2,30 @@
 
 <img src="assets/logo.svg" alt="libintti logo" width="180" align="right"/>
 
-Efficient quadrature code for tensor expressions in quantum chemistry.
+**libintti is a fresh, independent Gaussian-integral library for quantum
+chemistry, developed by Susi Lehtola at the University of Helsinki.** It
+evaluates one- and two-electron integrals — and their arbitrary-order
+derivatives — through a one-dimensional quadrature that replaces the Boys
+function entirely.
 
-(*intti* is Finnish slang for the army; the integral is what the author did
-instead of non-military service, *sivari* being the name of [Dage Sundholm's
-group's](https://www.helsinki.fi/en/researchgroups/sundholm-group) library.)
+## Design
+
+- **Boys-free by construction.** The Coulomb operator is resolved as a 1-D
+  integral in *t* (see [Method](#method)); at each node the kernel factorizes
+  over Cartesian directions, so every integral is a product of analytic 1-D
+  pieces. No Boys function is ever formed — which is what makes complex
+  (GIAO) and arbitrary-precision arithmetic fall out for free.
+- **Arbitrary precision.** Header-only and templated on the scalar type:
+  `float`, `double`, `long double`, `__float128`, `std::complex`, and
+  class-type scalars (e.g. MPFR wrappers) all run the same code.
+- **GPU-portable.** The real-scalar path runs through
+  [Kokkos](https://kokkos.org) for CPU/GPU portability from one source.
+- **Drop-in interoperable.** A thread-safe, libcint-compatible C ABI
+  (`include/intti/cint.h`) consumes libcint's `atm`/`bas`/`env` arrays
+  directly, so libintti can back an existing code with no call-site changes.
+- **Matrix-level API.** The native interface is expressed in Fock-like matrix
+  quantities (density in → J/K/property/gradient out), sized to saturate a
+  GPU; individual quartets are an internal detail (and the façade's shim).
 
 ## Method
 
@@ -157,6 +176,16 @@ Options: `INTTI_BUILD_TESTS` (default `ON`), `INTTI_ENABLE_MPI` (default
   every matrix element is produced by exactly one rank and the allreduce
   reproduces the serial result **bitwise** (verified at 1, 2, 4 ranks).
 
+## Name
+
+*intti* is Finnish slang for the army; the library is what the author did
+instead of non-military service. The pun completes with *sivari* (civilian
+service) — coincidentally also the name of a library from [Dage Sundholm's
+group](https://www.helsinki.fi/en/researchgroups/sundholm-group) — but
+**libintti shares no code, lineage, or dependency with it**; the name is only
+the military/civil-service joke.
+
 ## License
 
-MPL-2.0.
+BSD-3-Clause. See [`LICENSE`](LICENSE); the same identifier appears in the
+SPDX header of every source file.

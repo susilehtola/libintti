@@ -29,7 +29,7 @@ difference or an internal identity) — the RI eigenvector-transpose bug was
 invisible to self-consistency alone. Never loosen a tolerance to proceed;
 report and stop. Matrix-level API only (no per-quartet public entry point).
 Follow the codebase idiom (header-only templates, Kokkos for float/double,
-serial fallback for complex/quad/class scalars, MPL-2.0 + SPDX).
+serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
 
 ## Remaining program milestones
 
@@ -100,7 +100,8 @@ serial fallback for complex/quad/class scalars, MPL-2.0 + SPDX).
 ## Reference: gen1int (one-electron response engine)
 
 `/home/work/gen1int` (Bin Gao & Andreas Thorvaldsen, LGPL — GitLab
-bingao/gen1int; learn architecture only, do not copy into MPL tree) is the
+bingao/gen1int; learn architecture only, do not copy into our BSD-3-Clause
+tree) is the
 gold-standard **one-electron** integral/derivative engine for response theory
 (used in Dalton/LSDalton/DIRAC). Same Hermite-Gaussian (McMurchie–Davidson)
 substrate as us, but analytic Boys (`aux_boys_vec`), Fortran 90 + Python,

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BSD-3-Clause
 find_package(GTest QUIET)
 if(NOT GTest_FOUND)
   message(STATUS "System GTest not found - fetching")

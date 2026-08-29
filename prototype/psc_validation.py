@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BSD-3-Clause
 # Copyright (C) 2026 Susi Lehtola
 """Validation of the prolate-spheroidal (PSC) representation of orbital
 products and of kernel-mediated interactions between them (libintti M2c).

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BSD-3-Clause
 cmake_minimum_required(VERSION 3.23)
 project(intti VERSION 0.1.0
         DESCRIPTION "Efficient quadrature code for tensor expressions"

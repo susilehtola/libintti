@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: MPL-2.0
+# SPDX-License-Identifier: BSD-3-Clause
 # Copyright (C) 2026 Susi Lehtola
 """Analytic reference for GIAO (London orbital) ERIs.
 

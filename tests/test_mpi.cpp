@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BSD-3-Clause
 // Copyright (C) 2026 Susi Lehtola
 
 // Standalone MPI correctness check for M8 (not a gtest binary: MPI must be
