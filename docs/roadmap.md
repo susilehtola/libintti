@@ -89,3 +89,38 @@ serial fallback for complex/quad/class scalars, MPL-2.0 + SPDX).
   contribution; note the several published gauge conventions differ.
 - CI does not run the PySCF or MPI tests (not installed on runners); both are
   verified locally only.
+
+## Reference: gen1int (one-electron response engine)
+
+`/home/work/gen1int` (Bin Gao & Andreas Thorvaldsen, LGPL — GitLab
+bingao/gen1int; learn architecture only, do not copy into MPL tree) is the
+gold-standard **one-electron** integral/derivative engine for response theory
+(used in Dalton/LSDalton/DIRAC). Same Hermite-Gaussian (McMurchie–Davidson)
+substrate as us, but analytic Boys (`aux_boys_vec`), Fortran 90 + Python,
+contracted Cartesian *and* spherical, London (LAO/GIAO) orbitals.
+
+**Operator set (the target 1e property surface — mine this like libcint's
+intor):** `INT_OVERLAP`, `INT_KIN_ENERGY`, `INT_POT_ENERGY` (nuclear),
+`INT_ONE_HAMIL` (T+V), `INT_CART_MULTIPOLE`, `INT_SPHER_MULTIPOLE`,
+`INT_ANGMOM` (angular momentum), `INT_PSO` (paramagnetic spin-orbit),
+`INT_GAUSSIAN_POT` (finite-nucleus/effective potential), plus ECP. libintti
+has S, T, V, Cartesian multipoles, and their gradients (M10/M16); missing:
+angular momentum, PSO, Gaussian/finite-nucleus potential, ECP, spherical
+multipoles (c2s handles the transform).
+
+**Key architectural lesson — arbitrary-order geometric derivatives via an
+N-ary tree over atomic centers** (`gen1int_geom.F90`, `NaryTreeCreate`,
+`order_geo`/`max_num_cent`). Rather than special-casing gradient then Hessian,
+one recursion distributes the derivative order among the differentiated
+centers (with N_alpha <= 2 typically). **Adopt this for M16:** build the
+derivative layer as arbitrary-order from the start (gradient and Hessian are
+orders 1 and 2), not ad hoc. gen1int also does magnetic-field and total
+rotational-angular-momentum derivatives (LAO) — the 1e magnetic-response
+integrals for NMR/magnetizability.
+
+**Positioning:** gen1int is 1e-only; libintX is 2e-only (GPU). libintti's bet
+is ONE t-quadrature MD engine for BOTH, scalar-templated (real/complex/quad),
+so GIAO/complex/anisotropic/arbitrary-kernel come for free where the
+analytic-Boys engines need new special functions. gen1int is 15 years mature
+on 1e response — treat its operator list and N-ary-tree derivative
+organization as the design target, its numbers as an oracle.
