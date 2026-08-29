@@ -224,6 +224,105 @@ TEST(GIAO, OverlapFieldDerivativeHermitian) {
   }
 }
 
+// brute-force <omega_mu | -1/2 nabla^2 | omega_nu> by real-space quadrature
+// with a finite-difference Laplacian -- fully independent of the MD machinery.
+// London orbital (gauge origin O = 0): (r-C)^l e^{-a(r-C)^2} e^{i a_phase . r},
+// a_phase = -1/2 B x C.
+C grid_giao_kinetic(double a, const double *Ca, const int *la, double b,
+                    const double *Cb, const int *lb, const double *Bf, int n,
+                    double L) {
+  auto Bxv = [&](const double *Cv, double *out) {
+    out[0] = -0.5 * (Bf[1] * Cv[2] - Bf[2] * Cv[1]);
+    out[1] = -0.5 * (Bf[2] * Cv[0] - Bf[0] * Cv[2]);
+    out[2] = -0.5 * (Bf[0] * Cv[1] - Bf[1] * Cv[0]);
+  };
+  double aa[3], ab[3];
+  Bxv(Ca, aa);
+  Bxv(Cb, ab);
+  const double h = 2 * L / (n - 1);
+  auto orb = [&](double x, double y, double z, double e, const double *Cc,
+                 const int *l, const double *ph) {
+    const double dx = x - Cc[0], dy = y - Cc[1], dz = z - Cc[2];
+    double g = std::exp(-e * (dx * dx + dy * dy + dz * dz));
+    for (int i = 0; i < l[0]; ++i) g *= dx;
+    for (int i = 0; i < l[1]; ++i) g *= dy;
+    for (int i = 0; i < l[2]; ++i) g *= dz;
+    const double phase = ph[0] * x + ph[1] * y + ph[2] * z;
+    return C(g * std::cos(phase), g * std::sin(phase));
+  };
+  C acc(0);
+  for (int i = 1; i < n - 1; ++i)
+    for (int j = 1; j < n - 1; ++j)
+      for (int k = 1; k < n - 1; ++k) {
+        const double x = -L + i * h, y = -L + j * h, z = -L + k * h;
+        const C ket = orb(x, y, z, b, Cb, lb, ab);
+        const C lap =
+            (orb(x + h, y, z, b, Cb, lb, ab) + orb(x - h, y, z, b, Cb, lb, ab) +
+             orb(x, y + h, z, b, Cb, lb, ab) + orb(x, y - h, z, b, Cb, lb, ab) +
+             orb(x, y, z + h, b, Cb, lb, ab) + orb(x, y, z - h, b, Cb, lb, ab) -
+             6.0 * ket) /
+            (h * h);
+        acc += std::conj(orb(x, y, z, a, Ca, la, aa)) * (-0.5 * lap);
+      }
+  return acc * (h * h * h);
+}
+
+TEST(GIAO, KineticMatchesRealSpaceGrid) {
+  // independent oracle: giao_kinetic vs a real-space grid integral, for a
+  // p_x/s pair in a field along x (x,y components of the phase both active)
+  const double Bf[3] = {0.6, 0.0, 0.0};
+  auto bas = intti::make_basis<double>(
+      {{0.9, {kA[0], kA[1], kA[2]}, 1}, {1.3, {kB[0], kB[1], kB[2]}, 0}});
+  const double O[3] = {0.0, 0.0, 0.0};
+  auto T = intti::giao_kinetic(bas, Bf, O);
+  const int nao = bas.nao; // p(3) + s(1)
+  const int lax[3] = {1, 0, 0}, ls[3] = {0, 0, 0};
+  const C ref = grid_giao_kinetic(0.9, kA, lax, 1.3, kB, ls, Bf, 181, 8.0);
+  const C got = T[0 * nao + 3]; // <p_x(a)| T | s(b)>
+  // grid is coarse (finite-difference Laplacian); ~1e-3 agreement expected
+  EXPECT_LT(std::abs(got - ref), 3e-3 * std::abs(ref))
+      << "giao_kinetic " << got << " vs grid " << ref;
+}
+
+TEST(GIAO, KineticZeroFieldRealMatch) {
+  auto bas = giao_basis();
+  const double Bf[3] = {0.0, 0.0, 0.0}, O[3] = {0.1, -0.2, 0.3};
+  auto Tc = intti::giao_kinetic(bas, Bf, O);
+  auto Tr = intti::kinetic_matrix(bas);
+  double mx = 0, dev = 0;
+  for (std::size_t i = 0; i < Tr.size(); ++i) {
+    mx = std::max(mx, std::abs(Tr[i]));
+    dev = std::max(dev, std::abs(Tc[i].real() - Tr[i]));
+    dev = std::max(dev, std::abs(Tc[i].imag()));
+  }
+  EXPECT_LT(dev, 1e-13 * mx);
+}
+
+TEST(GIAO, KineticFieldDerivativeVsFiniteDiff) {
+  // -1/2 nabla^2 also differentiates the London phase, so dT/dB carries a
+  // gradient term beyond the phase-weighted kinetic; check the full analytic
+  // dT/dB against a central finite difference of the exact T(B).
+  auto bas = giao_basis();
+  const double O[3] = {0.1, -0.2, 0.3};
+  auto dT = intti::giao_kinetic_dB(bas, O);
+  const double h = 1e-4;
+  double worst = 0, scale = 0;
+  for (int k = 0; k < 3; ++k) {
+    double Bp[3] = {0, 0, 0}, Bm[3] = {0, 0, 0};
+    Bp[k] = h;
+    Bm[k] = -h;
+    auto Tp = intti::giao_kinetic(bas, Bp, O);
+    auto Tm = intti::giao_kinetic(bas, Bm, O);
+    for (std::size_t i = 0; i < Tp.size(); ++i) {
+      const C fd = (Tp[i] - Tm[i]) / (2.0 * h);
+      worst = std::max(worst, std::abs(fd - dT[k][i]));
+      scale = std::max(scale, std::abs(dT[k][i]));
+    }
+  }
+  EXPECT_GT(scale, 1e-3) << "derivative must be nonzero";
+  EXPECT_LT(worst, 1e-7 * (scale + 1)) << "analytic dT/dB != finite difference";
+}
+
 TEST(GIAO, NuclearZeroFieldRealMatch) {
   auto bas = giao_basis();
   auto grid = intti::make_tgrid(intti::coulomb());

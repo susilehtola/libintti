@@ -18,10 +18,16 @@ approved plan) is under way and mostly delivered:
   geometric derivatives (`geoderiv.hpp`) done. GIAO ∂/∂B started (`giao.hpp`):
   complex overlap S(B) in a finite field and the analytic dS/dB at B=0, vs
   PySCF `int1e_igovlp` (2.6e-16) and finite difference of S(B). Remaining:
-  RI/2e gradients into the Fock build, Hessians, and dT/dB (kinetic, where the
-  operator also differentiates the London phase). GIAO dV/dB done: complex
+  RI/2e gradients into the Fock build and Hessians. GIAO dV/dB done: complex
   nuclear V(B) and the analytic dV/dB (multiplicative operator, so phase-only
   like the overlap), vs PySCF int1e_ignuc (1.2e-14) and finite difference.
+  GIAO dT/dB done: -1/2 nabla^2 also differentiates the London phase, so
+  dT/dB carries a gradient term beyond the phase-weighted kinetic
+  (kinetic_moment_matrices + gradient_matrices). The exact finite-field T(B)
+  is built from the momentum form and validated against an independent
+  real-space grid integral (libcint's int1e_igkin is a one-sided g convention
+  and does not match the full symmetric derivative, so it is not used as the
+  oracle here); the analytic dT/dB matches finite difference of T(B).
 
 **Ground rules (binding for any implementer):** every deliverable has a hard
 oracle (PySCF or analytic) *and* an independent second check (finite

@@ -55,7 +55,7 @@ def libintti(dumper, workdir):
     n2 = nao * nao
     blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(31)]
     # S, T, dipole(3), quad(6), rinv@p0, rinv@p1, ipovlp(3), ipkin(3),
-    # iprinv@p0(3), angmom Lx,Ly,Lz(3), giao dS/dB_x,y,z(3), giao dV/dB_x,y,z(3)
+    # iprinv@p0(3), angmom Lx,Ly,Lz(3), giao dS/dB(3), dV/dB(3)
     return nao, blocks
 
 

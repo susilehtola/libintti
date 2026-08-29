@@ -288,6 +288,109 @@ std::array<std::vector<Real>, 3> angular_momentum(const ShellBasis<Real> &basis,
   return L;
 }
 
+/// Electron-gradient matrices G_c = <mu| d/dr_c |nu> (c = x, y, z), the ket
+/// derivative acting to the right. Real; equals -int1e_ipovlp by parts. Built
+/// directly from the ket-derivative 1D factor j S[i][j-1] - 2 beta S[i][j+1].
+template <class Real>
+std::array<std::vector<Real>, 3> gradient_matrices(const ShellBasis<Real> &basis) {
+  const int nao = basis.nao;
+  std::array<std::vector<Real>, 3> G;
+  for (auto &m : G) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
+      std::vector<Real> Sf[3], Kf[3];
+      for (int d = 0; d < 3; ++d) {
+        std::vector<Real> s;
+        int lbx;
+        detail::overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb, 0, 1,
+                           s, lbx);
+        Sf[d].assign(static_cast<std::size_t>(la + 1) * lb1, Real(0));
+        Kf[d].assign(static_cast<std::size_t>(la + 1) * lb1, Real(0));
+        for (int i = 0; i <= la; ++i)
+          for (int j = 0; j <= lb; ++j) {
+            Sf[d][i * lb1 + j] = s[i * (lbx + 1) + j];
+            Real k = -2 * sb.alpha * s[i * (lbx + 1) + (j + 1)];
+            if (j >= 1) k += Real(j) * s[i * (lbx + 1) + (j - 1)];
+            Kf[d][i * lb1 + j] = k;
+          }
+      }
+      for (int ka = 0; ka < ncart(la); ++ka) {
+        int a3[3];
+        cart_comp(la, ka, a3[0], a3[1], a3[2]);
+        for (int kb = 0; kb < ncart(lb); ++kb) {
+          int b3[3];
+          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+          auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
+          auto K = [&](int d) { return Kf[d][a3[d] * lb1 + b3[d]]; };
+          const std::size_t idx =
+              (basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb;
+          G[0][idx] = K(0) * S(1) * S(2);
+          G[1][idx] = S(0) * K(1) * S(2);
+          G[2][idx] = S(0) * S(1) * K(2);
+        }
+      }
+    }
+  return G;
+}
+
+/// Position-weighted kinetic matrices KM_c = <mu| x_c (-1/2 nabla^2) |nu> about
+/// the coordinate origin (c = x, y, z). Built by promoting the bra angular
+/// momentum by one unit: x_c = (x_c - A_c) + A_c. The GIAO kinetic
+/// field-derivative primitive (the analogue of nuclear_moment_matrices).
+template <class Real>
+std::array<std::vector<Real>, 3>
+kinetic_moment_matrices(const ShellBasis<Real> &basis) {
+  const int nao = basis.nao;
+  std::array<std::vector<Real>, 3> KM;
+  for (auto &m : KM) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int la = sa.l, lb = sb.l, la1 = la + 1, lb1 = lb + 1;
+      std::vector<Real> S[3], T[3]; // bra up to la+1, ket base
+      for (int d = 0; d < 3; ++d) {
+        std::vector<Real> s;
+        int lbx;
+        detail::overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb, 1, 2,
+                           s, lbx);
+        S[d].assign(static_cast<std::size_t>(la1 + 1) * lb1, Real(0));
+        for (int i = 0; i <= la1; ++i)
+          for (int j = 0; j <= lb; ++j) S[d][i * lb1 + j] = s[i * (lbx + 1) + j];
+        std::vector<Real> t;
+        detail::kinetic_1d(s, lbx, la1, lb, sb.alpha, t); // bra up to la1
+        T[d].assign(static_cast<std::size_t>(la1 + 1) * lb1, Real(0));
+        for (int i = 0; i <= la1; ++i)
+          for (int j = 0; j <= lb; ++j) T[d][i * lb1 + j] = t[i * lb1 + j];
+      }
+      auto Si = [&](int d, int i, int j) { return S[d][i * lb1 + j]; };
+      auto Ti = [&](int d, int i, int j) { return T[d][i * lb1 + j]; };
+      for (int ka = 0; ka < ncart(la); ++ka) {
+        int a3[3];
+        cart_comp(la, ka, a3[0], a3[1], a3[2]);
+        for (int kb = 0; kb < ncart(lb); ++kb) {
+          int b3[3];
+          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+          auto kin = [&](int ix, int iy, int iz) {
+            return Ti(0, ix, b3[0]) * Si(1, iy, b3[1]) * Si(2, iz, b3[2]) +
+                   Si(0, ix, b3[0]) * Ti(1, iy, b3[1]) * Si(2, iz, b3[2]) +
+                   Si(0, ix, b3[0]) * Si(1, iy, b3[1]) * Ti(2, iz, b3[2]);
+          };
+          const Real Tb = kin(a3[0], a3[1], a3[2]);
+          const std::size_t idx =
+              (basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb;
+          KM[0][idx] = kin(a3[0] + 1, a3[1], a3[2]) + sa.center[0] * Tb;
+          KM[1][idx] = kin(a3[0], a3[1] + 1, a3[2]) + sa.center[1] * Tb;
+          KM[2][idx] = kin(a3[0], a3[1], a3[2] + 1) + sa.center[2] * Tb;
+        }
+      }
+    }
+  return KM;
+}
+
 /// Trace(D^T M) -- contract a density (or any nao x nao matrix) with a
 /// property matrix to get the property value.
 template <class Real>

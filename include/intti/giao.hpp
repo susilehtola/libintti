@@ -210,6 +210,122 @@ giao_overlap_dB(const ShellBasis<Real> &basis) {
   return dS;
 }
 
+/// Complex GIAO kinetic matrix T(B) = <omega_mu| -1/2 nabla^2 |omega_nu> in a
+/// finite field B with gauge origin O. Unlike the overlap and nuclear cases,
+/// the operator differentiates the London phase, so this is built from the
+/// momentum form 1/2 sum_c <d_c omega_mu | d_c omega_nu>: each London-orbital
+/// gradient d_c omega = e^{i phi}(i a_c chi + d_c chi) with a = -1/2 B x (R-O),
+/// and every phase-weighted 1D overlap is the complex MD overlap table. Reduces
+/// to the real kinetic_matrix at B = 0. Used to finite-difference giao_kinetic_dB.
+template <class Real>
+std::vector<std::complex<Real>> giao_kinetic(const ShellBasis<Real> &basis,
+                                             const Real B[3], const Real O[3]) {
+  using C = std::complex<Real>;
+  static_assert(!is_complex_v<Real>, "giao_kinetic takes a real basis");
+  const int nao = basis.nao;
+  std::vector<C> T(static_cast<std::size_t>(nao) * nao, C(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  auto avec = [&](const Real R[3], Real out[3]) { // a = -1/2 B x (R - O)
+    const Real w[3] = {R[0] - O[0], R[1] - O[1], R[2] - O[2]};
+    out[0] = -Real(0.5) * (B[1] * w[2] - B[2] * w[1]);
+    out[1] = -Real(0.5) * (B[2] * w[0] - B[0] * w[2]);
+    out[2] = -Real(0.5) * (B[0] * w[1] - B[1] * w[0]);
+  };
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const auto sp = make_giao_pair(sa, sb, B);
+      const int la = sa.l, lb = sb.l, lap = la + 1, lbp = lb + 1, nt = lap + lbp + 1;
+      std::vector<C> s[3]; // complex 1D overlap tables, bra..la+1, ket..lb+1
+      for (int d = 0; d < 3; ++d) {
+        std::vector<C> E(static_cast<std::size_t>(lap + 1) * (lbp + 1) * nt);
+        e_coeffs(lap, lbp, sp.p, sp.P[d] - C(sa.center[d]), sp.P[d] - C(sb.center[d]),
+                 sp.K[d], E.data());
+        const Real pref = sqrt_(pi_v<Real>() / sp.p);
+        s[d].assign(static_cast<std::size_t>(lap + 1) * (lbp + 1), C(0));
+        for (int i = 0; i <= lap; ++i)
+          for (int j = 0; j <= lbp; ++j)
+            s[d][i * (lbp + 1) + j] = C(pref) * E[(i * (lbp + 1) + j) * nt + 0];
+      }
+      Real am[3], an[3];
+      avec(sa.center, am);
+      avec(sb.center, an);
+      const Real al = sa.alpha, be = sb.alpha;
+      auto sd = [&](int d, int i, int j) { return s[d][i * (lbp + 1) + j]; };
+      for (int ka = 0; ka < ncart(la); ++ka) {
+        int a3[3];
+        cart_comp(la, ka, a3[0], a3[1], a3[2]);
+        for (int kb = 0; kb < ncart(lb); ++kb) {
+          int b3[3];
+          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+          // 1D derivative-overlap-derivative factor in direction c
+          auto facc = [&](int c) {
+            C bc[3];
+            int bi[3];
+            int nb = 0;
+            bc[nb] = C(Real(0), -am[c]); bi[nb] = a3[c]; ++nb;      // conj phase deriv
+            bc[nb] = C(-2 * al);        bi[nb] = a3[c] + 1; ++nb;  // -2a (x-A)^{+1}
+            if (a3[c] >= 1) { bc[nb] = C(Real(a3[c])); bi[nb] = a3[c] - 1; ++nb; }
+            C kc[3];
+            int kj[3];
+            int nk = 0;
+            kc[nk] = C(Real(0), an[c]); kj[nk] = b3[c]; ++nk;
+            kc[nk] = C(-2 * be);        kj[nk] = b3[c] + 1; ++nk;
+            if (b3[c] >= 1) { kc[nk] = C(Real(b3[c])); kj[nk] = b3[c] - 1; ++nk; }
+            C f(0);
+            for (int p = 0; p < nb; ++p)
+              for (int q = 0; q < nk; ++q) f += bc[p] * kc[q] * sd(c, bi[p], kj[q]);
+            return f;
+          };
+          const C bx = sd(0, a3[0], b3[0]), by = sd(1, a3[1], b3[1]),
+                  bz = sd(2, a3[2], b3[2]);
+          T[(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
+              C(Real(0.5)) * (facc(0) * by * bz + bx * facc(1) * bz + bx * by * facc(2));
+        }
+      }
+    }
+  return T;
+}
+
+/// Analytic magnetic-field derivative dT/dB_k of the GIAO kinetic matrix at
+/// B = 0, gauge origin O. Because -1/2 nabla^2 also acts on the London phase,
+///   dT_munu/dB_k = (i/2) [e_k x (R_mu - R_nu)] . <mu| r (-1/2 nabla^2) |nu>
+///                + (i/2) [e_k x (R_nu - O)]   . <mu| grad |nu>,
+/// the first term the phase-weighted kinetic (kinetic_moment_matrices), the
+/// second from the operator differentiating the ket phase (gradient_matrices).
+/// Returns {dT/dB_x, dT/dB_y, dT/dB_z}.
+template <class Real>
+std::array<std::vector<std::complex<Real>>, 3>
+giao_kinetic_dB(const ShellBasis<Real> &basis, const Real O[3]) {
+  using C = std::complex<Real>;
+  static_assert(!is_complex_v<Real>, "giao_kinetic_dB takes a real basis");
+  const int nao = basis.nao;
+  const auto KM = kinetic_moment_matrices(basis); // <mu| x_c (-1/2 lap) |nu>
+  const auto G = gradient_matrices(basis);        // <mu| d/dr_c |nu>
+  std::array<std::vector<C>, 3> dT;
+  for (auto &m : dT) m.assign(static_cast<std::size_t>(nao) * nao, C(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  const C hi(Real(0), Real(0.5));
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const Real u[3] = {sa.center[0] - sb.center[0], sa.center[1] - sb.center[1],
+                         sa.center[2] - sb.center[2]};                        // R_mu - R_nu
+      const Real v[3] = {sb.center[0] - O[0], sb.center[1] - O[1], sb.center[2] - O[2]}; // R_nu - O
+      for (int ka = 0; ka < ncart(sa.l); ++ka)
+        for (int kb = 0; kb < ncart(sb.l); ++kb) {
+          const std::size_t idx =
+              (basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb;
+          const Real Kx = KM[0][idx], Ky = KM[1][idx], Kz = KM[2][idx];
+          const Real Gx = G[0][idx], Gy = G[1][idx], Gz = G[2][idx];
+          dT[0][idx] = hi * ((-u[2] * Ky + u[1] * Kz) + (-v[2] * Gy + v[1] * Gz));
+          dT[1][idx] = hi * ((u[2] * Kx - u[0] * Kz) + (v[2] * Gx - v[0] * Gz));
+          dT[2][idx] = hi * ((-u[1] * Kx + u[0] * Ky) + (-v[1] * Gx + v[0] * Gy));
+        }
+    }
+  return dT;
+}
+
 /// Complex GIAO nuclear-attraction matrix V(B) = <omega_mu| sum_C w_C/|r-R_C|
 /// |omega_nu> in a finite field B. The London phase shifts the product centre
 /// into the complex plane (make_giao_pair), so the ordinary MD + t-quadrature
