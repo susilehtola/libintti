@@ -65,6 +65,28 @@ TEST(OneEl, MatricesSymmetric) {
     EXPECT_GT(T[i * n + i], 0.0) << "kinetic diagonal must be positive";
 }
 
+TEST(OneEl, AngularMomentumAntisymmetric) {
+  // r x nabla is anti-Hermitian -> the AO matrix is real antisymmetric with
+  // zero diagonal (convention-independent structural check)
+  auto bas = basis();
+  const double O[3] = {0.1, 0.0, -0.2};
+  auto L = intti::angular_momentum(bas, O);
+  const int n = bas.nao;
+  for (int d = 0; d < 3; ++d) {
+    double asym = 0, mx = 0, diag = 0;
+    for (int i = 0; i < n; ++i) {
+      diag = std::max(diag, std::abs(L[d][i * n + i]));
+      for (int j = 0; j < n; ++j) {
+        asym = std::max(asym, std::abs(L[d][i * n + j] + L[d][j * n + i]));
+        mx = std::max(mx, std::abs(L[d][i * n + j]));
+      }
+    }
+    EXPECT_LT(asym, 1e-13 * (mx + 1)) << "component " << d << " not antisymmetric";
+    EXPECT_LT(diag, 1e-13) << "component " << d << " diagonal nonzero";
+    EXPECT_GT(mx, 1e-3) << "component " << d << " vanished";
+  }
+}
+
 TEST(OneEl, PropertyValueContraction) {
   auto bas = basis();
   auto S = intti::overlap_matrix(bas);

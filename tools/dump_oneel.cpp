@@ -82,6 +82,9 @@ int main(int argc, char **argv) {
   std::vector<intti::PointCharge<double>> one{{1.0, {pts[0][0], pts[0][1], pts[0][2]}}};
   auto dV = intti::nuclear_deriv(basis, one, grid);
   for (int d = 0; d < 3; ++d) write_norm(dV[d]);
+  // angular momentum <mu|(r-O) x nabla|nu> about origin
+  auto Lm = intti::angular_momentum(basis, origin);
+  for (int d = 0; d < 3; ++d) write_norm(Lm[d]);
   std::printf("nao %d\n", nao);
   return 0;
 }

@@ -45,9 +45,9 @@ def libintti(dumper, workdir):
     nao = int(r.stdout.split()[-1])
     data = np.fromfile(out, dtype=np.float64)
     n2 = nao * nao
-    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(22)]
+    blocks = [data[i * n2:(i + 1) * n2].reshape(nao, nao) for i in range(25)]
     # S, T, dipole(3), quad(6), rinv@p0, rinv@p1, ipovlp(3), ipkin(3),
-    # iprinv@p0(3)
+    # iprinv@p0(3), angmom Lx,Ly,Lz(3)
     return nao, blocks
 
 
@@ -85,6 +85,16 @@ def main():
     iprinv = mol.intor("int1e_iprinv_cart")   # (3, nao, nao)
     for d, ax in enumerate("xyz"):
         refs[f"iprinv_{ax}"] = (iprinv[d], B[19 + d])
+    # angular momentum: PySCF int1e_cg_irxp = <mu| r x nabla |nu> about the
+    # common gauge origin; compare up to an overall sign per component.
+    mol.set_common_orig([0.0, 0.0, 0.0])
+    irxp = mol.intor("int1e_cg_irxp_cart")    # (3, nao, nao)
+    for d, ax in enumerate("xyz"):
+        ref, got = irxp[d], B[22 + d]
+        sc = max(np.abs(ref).max(), 1e-12)
+        # compare up to overall sign (convention)
+        refs[f"L{ax}"] = (ref, got if np.abs(got - ref).max() <= np.abs(got + ref).max()
+                          else -got)
     worst = 0.0
     ok = True
     for name, (ref, got) in refs.items():

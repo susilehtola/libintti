@@ -6,7 +6,8 @@ driven entirely by libintti matches PySCF to 1.4×10⁻¹³ Ha). The **RI +
 property + derivative + local-hybrid program** (matrix-level API; see the
 approved plan) is under way and mostly delivered:
 
-- **M10 done** — 1e property matrices (overlap, kinetic, multipoles), `oneel.hpp`.
+- **M10 done** — 1e property matrices (overlap, kinetic, multipoles, and
+  angular momentum ⟨μ|(r−O)×∇|ν⟩ vs PySCF `int1e_cg_irxp`), `oneel.hpp`.
 - **M11 done** — screened nuclear attraction + Coulomb-potential collocation, `nuclear.hpp`.
 - **M12 done** — 2-/3-center Coulomb (ghost-shell), `ncenter.hpp`.
 - **M13 done** — RI J/K + occupation-driven RI-K, `ri.hpp`.
@@ -104,8 +105,8 @@ intor):** `INT_OVERLAP`, `INT_KIN_ENERGY`, `INT_POT_ENERGY` (nuclear),
 `INT_ONE_HAMIL` (T+V), `INT_CART_MULTIPOLE`, `INT_SPHER_MULTIPOLE`,
 `INT_ANGMOM` (angular momentum), `INT_PSO` (paramagnetic spin-orbit),
 `INT_GAUSSIAN_POT` (finite-nucleus/effective potential), plus ECP. libintti
-has S, T, V, Cartesian multipoles, and their gradients (M10/M16); missing:
-angular momentum, PSO, Gaussian/finite-nucleus potential, ECP, spherical
+has S, T, V, Cartesian multipoles, angular momentum ⟨r×∇⟩, and their gradients
+(M10/M16); missing: PSO, Gaussian/finite-nucleus potential, ECP, spherical
 multipoles (c2s handles the transform).
 
 **Key architectural lesson — arbitrary-order geometric derivatives via an

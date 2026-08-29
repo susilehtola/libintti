@@ -225,6 +225,69 @@ inline std::vector<std::array<int, 3>> multipole_labels(int max_order) {
   return comps;
 }
 
+/// Angular-momentum integrals <mu|(r-O) x nabla|nu>, three matrices
+/// (Lx, Ly, Lz). r x nabla is anti-Hermitian, so each matrix is real and
+/// antisymmetric. Per direction the integrand factors into an overlap S, a
+/// moment M_d = <i|(x_d-O_d)|j>, and a ket derivative K_d = <i|d/dx_d|j>:
+///   Lx = Sx (My Kz - Ky Mz),  Ly = Sy (Mz Kx - Mx Kz),  Lz = Sz (Mx Ky - My Kx).
+/// This is <mu| r x p |nu> up to the -i in p (that factor is the caller's
+/// convention; PySCF int1e_cg_irxp carries the i).
+template <class Real>
+std::array<std::vector<Real>, 3> angular_momentum(const ShellBasis<Real> &basis,
+                                                  const Real origin[3]) {
+  const int nao = basis.nao;
+  std::array<std::vector<Real>, 3> L;
+  for (auto &m : L) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
+      std::vector<Real> Sf[3], Mf[3], Kf[3];
+      for (int d = 0; d < 3; ++d) {
+        std::vector<Real> s;
+        int lbx;
+        detail::overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb, 1, 1,
+                           s, lbx);
+        // overlap S (restricted to la x lb)
+        Sf[d].assign(static_cast<std::size_t>(la + 1) * lb1, Real(0));
+        Kf[d].assign(static_cast<std::size_t>(la + 1) * lb1, Real(0));
+        for (int i = 0; i <= la; ++i)
+          for (int j = 0; j <= lb; ++j) {
+            Sf[d][i * lb1 + j] = s[i * (lbx + 1) + j];
+            // ket derivative d/dx_d : j S[i][j-1] - 2 beta S[i][j+1]
+            Real k = -2 * sb.alpha * s[i * (lbx + 1) + (j + 1)];
+            if (j >= 1) k += Real(j) * s[i * (lbx + 1) + (j - 1)];
+            Kf[d][i * lb1 + j] = k;
+          }
+        // moment M_d = <i|(x_d - O_d)|j> = S_{i+1,j} + (A_d - O_d) S_{i,j}
+        std::vector<Real> m1;
+        detail::multipole_1d(s, lbx, la, lb, sa.center[d], origin[d], 1, m1);
+        Mf[d].assign(static_cast<std::size_t>(la + 1) * lb1, Real(0));
+        for (int i = 0; i <= la; ++i)
+          for (int j = 0; j <= lb; ++j)
+            Mf[d][i * lb1 + j] = m1[(1 * (la + 1) + i) * lb1 + j]; // e=1 block
+      }
+      for (int ka = 0; ka < ncart(la); ++ka) {
+        int a3[3];
+        cart_comp(la, ka, a3[0], a3[1], a3[2]);
+        for (int kb = 0; kb < ncart(lb); ++kb) {
+          int b3[3];
+          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+          auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
+          auto M = [&](int d) { return Mf[d][a3[d] * lb1 + b3[d]]; };
+          auto K = [&](int d) { return Kf[d][a3[d] * lb1 + b3[d]]; };
+          const std::size_t idx =
+              (basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb;
+          L[0][idx] = S(0) * (M(1) * K(2) - K(1) * M(2));
+          L[1][idx] = S(1) * (M(2) * K(0) - M(0) * K(2));
+          L[2][idx] = S(2) * (M(0) * K(1) - M(1) * K(0));
+        }
+      }
+    }
+  return L;
+}
+
 /// Trace(D^T M) -- contract a density (or any nao x nao matrix) with a
 /// property matrix to get the property value.
 template <class Real>
