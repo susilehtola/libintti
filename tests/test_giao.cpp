@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include "intti/giao.hpp"
+#include "intti/giao2e.hpp"
 #include "intti/quartet.hpp"
 
 namespace {
@@ -321,6 +322,92 @@ TEST(GIAO, KineticFieldDerivativeVsFiniteDiff) {
   }
   EXPECT_GT(scale, 1e-3) << "derivative must be nonzero";
   EXPECT_LT(worst, 1e-7 * (scale + 1)) << "analytic dT/dB != finite difference";
+}
+
+// finite-field GIAO J and K reference by direct complex quartet summation:
+//   J(B)_mn = sum_ls (mn|ls)_giao D_ls,  K(B)_mn = sum_ls (ml|ns)_giao D_ls.
+void giao_jk_ref(const intti::ShellBasis<double> &bas, const double *D,
+                 const double *Bf, const intti::TGrid<double> &grid,
+                 std::vector<C> &J, std::vector<C> &K) {
+  const int ns = static_cast<int>(bas.shells.size()), nao = bas.nao;
+  J.assign(static_cast<std::size_t>(nao) * nao, C(0));
+  K.assign(static_cast<std::size_t>(nao) * nao, C(0));
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b)
+      for (int cc = 0; cc < ns; ++cc)
+        for (int dd = 0; dd < ns; ++dd) {
+          const int la = bas.shells[a].l, lb = bas.shells[b].l, lc = bas.shells[cc].l,
+                    ld = bas.shells[dd].l;
+          const int na = intti::ncart(la), nb = intti::ncart(lb), ncc = intti::ncart(lc),
+                    nd = intti::ncart(ld);
+          std::vector<C> blk(static_cast<std::size_t>(na) * nb * ncc * nd);
+          intti::eri_quartet(intti::make_giao_pair(bas.shells[a], bas.shells[b], Bf),
+                             intti::make_giao_pair(bas.shells[cc], bas.shells[dd], Bf),
+                             grid, blk.data());
+          const int oa = bas.ao_off[a], ob = bas.ao_off[b], oc = bas.ao_off[cc],
+                    odd = bas.ao_off[dd];
+          for (int ka = 0; ka < na; ++ka)
+            for (int kb = 0; kb < nb; ++kb)
+              for (int kc = 0; kc < ncc; ++kc)
+                for (int kd = 0; kd < nd; ++kd) {
+                  const C v = blk[((static_cast<std::size_t>(ka) * nb + kb) * ncc + kc) * nd + kd];
+                  J[(oa + ka) * static_cast<std::size_t>(nao) + ob + kb] +=
+                      v * Dm(oc + kc, odd + kd);
+                  K[(oa + ka) * static_cast<std::size_t>(nao) + oc + kc] +=
+                      v * Dm(ob + kb, odd + kd);
+                }
+        }
+}
+
+TEST(GIAO, JKFieldDerivativeVsFiniteDiff) {
+  // analytic dJ/dB, dK/dB against a central finite difference of the exact
+  // finite-field GIAO J(B)/K(B) built by direct complex quartet summation.
+  auto bas = giao_basis(); // s, p, d on three centres
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  // symmetric positive test density
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) D[i * nao + j] = 0.3 / (1 + std::abs(i - j)) + (i == j ? 0.5 : 0);
+  auto d = intti::giao_jk_dB(bas, D.data(), grid);
+  const double h = 1e-4;
+  double worstJ = 0, worstK = 0, scaleJ = 0, scaleK = 0;
+  for (int k = 0; k < 3; ++k) {
+    double Bp[3] = {0, 0, 0}, Bm[3] = {0, 0, 0};
+    Bp[k] = h;
+    Bm[k] = -h;
+    std::vector<C> Jp, Kp, Jm, Km;
+    giao_jk_ref(bas, D.data(), Bp, grid, Jp, Kp);
+    giao_jk_ref(bas, D.data(), Bm, grid, Jm, Km);
+    for (std::size_t i = 0; i < Jp.size(); ++i) {
+      const C fdJ = (Jp[i] - Jm[i]) / (2.0 * h), fdK = (Kp[i] - Km[i]) / (2.0 * h);
+      worstJ = std::max(worstJ, std::abs(fdJ - d.dJ[k][i]));
+      worstK = std::max(worstK, std::abs(fdK - d.dK[k][i]));
+      scaleJ = std::max(scaleJ, std::abs(d.dJ[k][i]));
+      scaleK = std::max(scaleK, std::abs(d.dK[k][i]));
+    }
+  }
+  EXPECT_GT(scaleJ, 1e-3);
+  EXPECT_GT(scaleK, 1e-3);
+  EXPECT_LT(worstJ, 1e-7 * (scaleJ + 1)) << "analytic dJ/dB != finite difference";
+  EXPECT_LT(worstK, 1e-7 * (scaleK + 1)) << "analytic dK/dB != finite difference";
+}
+
+TEST(GIAO, JKFieldDerivativeImaginaryAndReal) {
+  // dJ/dB and dK/dB are purely imaginary at B=0 (real ERIs, i from the phase);
+  // dJ is Hermitian (imag part antisymmetric), so its diagonal is zero
+  auto bas = giao_basis();
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int i = 0; i < nao; ++i) D[i * nao + i] = 1.0;
+  auto d = intti::giao_jk_dB(bas, D.data(), grid);
+  for (int k = 0; k < 3; ++k)
+    for (std::size_t i = 0; i < d.dJ[k].size(); ++i) {
+      EXPECT_EQ(d.dJ[k][i].real(), 0.0);
+      EXPECT_EQ(d.dK[k][i].real(), 0.0);
+    }
 }
 
 TEST(GIAO, NuclearZeroFieldRealMatch) {

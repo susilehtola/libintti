@@ -28,6 +28,13 @@ approved plan) is under way and mostly delivered:
   real-space grid integral (libcint's int1e_igkin is a one-sided g convention
   and does not match the full symmetric derivative, so it is not used as the
   oracle here); the analytic dT/dB matches finite difference of T(B).
+  Two-electron dJ/dB, dK/dB done (`giao2e.hpp`, matrix-level: density in,
+  imaginary first-order J/K matrices out): 1/r12 is multiplicative so the
+  field differentiates only the two pair phases, giving i times a combination
+  of real position-weighted (bra-promoted) ERIs contracted with the density.
+  Validated vs finite difference of the exact complex finite-field GIAO
+  J(B)/K(B) built by direct quartet summation. Remaining: RI/2e geometric
+  gradients into the Fock build, and Hessians.
 
 **Ground rules (binding for any implementer):** every deliverable has a hard
 oracle (PySCF or analytic) *and* an independent second check (finite
