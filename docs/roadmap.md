@@ -53,8 +53,13 @@ approved plan) is under way and mostly delivered:
   centre Coulomb integrals via the erigrad centre-shift (the zero-exponent
   ghost never moves); returns per-shell forces over the orbital and auxiliary
   bases. Validated vs finite difference of the ri_fit/ri_jk energy and
-  translationally invariant. Remaining: the RI-K (exchange) gradient (double
-  density contraction through a 3-index intermediate).
+  translationally invariant. RI-K (exchange) gradient done (same file): the
+  double density contraction routes through the density-transformed 3-index
+  H_{sn}^Q = sum_l D_sl (ln|Q) and its fit G = M^{-1} H, giving 3-centre and
+  2-centre coefficient tensors that the same quartet_pos_grad helper contracts;
+  validated vs finite difference of the ri_jk exchange energy. RI J and K
+  gradients thus complete the RI Fock-derivative surface (skeleton; the caller
+  adds CPHF).
 
 **Scope boundary.** libintti stops at the integral/matrix level: derivative
 integrals and the skeleton (frozen-density) energy-derivative contractions

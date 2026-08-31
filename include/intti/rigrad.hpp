@@ -183,4 +183,117 @@ RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
   return g;
 }
 
+/// Geometric gradient of the RI exchange energy E_K = -1/4 sum_mn D_mn K_mn
+/// (K from ri_jk) w.r.t. the orbital- and auxiliary-shell centres. With the
+/// density-transformed 3-index H_{sn}^Q = sum_l D_sl (ln|Q), its fit
+/// G_{ab}^R = sum_Q M^{-1}_RQ H_{ab}^Q, and E_K = -1/4 sum_Q H_{ns}^Q G_{sn}^Q,
+///   dE_K/dx = -1/2 sum_{lnR} [sum_s D_ls G_{ns}^R] d(ln|R)/dx
+///           + 1/4  sum_{TU}   [sum_sn G_{ns}^T G_{sn}^U] d(T|U)/dx.
+template <class Real>
+RIGrad<Real> ri_k_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                           const Real *D, const TGrid<Real> &grid,
+                           Real tau_lin = Real(1e-10)) {
+  const int nao = orb.nao, naux = aux.nao;
+  auto M = coulomb_2c(aux, grid);
+  auto T = coulomb_3c(orb, aux, grid); // T[(mu*nao+la)*naux+P] = (mu la|P)
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
+  const std::size_t no2 = static_cast<std::size_t>(nao) * nao;
+
+  // M^{-1} (pseudo-inverse with cutoff)
+  std::vector<Real> V = M, eval(naux);
+  detail::syevd(naux, V.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int k = 0; k < naux; ++k) {
+    if (eval[k] <= tau_lin * emax) continue;
+    const Real s = Real(1) / eval[k];
+    for (int R = 0; R < naux; ++R)
+      for (int Q = 0; Q < naux; ++Q) Minv[R * naux + Q] += s * V[k * naux + R] * V[k * naux + Q];
+  }
+
+  // H[(s*nao+n)*naux+Q] = sum_l D_sl (l n|Q)
+  std::vector<Real> H(no2 * naux, Real(0));
+  for (int s = 0; s < nao; ++s)
+    for (int l = 0; l < nao; ++l) {
+      const Real dsl = Dm(s, l);
+      if (dsl == Real(0)) continue;
+      for (int n = 0; n < nao; ++n)
+        for (int Q = 0; Q < naux; ++Q)
+          H[(static_cast<std::size_t>(s) * nao + n) * naux + Q] +=
+              dsl * T[(static_cast<std::size_t>(l) * nao + n) * naux + Q];
+    }
+  // G[(a*nao+b)*naux+R] = sum_Q M^{-1}_RQ H[(a*nao+b)*naux+Q]
+  std::vector<Real> G(no2 * naux, Real(0));
+  for (std::size_t ab = 0; ab < no2; ++ab)
+    for (int R = 0; R < naux; ++R) {
+      Real s = 0;
+      for (int Q = 0; Q < naux; ++Q) s += Minv[R * naux + Q] * H[ab * naux + Q];
+      G[ab * naux + R] = s;
+    }
+  // c3[(l*nao+n)*naux+R] = -1/2 sum_s D_ls G[(n*nao+s)*naux+R]
+  std::vector<Real> c3(no2 * naux, Real(0));
+  for (int l = 0; l < nao; ++l)
+    for (int n = 0; n < nao; ++n)
+      for (int R = 0; R < naux; ++R) {
+        Real s = 0;
+        for (int sig = 0; sig < nao; ++sig)
+          s += Dm(l, sig) * G[(static_cast<std::size_t>(n) * nao + sig) * naux + R];
+        c3[(static_cast<std::size_t>(l) * nao + n) * naux + R] = Real(-0.5) * s;
+      }
+  // c2[T*naux+U] = 1/4 sum_{sn} G[(n*nao+s)*naux+T] G[(s*nao+n)*naux+U]
+  std::vector<Real> c2(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int Tc = 0; Tc < naux; ++Tc)
+    for (int U = 0; U < naux; ++U) {
+      Real s = 0;
+      for (int n = 0; n < nao; ++n)
+        for (int sig = 0; sig < nao; ++sig)
+          s += G[(static_cast<std::size_t>(n) * nao + sig) * naux + Tc] *
+               G[(static_cast<std::size_t>(sig) * nao + n) * naux + U];
+      c2[Tc * naux + U] = Real(0.25) * s;
+    }
+
+  RIGrad<Real> g;
+  g.forb.assign(orb.shells.size(), {Real(0), Real(0), Real(0)});
+  g.faux.assign(aux.shells.size(), {Real(0), Real(0), Real(0)});
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+
+  // Term 1: 3-centre d(l n|R) contracted with c3, quartet (l n | R ghost)
+  for (int lsh = 0; lsh < nso; ++lsh)
+    for (int nsh = 0; nsh < nso; ++nsh)
+      for (int a = 0; a < nsa; ++a) {
+        const auto &sl = orb.shells[lsh], &sn = orb.shells[nsh], &sR = aux.shells[a];
+        const auto gh = detail::ghost_shell(sR);
+        const int ol = orb.ao_off[lsh], on = orb.ao_off[nsh], oR = aux.ao_off[a];
+        auto coeff = [&](int kl, int kn, int kR, int) {
+          return c3[((static_cast<std::size_t>(ol + kl) * nao + on + kn) * naux) + oR + kR];
+        };
+        const int posshell[3] = {lsh, nsh, a};
+        for (int pos = 0; pos < 3; ++pos) {
+          Real out[3] = {0, 0, 0};
+          detail::quartet_pos_grad(sl, sn, sR, gh, pos, grid, coeff, out);
+          auto &F = (pos == 2) ? g.faux[a] : g.forb[posshell[pos]];
+          for (int e = 0; e < 3; ++e) F[e] += out[e];
+        }
+      }
+  // Term 2: 2-centre d(T|U) contracted with c2, quartet (T ghost | U ghost)
+  for (int a = 0; a < nsa; ++a)
+    for (int b = 0; b < nsa; ++b) {
+      const auto &sT = aux.shells[a], &sU = aux.shells[b];
+      const auto ghT = detail::ghost_shell(sT), ghU = detail::ghost_shell(sU);
+      const int oT = aux.ao_off[a], oU = aux.ao_off[b];
+      auto coeff = [&](int kT, int, int kU, int) {
+        return c2[(static_cast<std::size_t>(oT + kT) * naux) + oU + kU];
+      };
+      for (int pos : {0, 2}) {
+        Real out[3] = {0, 0, 0};
+        detail::quartet_pos_grad(sT, ghT, sU, ghU, pos, grid, coeff, out);
+        auto &F = (pos == 0) ? g.faux[a] : g.faux[b];
+        for (int e = 0; e < 3; ++e) F[e] += out[e];
+      }
+    }
+  return g;
+}
+
 } // namespace intti

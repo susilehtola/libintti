@@ -51,6 +51,50 @@ double ri_j_energy(const std::vector<Shell> &os, const std::vector<Shell> &as,
   return e;
 }
 
+double ri_k_energy(const std::vector<Shell> &os, const std::vector<Shell> &as,
+                   const std::vector<double> &D, const intti::TGrid<double> &grid) {
+  auto orb = intti::make_basis(os);
+  auto aux = intti::make_basis(as);
+  auto fit = intti::ri_fit(orb, aux, grid, 1e-12);
+  std::vector<double> K(static_cast<std::size_t>(orb.nao) * orb.nao, 0.0);
+  intti::ri_jk(fit, D.data(), static_cast<double *>(nullptr), K.data());
+  double e = 0;
+  for (std::size_t i = 0; i < K.size(); ++i) e += -0.25 * D[i] * K[i];
+  return e;
+}
+
+TEST(RIGrad, ExchangeGradientVsFiniteDifference) {
+  auto os = orb_shells();
+  auto as = aux_shells();
+  auto orb = intti::make_basis(os);
+  auto D = density(orb.nao);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto g = intti::ri_k_gradient(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  const double h = 1e-4;
+  double worst = 0, scale = 0;
+  auto fd = [&](std::vector<Shell> &shells, int s, int e) {
+    const double c0 = shells[s].center[e];
+    shells[s].center[e] = c0 + h;
+    const double ep = ri_k_energy(os, as, D, grid);
+    shells[s].center[e] = c0 - h;
+    const double em = ri_k_energy(os, as, D, grid);
+    shells[s].center[e] = c0;
+    return (ep - em) / (2 * h);
+  };
+  for (int s = 0; s < static_cast<int>(os.size()); ++s)
+    for (int e = 0; e < 3; ++e) {
+      worst = std::max(worst, std::abs(fd(os, s, e) - g.forb[s][e]));
+      scale = std::max(scale, std::abs(g.forb[s][e]));
+    }
+  for (int s = 0; s < static_cast<int>(as.size()); ++s)
+    for (int e = 0; e < 3; ++e) {
+      worst = std::max(worst, std::abs(fd(as, s, e) - g.faux[s][e]));
+      scale = std::max(scale, std::abs(g.faux[s][e]));
+    }
+  EXPECT_GT(scale, 1e-2) << "gradient must be nonzero";
+  EXPECT_LT(worst, 1e-6 * (scale + 1)) << "analytic RI-K gradient != finite difference";
+}
+
 TEST(RIGrad, CoulombGradientVsFiniteDifference) {
   auto os = orb_shells();
   auto as = aux_shells();
