@@ -91,7 +91,17 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   once), so all NAO integrals reduce to GTO 2-/3-center RI; grid path kept as
   the exact reference. Oracle: NAO-via-fit vs NAO-via-grid.
 
-- **M-STO — Slater-type orbitals** (new, folded in 2026): an STO is the exact
+- **M-STO — Slater-type orbitals** (minimal STOs done, `sto.hpp`): a minimal
+  STO (n = l+1), r^l Y_lm e^{-ζr}, is a contracted Cartesian GTO shell of
+  angular momentum l with the s-expansion exponents/coefficients, so every
+  existing matrix builder works once the primitive shells are contracted.
+  `sto_gaussians` builds the log-Gauss-Legendre s-expansion, `expand_sto`
+  emits the primitive ShellBasis + contraction map, `contract_to_sto` folds a
+  primitive AO matrix to the STO basis. Validated vs analytic Slater results:
+  the s-expansion reproduces e^{-ζr} to 1e-9, the 1s/2p self-overlaps hit
+  π/ζ³ and π/ζ⁵ to 1e-8, and the 1s self-repulsion hits 5ζ/8 to 1e-6.
+  Remaining: higher n (extra even radial powers r^{2k}) and the delta-tail
+  acceleration of the s-quadrature below. An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.

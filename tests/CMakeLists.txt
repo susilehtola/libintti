@@ -34,7 +34,8 @@ add_executable(intti_tests
   test_erigrad.cpp
   test_erihess.cpp
   test_geohess.cpp
-  test_rigrad.cpp)
+  test_rigrad.cpp
+  test_sto.cpp)
 if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_ri.cpp)
 endif()
