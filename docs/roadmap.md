@@ -38,13 +38,24 @@ approved plan) is under way and mostly delivered:
   l+/-1 x l+/-1 cross shells), contracted with the two-particle density into
   a (3 ns) x (3 ns) matrix; validated vs finite difference of the 2e gradient,
   symmetric, translationally invariant. One-electron overlap and kinetic
-  Hessians and the nuclear-repulsion Hessian done (`geohess.hpp`): the order-2
-  geoderiv blocks routed per shell into a (3 ns) x (3 ns) matrix over the four
-  bra/ket-centre families, weighted by the (energy-weighted) density; all
-  validated vs a finite-difference second difference. Remaining for a full
-  molecular Hessian: the nuclear-attraction electronic Hessian (needs the
-  operator-centre derivative) and the CPHF orbital-response term; and wiring
-  the GIAO first-order Fock into a response/CPHF driver.
+  Hessians, the nuclear-attraction electronic Hessian, and the
+  nuclear-repulsion Hessian done (`geohess.hpp`): the order-2 geoderiv blocks
+  routed per shell into a (3 ns) x (3 ns) matrix over the bra/ket-centre
+  families (weighted by the energy-weighted density / density); the
+  nuclear-attraction Hessian adds the operator-centre derivative via
+  translational invariance (d/dR_C = -(d_A + d_B) per single-charge term, so
+  no new integral is needed); all validated vs a finite-difference second
+  difference. This completes the **integral/skeleton Hessian**: the
+  frozen-density second-derivative contributions of every energy term.
+
+**Scope boundary.** libintti stops at the integral/matrix level: derivative
+integrals and the skeleton (frozen-density) energy-derivative contractions
+(gradient/Hessian of an energy term given a density; the first-order Fock
+builders). The CPHF/CP-SCF orbital-response solve that turns a skeleton
+Hessian or a first-order Fock into true frequencies / magnetic properties is
+the host SCF code's responsibility (it is needed independently of who supplies
+the integrals) and is deliberately **not** in libintti; libintti only feeds it
+the matrix-level pieces it consumes.
 
 **Ground rules (binding for any implementer):** every deliverable has a hard
 oracle (PySCF or analytic) *and* an independent second check (finite

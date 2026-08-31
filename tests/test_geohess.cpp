@@ -102,6 +102,57 @@ TEST(GeoHess, OneElectronHessianSymmetric) {
   }
 }
 
+TEST(GeoHess, NuclearAttractionHessianVsFiniteDiff) {
+  // three shells, each on its own centre carrying a point charge (an "atom");
+  // moving an atom displaces its shell centre and its nucleus together.
+  std::vector<Shell> shells = {{1.1, {0.0, 0.0, 0.0}, 0},
+                               {0.7, {0.3, -0.2, 1.1}, 1},
+                               {0.9, {-0.5, 0.4, 0.6}, 0}};
+  const int ns = static_cast<int>(shells.size());
+  auto bas0 = intti::make_basis(shells);
+  const int nao = bas0.nao, dim = 3 * ns;
+  const double Z[3] = {1.0, 6.0, 1.0};
+  std::vector<int> charge_shell = {0, 1, 2};
+  auto make_charges = [&](const std::vector<Shell> &sh) {
+    std::vector<intti::PointCharge<double>> c(ns);
+    for (int i = 0; i < ns; ++i)
+      c[i] = {-Z[i], {sh[i].center[0], sh[i].center[1], sh[i].center[2]}};
+    return c;
+  };
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto W = rand_sym(nao, 31);
+  auto H = intti::nuclear_attraction_hessian(bas0, make_charges(shells), grid, charge_shell,
+                                             W.data());
+  auto Ene = [&](const std::vector<Shell> &sh) {
+    auto b = intti::make_basis(sh);
+    auto V = intti::nuclear_matrix(b, make_charges(sh), grid);
+    double e = 0;
+    for (std::size_t i = 0; i < W.size(); ++i) e += W[i] * V[i];
+    return e;
+  };
+  auto E = [&](int p, int e, double sp, int q, int f, double sq) {
+    auto sh = shells;
+    sh[p].center[e] += sp; // moves shell centre and (via make_charges) the nucleus
+    sh[q].center[f] += sq;
+    return Ene(sh);
+  };
+  const double h = 2e-3;
+  double worst = 0, scale = 0;
+  for (int p = 0; p < ns; ++p)
+    for (int e = 0; e < 3; ++e)
+      for (int q = 0; q < ns; ++q)
+        for (int f = 0; f < 3; ++f) {
+          const double fd = (E(p, e, h, q, f, h) - E(p, e, h, q, f, -h) -
+                             E(p, e, -h, q, f, h) + E(p, e, -h, q, f, -h)) /
+                            (4 * h * h);
+          const double an = H[(3 * p + e) * static_cast<std::size_t>(dim) + 3 * q + f];
+          worst = std::max(worst, std::abs(fd - an));
+          scale = std::max(scale, std::abs(an));
+        }
+  EXPECT_GT(scale, 1e-2) << "hessian must be nonzero";
+  EXPECT_LT(worst, 5e-5 * (scale + 1)) << "analytic V Hessian != finite difference";
+}
+
 TEST(GeoHess, NuclearRepulsionHessianVsFiniteDiff) {
   std::vector<intti::PointCharge<double>> chg{
       {1.0, {0.0, 0.0, 0.0}}, {8.0, {0.0, 0.0, 1.8}}, {1.0, {1.4, 0.0, 2.2}}};

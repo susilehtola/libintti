@@ -101,6 +101,82 @@ std::vector<Real> kinetic_hessian(const ShellBasis<Real> &basis, const Real *D) 
       });
 }
 
+/// Hessian of the nuclear-attraction energy sum_mn D_mn V_mn,
+/// V_mn = sum_C w_C <m|1/|r-R_C||n>, w.r.t. the shell centres, as a
+/// (3 ns) x (3 ns) matrix. Each single-charge term depends on the bra centre,
+/// the ket centre, and the nucleus R_C; by translational invariance the
+/// operator-centre derivative is d/dR_C = -(d_A + d_B), so the whole Hessian
+/// is assembled from bra/ket geometric derivatives (nuclear_geoderiv) with a
+/// per-shell coefficient of +1 on the bra/ket centre and -1 on the nucleus.
+/// charge_shell[c] gives the shell index whose centre coincides with charge c
+/// (the atom carrying the nucleus); differentiating that shell moves the
+/// nucleus too.
+template <class Real>
+std::vector<Real>
+nuclear_attraction_hessian(const ShellBasis<Real> &basis,
+                           const std::vector<PointCharge<Real>> &charges,
+                           const TGrid<Real> &grid, const std::vector<int> &charge_shell,
+                           const Real *D) {
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao, dim = 3 * ns;
+  std::vector<Real> H(static_cast<std::size_t>(dim) * dim, Real(0));
+  std::vector<int> ao2sh(nao);
+  for (int s = 0; s < ns; ++s)
+    for (int k = basis.ao_off[s]; k < basis.ao_off[s + 1]; ++k) ao2sh[k] = s;
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
+  auto Hadd = [&](int p, int e, int q, int f, Real v) {
+    H[(3 * p + e) * static_cast<std::size_t>(dim) + 3 * q + f] += v;
+  };
+  const std::array<int, 3> zero = {0, 0, 0};
+  for (std::size_t c = 0; c < charges.size(); ++c) {
+    const int nc = charge_shell[c];
+    std::vector<PointCharge<Real>> one{charges[c]};
+    for (int e = 0; e < 3; ++e)
+      for (int f = 0; f < 3; ++f) {
+        std::array<int, 3> nbb = {0, 0, 0}, na = {0, 0, 0}, nb = {0, 0, 0};
+        nbb[e] += 1;
+        nbb[f] += 1;
+        na[e] += 1;
+        nb[f] += 1;
+        auto Mbb = nuclear_geoderiv(basis, one, grid, nbb, zero); // d^bra_e d^bra_f
+        auto Mbk = nuclear_geoderiv(basis, one, grid, na, nb);    // d^bra_e d^ket_f
+        auto at = [&](const std::vector<Real> &M, int i, int j) {
+          return M[static_cast<std::size_t>(i) * nao + j];
+        };
+        for (int mu = 0; mu < nao; ++mu) {
+          const int a = ao2sh[mu];
+          for (int nu = 0; nu < nao; ++nu) {
+            const int b = ao2sh[nu];
+            const Real w = Dm(mu, nu);
+            if (w == Real(0)) continue;
+            // d^x_e d^y_f V at (mu,nu): x,y in {bra,ket}
+            const Real Dbb = at(Mbb, mu, nu), Dkk = at(Mbb, nu, mu);
+            const Real Dbk = at(Mbk, mu, nu), Dkb = at(Mbk, nu, mu);
+            // per-shell coefficients of the bra/ket derivative in d/dR_s
+            auto cbra = [&](int s) { return Real((s == a) - (s == nc)); };
+            auto cket = [&](int s) { return Real((s == b) - (s == nc)); };
+            // unique shells among {a, b, nc} (coincidences handled by cbra/cket)
+            int U[3], nu_s = 0;
+            for (int cand : {a, b, nc}) {
+              bool seen = false;
+              for (int t = 0; t < nu_s; ++t) seen |= (U[t] == cand);
+              if (!seen) U[nu_s++] = cand;
+            }
+            for (int i1 = 0; i1 < nu_s; ++i1)
+              for (int i2 = 0; i2 < nu_s; ++i2) {
+                const int s1 = U[i1], s2 = U[i2];
+                const Real coeff =
+                    cbra(s1) * (cbra(s2) * Dbb + cket(s2) * Dbk) +
+                    cket(s1) * (cbra(s2) * Dkb + cket(s2) * Dkk);
+                if (coeff != Real(0)) Hadd(s1, e, s2, f, w * coeff);
+              }
+          }
+        }
+      }
+  }
+  return H;
+}
+
 /// Nuclear-repulsion Hessian d^2 E_nn / dR_{I,e} dR_{J,f} for
 /// E_nn = sum_{I<J} Z_I Z_J / |R_I - R_J|, as a (3 N) x (3 N) matrix
 /// (N = number of point charges; here weight = Z). Analytic.
