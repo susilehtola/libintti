@@ -33,8 +33,13 @@ approved plan) is under way and mostly delivered:
   field differentiates only the two pair phases, giving i times a combination
   of real position-weighted (bra-promoted) ERIs contracted with the density.
   Validated vs finite difference of the exact complex finite-field GIAO
-  J(B)/K(B) built by direct quartet summation. Remaining: RI/2e geometric
-  gradients into the Fock build, and Hessians.
+  J(B)/K(B) built by direct quartet summation. Two-electron energy Hessian
+  done (`erihess.hpp`): the MD centre-shift applied twice (l+/-2 same shell,
+  l+/-1 x l+/-1 cross shells), contracted with the two-particle density into
+  a (3 ns) x (3 ns) matrix; validated vs finite difference of the 2e gradient,
+  symmetric, translationally invariant. Remaining: 1e Hessian assembly into a
+  full molecular Hessian, and wiring the GIAO first-order Fock into a
+  response/CPHF driver.
 
 **Ground rules (binding for any implementer):** every deliverable has a hard
 oracle (PySCF or analytic) *and* an independent second check (finite
