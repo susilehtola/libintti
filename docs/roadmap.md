@@ -37,9 +37,14 @@ approved plan) is under way and mostly delivered:
   done (`erihess.hpp`): the MD centre-shift applied twice (l+/-2 same shell,
   l+/-1 x l+/-1 cross shells), contracted with the two-particle density into
   a (3 ns) x (3 ns) matrix; validated vs finite difference of the 2e gradient,
-  symmetric, translationally invariant. Remaining: 1e Hessian assembly into a
-  full molecular Hessian, and wiring the GIAO first-order Fock into a
-  response/CPHF driver.
+  symmetric, translationally invariant. One-electron overlap and kinetic
+  Hessians and the nuclear-repulsion Hessian done (`geohess.hpp`): the order-2
+  geoderiv blocks routed per shell into a (3 ns) x (3 ns) matrix over the four
+  bra/ket-centre families, weighted by the (energy-weighted) density; all
+  validated vs a finite-difference second difference. Remaining for a full
+  molecular Hessian: the nuclear-attraction electronic Hessian (needs the
+  operator-centre derivative) and the CPHF orbital-response term; and wiring
+  the GIAO first-order Fock into a response/CPHF driver.
 
 **Ground rules (binding for any implementer):** every deliverable has a hard
 oracle (PySCF or analytic) *and* an independent second check (finite
