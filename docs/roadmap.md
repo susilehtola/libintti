@@ -47,6 +47,14 @@ approved plan) is under way and mostly delivered:
   no new integral is needed); all validated vs a finite-difference second
   difference. This completes the **integral/skeleton Hessian**: the
   frozen-density second-derivative contributions of every energy term.
+  RI (density-fitting) Coulomb gradient done (`rigrad.hpp`): the standard DF-J
+  force dE_J/dx = sum_P gamma_P dd_P/dx - 1/2 sum_PQ gamma_P gamma_Q dM_PQ/dx
+  (gamma = M^{-1} d), assembled from derivatives of the ghost-augmented 2-/3-
+  centre Coulomb integrals via the erigrad centre-shift (the zero-exponent
+  ghost never moves); returns per-shell forces over the orbital and auxiliary
+  bases. Validated vs finite difference of the ri_fit/ri_jk energy and
+  translationally invariant. Remaining: the RI-K (exchange) gradient (double
+  density contraction through a 3-index intermediate).
 
 **Scope boundary.** libintti stops at the integral/matrix level: derivative
 integrals and the skeleton (frozen-density) energy-derivative contractions
