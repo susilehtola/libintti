@@ -59,7 +59,13 @@ approved plan) is under way and mostly delivered:
   2-centre coefficient tensors that the same quartet_pos_grad helper contracts;
   validated vs finite difference of the ri_jk exchange energy. RI J and K
   gradients thus complete the RI Fock-derivative surface (skeleton; the caller
-  adds CPHF).
+  adds CPHF). RI J and K Hessians done (`rigrad.hpp`): the envelope form
+  d^2E/dxdy = (direct integral-Hessian terms with the gradient's coefficient
+  tensors) + a response term in first-derivative residuals contracted through
+  M^{-1} (r_x for J; the 3-index R_x with an orbital transpose for K). Two
+  shared helpers -- quartet_pos_deriv_block (full first derivative) and
+  quartet_pos_hess (two-position second derivative) on the ghost quartets --
+  drive both. Validated vs finite difference of the RI gradients and symmetric.
 
 **Scope boundary.** libintti stops at the integral/matrix level: derivative
 integrals and the skeleton (frozen-density) energy-derivative contractions

@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstddef>
+#include <map>
 #include <vector>
 
 #include "erigrad.hpp" // detail::comp_index, detail::eri_block4
@@ -103,6 +104,177 @@ PrimitiveShell<Real> ghost_shell(const PrimitiveShell<Real> &s) {
   return {Real(0), {s.center[0], s.center[1], s.center[2]}, 0};
 }
 
+/// Full (uncontracted) derivative block d/dR_{pos,dir} of the quartet
+/// (s0 s1 | s2 s3): out has the base component shape, out[idx] = the MD
+/// centre-shift 2 alpha [.+1_dir] - m [.-1_dir] of position `pos`.
+template <class Real>
+std::vector<Real> quartet_pos_deriv_block(const PrimitiveShell<Real> &s0,
+                                          const PrimitiveShell<Real> &s1,
+                                          const PrimitiveShell<Real> &s2,
+                                          const PrimitiveShell<Real> &s3, int pos, int dir,
+                                          const TGrid<Real> &grid) {
+  const PrimitiveShell<Real> sh[4] = {s0, s1, s2, s3};
+  const int L[4] = {s0.l, s1.l, s2.l, s3.l};
+  const int nc[4] = {ncart(L[0]), ncart(L[1]), ncart(L[2]), ncart(L[3])};
+  const int lp = L[pos];
+  const Real ap = sh[pos].alpha;
+  auto promote = [&](int dl) {
+    PrimitiveShell<Real> s[4] = {s0, s1, s2, s3};
+    s[pos].l += dl;
+    return detail::eri_block4(s[0], s[1], s[2], s[3], grid);
+  };
+  auto plus = promote(1);
+  std::vector<Real> minus;
+  if (lp >= 1) minus = promote(-1);
+  int npl[4], nmi[4];
+  for (int i = 0; i < 4; ++i) {
+    npl[i] = nc[i];
+    nmi[i] = nc[i];
+  }
+  npl[pos] = ncart(lp + 1);
+  if (lp >= 1) nmi[pos] = ncart(lp - 1);
+  auto idx = [](const int n[4], int a, int b, int c, int d) {
+    return ((static_cast<std::size_t>(a) * n[1] + b) * n[2] + c) * n[3] + d;
+  };
+  std::vector<Real> out(static_cast<std::size_t>(nc[0]) * nc[1] * nc[2] * nc[3], Real(0));
+  int k[4];
+  for (k[0] = 0; k[0] < nc[0]; ++k[0])
+    for (k[1] = 0; k[1] < nc[1]; ++k[1])
+      for (k[2] = 0; k[2] < nc[2]; ++k[2])
+        for (k[3] = 0; k[3] < nc[3]; ++k[3]) {
+          int b3[3];
+          cart_comp(lp, k[pos], b3[0], b3[1], b3[2]);
+          int m3[3] = {b3[0], b3[1], b3[2]};
+          m3[dir] += 1;
+          const int ip = detail::comp_index(lp + 1, m3[0], m3[1]);
+          int ii[4] = {k[0], k[1], k[2], k[3]};
+          ii[pos] = ip;
+          Real term = 2 * ap * plus[idx(npl, ii[0], ii[1], ii[2], ii[3])];
+          if (b3[dir] >= 1) {
+            int mm[3] = {b3[0], b3[1], b3[2]};
+            mm[dir] -= 1;
+            const int im = detail::comp_index(lp - 1, mm[0], mm[1]);
+            int jj[4] = {k[0], k[1], k[2], k[3]};
+            jj[pos] = im;
+            term -= Real(b3[dir]) * minus[idx(nmi, jj[0], jj[1], jj[2], jj[3])];
+          }
+          out[idx(nc, k[0], k[1], k[2], k[3])] = term;
+        }
+  return out;
+}
+
+/// Second geometric derivative d^2/dR_{p,e} dR_{q,f} of the quartet
+/// (s0 s1 | s2 s3), contracted with coeff(k0,k1,k2,k3) over the components,
+/// returned as out[e][f]. The MD centre-shift applied twice (l+/-2 for p==q,
+/// l+/-1 x l+/-1 for p!=q); p, q must be non-ghost positions.
+template <class Real, class CoeffFn>
+void quartet_pos_hess(const PrimitiveShell<Real> &s0, const PrimitiveShell<Real> &s1,
+                      const PrimitiveShell<Real> &s2, const PrimitiveShell<Real> &s3,
+                      int p, int q, const TGrid<Real> &grid, CoeffFn coeff,
+                      Real out[3][3]) {
+  const PrimitiveShell<Real> sh[4] = {s0, s1, s2, s3};
+  const int L[4] = {s0.l, s1.l, s2.l, s3.l};
+  const int nc[4] = {ncart(L[0]), ncart(L[1]), ncart(L[2]), ncart(L[3])};
+  const Real ap = sh[p].alpha, aq = sh[q].alpha;
+  std::map<std::array<int, 4>, std::vector<Real>> cache;
+  auto block = [&](const std::array<int, 4> &o) -> const std::vector<Real> * {
+    for (int i = 0; i < 4; ++i)
+      if (L[i] + o[i] < 0) return nullptr;
+    auto it = cache.find(o);
+    if (it == cache.end()) {
+      PrimitiveShell<Real> s[4] = {s0, s1, s2, s3};
+      for (int i = 0; i < 4; ++i) s[i].l += o[i];
+      it = cache.emplace(o, detail::eri_block4(s[0], s[1], s[2], s[3], grid)).first;
+    }
+    return &it->second;
+  };
+  auto rawval = [&](const std::array<int, 4> &o, const int m[4][3]) -> Real {
+    const auto *blk = block(o);
+    if (!blk) return Real(0);
+    int nn[4], id[4];
+    for (int i = 0; i < 4; ++i) {
+      const int li = L[i] + o[i];
+      if (m[i][0] < 0 || m[i][1] < 0 || m[i][2] < 0 || m[i][0] + m[i][1] + m[i][2] != li)
+        return Real(0);
+      nn[i] = ncart(li);
+      id[i] = detail::comp_index(li, m[i][0], m[i][1]);
+    }
+    return (*blk)[((static_cast<std::size_t>(id[0]) * nn[1] + id[1]) * nn[2] + id[2]) * nn[3] +
+                  id[3]];
+  };
+  for (int e = 0; e < 3; ++e)
+    for (int f = 0; f < 3; ++f) out[e][f] = Real(0);
+  int bm[4][3];
+  int k[4];
+  for (k[0] = 0; k[0] < nc[0]; ++k[0])
+    for (k[1] = 0; k[1] < nc[1]; ++k[1])
+      for (k[2] = 0; k[2] < nc[2]; ++k[2])
+        for (k[3] = 0; k[3] < nc[3]; ++k[3]) {
+          const Real cf = coeff(k[0], k[1], k[2], k[3]);
+          if (cf == Real(0)) continue;
+          for (int i = 0; i < 4; ++i) cart_comp(L[i], k[i], bm[i][0], bm[i][1], bm[i][2]);
+          auto set = [&](int pp, const int mp[3], int qq, const int mq[3], int mm[4][3]) {
+            for (int r = 0; r < 4; ++r)
+              for (int t = 0; t < 3; ++t) mm[r][t] = bm[r][t];
+            for (int t = 0; t < 3; ++t) mm[pp][t] = mp[t];
+            if (qq != pp)
+              for (int t = 0; t < 3; ++t) mm[qq][t] = mq[t];
+          };
+          for (int e = 0; e < 3; ++e)
+            for (int f = 0; f < 3; ++f) {
+              Real d2 = 0;
+              int mm[4][3];
+              if (p == q) {
+                const int *mp = bm[p];
+                const int de = (e == f) ? 1 : 0;
+                int T[4][3];
+                for (int t = 0; t < 3; ++t)
+                  T[0][t] = T[1][t] = T[2][t] = T[3][t] = mp[t];
+                T[0][e] += 1; T[0][f] += 1;
+                T[1][f] += 1; T[1][e] -= 1;
+                T[2][e] += 1; T[2][f] -= 1;
+                T[3][e] -= 1; T[3][f] -= 1;
+                const std::array<int, 4> o2 = {p == 0 ? 2 : 0, p == 1 ? 2 : 0, p == 2 ? 2 : 0,
+                                               p == 3 ? 2 : 0};
+                const std::array<int, 4> o0 = {0, 0, 0, 0};
+                const std::array<int, 4> om2 = {p == 0 ? -2 : 0, p == 1 ? -2 : 0,
+                                                p == 2 ? -2 : 0, p == 3 ? -2 : 0};
+                set(p, T[0], q, T[0], mm);
+                d2 += 2 * ap * (2 * ap * rawval(o2, mm));
+                set(p, T[1], q, T[1], mm);
+                d2 += 2 * ap * (-(Real(mp[e]) + de) * rawval(o0, mm));
+                set(p, T[2], q, T[2], mm);
+                d2 += -Real(mp[f]) * (2 * ap * rawval(o0, mm));
+                set(p, T[3], q, T[3], mm);
+                d2 += -Real(mp[f]) * (-(Real(mp[e]) - de) * rawval(om2, mm));
+              } else {
+                const int *mp = bm[p], *mq = bm[q];
+                int Pe1[3], Pe0[3], Qf1[3], Qf0[3];
+                for (int t = 0; t < 3; ++t) {
+                  Pe1[t] = mp[t]; Pe0[t] = mp[t];
+                  Qf1[t] = mq[t]; Qf0[t] = mq[t];
+                }
+                Pe1[e] += 1; Pe0[e] -= 1;
+                Qf1[f] += 1; Qf0[f] -= 1;
+                auto oo = [&](int dp, int dq) {
+                  std::array<int, 4> o = {0, 0, 0, 0};
+                  o[p] += dp; o[q] += dq;
+                  return o;
+                };
+                set(p, Pe1, q, Qf1, mm);
+                d2 += 4 * ap * aq * rawval(oo(1, 1), mm);
+                set(p, Pe1, q, Qf0, mm);
+                d2 += -2 * ap * Real(mq[f]) * rawval(oo(1, -1), mm);
+                set(p, Pe0, q, Qf1, mm);
+                d2 += -Real(mp[e]) * 2 * aq * rawval(oo(-1, 1), mm);
+                set(p, Pe0, q, Qf0, mm);
+                d2 += Real(mp[e]) * Real(mq[f]) * rawval(oo(-1, -1), mm);
+              }
+              out[e][f] += cf * d2;
+            }
+        }
+}
+
 } // namespace detail
 
 /// Geometric gradient of the RI Coulomb energy E_J = 1/2 sum_mn D_mn J_mn
@@ -181,6 +353,153 @@ RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
       }
     }
   return g;
+}
+
+/// Geometric Hessian of the RI Coulomb energy E_J, as a (3 ncen) x (3 ncen)
+/// matrix with ncen = (#orbital shells) + (#auxiliary shells), ordered orbital
+/// shells first then auxiliary shells (Cartesian-minor). Uses the envelope form
+///   d^2E_J/dxdy = gamma^T d_xy - 1/2 gamma^T M_xy gamma + r_x^T M^{-1} r_y,
+/// r_x = d_x - M_x gamma. The caller maps shells to atoms and sums.
+template <class Real>
+std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                               const Real *D, const TGrid<Real> &grid,
+                               Real tau_lin = Real(1e-10)) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  const int ncen = nso + nsa, dim = 3 * ncen;
+  auto M = coulomb_2c(aux, grid);
+  auto T = coulomb_3c(orb, aux, grid);
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  // d_P and M^{-1}
+  std::vector<Real> d(naux, Real(0));
+  for (std::size_t mn = 0; mn < N; ++mn)
+    for (int P = 0; P < naux; ++P) d[P] += T[mn * naux + P] * D[mn];
+  std::vector<Real> Vv = M, eval(naux);
+  detail::syevd(naux, Vv.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0)), gamma(naux, Real(0));
+  for (int kk = 0; kk < naux; ++kk) {
+    if (eval[kk] <= tau_lin * emax) continue;
+    const Real inv = Real(1) / eval[kk];
+    Real vd = 0;
+    for (int P = 0; P < naux; ++P) vd += Vv[kk * naux + P] * d[P];
+    for (int P = 0; P < naux; ++P) {
+      gamma[P] += inv * vd * Vv[kk * naux + P];
+      for (int Q = 0; Q < naux; ++Q)
+        Minv[P * naux + Q] += inv * Vv[kk * naux + P] * Vv[kk * naux + Q];
+    }
+  }
+  auto cshell = [&](bool isaux, int s) { return isaux ? nso + s : s; };
+
+  // first-derivative residual tensor r[x][P] = d_x[P] - (M_x gamma)[P]
+  std::vector<Real> r(static_cast<std::size_t>(dim) * naux, Real(0));
+  auto radd = [&](int cs, int dir, int P, Real v) {
+    r[(static_cast<std::size_t>(3 * cs + dir)) * naux + P] += v;
+  };
+  const auto ghost = [&](const PrimitiveShell<Real> &s) { return detail::ghost_shell(s); };
+  // d_x: 3-centre (m n | a ghost)
+  for (int m = 0; m < nso; ++m)
+    for (int n = 0; n < nso; ++n)
+      for (int a = 0; a < nsa; ++a) {
+        const auto &sm = orb.shells[m], &sn = orb.shells[n], &sP = aux.shells[a];
+        const auto gh = ghost(sP);
+        const int om = orb.ao_off[m], on = orb.ao_off[n], oP = aux.ao_off[a];
+        const int nm = ncart(sm.l), nn = ncart(sn.l), nP = ncart(sP.l);
+        const int cs[3] = {cshell(false, m), cshell(false, n), cshell(true, a)};
+        for (int pos = 0; pos < 3; ++pos)
+          for (int dir = 0; dir < 3; ++dir) {
+            auto blk = detail::quartet_pos_deriv_block(sm, sn, sP, gh, pos, dir, grid);
+            for (int km = 0; km < nm; ++km)
+              for (int kn = 0; kn < nn; ++kn) {
+                const Real dmn = Dm(om + km, on + kn);
+                if (dmn == Real(0)) continue;
+                for (int kP = 0; kP < nP; ++kP)
+                  radd(cs[pos], dir, oP + kP,
+                       dmn * blk[((static_cast<std::size_t>(km) * nn + kn) * nP + kP)]);
+              }
+          }
+      }
+  // -(M_x gamma): 2-centre (a ghost | b ghost), free aux index = a
+  for (int a = 0; a < nsa; ++a)
+    for (int b = 0; b < nsa; ++b) {
+      const auto &sA = aux.shells[a], &sB = aux.shells[b];
+      const auto ghA = ghost(sA), ghB = ghost(sB);
+      const int oA = aux.ao_off[a], oB = aux.ao_off[b];
+      const int nA = ncart(sA.l), nB = ncart(sB.l);
+      for (int pos : {0, 2})
+        for (int dir = 0; dir < 3; ++dir) {
+          auto blk = detail::quartet_pos_deriv_block(sA, ghA, sB, ghB, pos, dir, grid);
+          const int cs = (pos == 0) ? cshell(true, a) : cshell(true, b);
+          for (int ka = 0; ka < nA; ++ka) {
+            Real acc = 0;
+            for (int kb = 0; kb < nB; ++kb)
+              acc += blk[static_cast<std::size_t>(ka) * nB + kb] * gamma[oB + kb];
+            radd(cs, dir, oA + ka, -acc);
+          }
+        }
+    }
+  // s[x] = M^{-1} r[x]
+  std::vector<Real> s(static_cast<std::size_t>(dim) * naux, Real(0));
+  for (int x = 0; x < dim; ++x)
+    for (int P = 0; P < naux; ++P) {
+      Real acc = 0;
+      for (int Q = 0; Q < naux; ++Q)
+        acc += Minv[P * naux + Q] * r[static_cast<std::size_t>(x) * naux + Q];
+      s[static_cast<std::size_t>(x) * naux + P] = acc;
+    }
+
+  std::vector<Real> H(static_cast<std::size_t>(dim) * dim, Real(0));
+  auto Hadd = [&](int x, int y, Real v) { H[static_cast<std::size_t>(x) * dim + y] += v; };
+  // response term r_x^T M^{-1} r_y
+  for (int x = 0; x < dim; ++x)
+    for (int y = 0; y < dim; ++y) {
+      Real acc = 0;
+      for (int P = 0; P < naux; ++P)
+        acc += r[static_cast<std::size_t>(x) * naux + P] * s[static_cast<std::size_t>(y) * naux + P];
+      Hadd(x, y, acc);
+    }
+  // direct term 1: gamma^T d_xy, 3-centre with coeff D_mn gamma_P
+  for (int m = 0; m < nso; ++m)
+    for (int n = 0; n < nso; ++n)
+      for (int a = 0; a < nsa; ++a) {
+        const auto &sm = orb.shells[m], &sn = orb.shells[n], &sP = aux.shells[a];
+        const auto gh = ghost(sP);
+        const int om = orb.ao_off[m], on = orb.ao_off[n], oP = aux.ao_off[a];
+        auto coeff = [&](int km, int kn, int kP, int) {
+          return Dm(om + km, on + kn) * gamma[oP + kP];
+        };
+        const int cs[3] = {cshell(false, m), cshell(false, n), cshell(true, a)};
+        for (int p = 0; p < 3; ++p)
+          for (int q = 0; q < 3; ++q) {
+            Real o[3][3];
+            detail::quartet_pos_hess(sm, sn, sP, gh, p, q, grid, coeff, o);
+            for (int e = 0; e < 3; ++e)
+              for (int f = 0; f < 3; ++f) Hadd(3 * cs[p] + e, 3 * cs[q] + f, o[e][f]);
+          }
+      }
+  // direct term 2: -1/2 gamma^T M_xy gamma, 2-centre with coeff -1/2 gamma gamma
+  for (int a = 0; a < nsa; ++a)
+    for (int b = 0; b < nsa; ++b) {
+      const auto &sA = aux.shells[a], &sB = aux.shells[b];
+      const auto ghA = ghost(sA), ghB = ghost(sB);
+      const int oA = aux.ao_off[a], oB = aux.ao_off[b];
+      auto coeff = [&](int ka, int, int kb, int) {
+        return Real(-0.5) * gamma[oA + ka] * gamma[oB + kb];
+      };
+      const int cs[2] = {cshell(true, a), cshell(true, b)};
+      const int poss[2] = {0, 2};
+      for (int pi = 0; pi < 2; ++pi)
+        for (int qi = 0; qi < 2; ++qi) {
+          Real o[3][3];
+          detail::quartet_pos_hess(sA, ghA, sB, ghB, poss[pi], poss[qi], grid, coeff, o);
+          for (int e = 0; e < 3; ++e)
+            for (int f = 0; f < 3; ++f) Hadd(3 * cs[pi] + e, 3 * cs[qi] + f, o[e][f]);
+        }
+    }
+  return H;
 }
 
 /// Geometric gradient of the RI exchange energy E_K = -1/4 sum_mn D_mn K_mn
@@ -294,6 +613,199 @@ RIGrad<Real> ri_k_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
       }
     }
   return g;
+}
+
+/// Geometric Hessian of the RI exchange energy E_K, as a (3 ncen) x (3 ncen)
+/// matrix (orbital shells then auxiliary shells). Envelope form: direct terms
+/// (coeff3, coeff2 of ri_k_gradient contracted with the integral Hessians) plus
+/// the response -1/2 sum_{ab} R_x[a,b]^T M^{-1} R_y[a,b],
+///   R_x[a,b,Q] = dH[a,b,Q]/dx - sum_R dM_QR/dx G[a,b,R],
+/// H[a,b,Q] = sum_l D_al (l b|Q), G = M^{-1} H.
+template <class Real>
+std::vector<Real> ri_k_hessian(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                               const Real *D, const TGrid<Real> &grid,
+                               Real tau_lin = Real(1e-10)) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  const int ncen = nso + nsa, dim = 3 * ncen;
+  auto M = coulomb_2c(aux, grid);
+  auto T = coulomb_3c(orb, aux, grid); // (mu la|P)
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
+  const std::size_t no2 = static_cast<std::size_t>(nao) * nao;
+  // M^{-1}
+  std::vector<Real> Vv = M, eval(naux);
+  detail::syevd(naux, Vv.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int k = 0; k < naux; ++k) {
+    if (eval[k] <= tau_lin * emax) continue;
+    const Real s = Real(1) / eval[k];
+    for (int P = 0; P < naux; ++P)
+      for (int Q = 0; Q < naux; ++Q) Minv[P * naux + Q] += s * Vv[k * naux + P] * Vv[k * naux + Q];
+  }
+  // H[(a*nao+b)*naux+Q] = sum_l D_al (l b|Q); G = M^{-1} H
+  std::vector<Real> Hm(no2 * naux, Real(0)), G(no2 * naux, Real(0));
+  for (int a = 0; a < nao; ++a)
+    for (int l = 0; l < nao; ++l) {
+      const Real dal = Dm(a, l);
+      if (dal == Real(0)) continue;
+      for (int b = 0; b < nao; ++b)
+        for (int Q = 0; Q < naux; ++Q)
+          Hm[(static_cast<std::size_t>(a) * nao + b) * naux + Q] +=
+              dal * T[(static_cast<std::size_t>(l) * nao + b) * naux + Q];
+    }
+  for (std::size_t ab = 0; ab < no2; ++ab)
+    for (int Q = 0; Q < naux; ++Q) {
+      Real acc = 0;
+      for (int R = 0; R < naux; ++R) acc += Minv[Q * naux + R] * Hm[ab * naux + R];
+      G[ab * naux + Q] = acc;
+    }
+  // coeff3[(l*nao+n)*naux+R] = -1/2 sum_s D_ls G[(n*nao+s)*naux+R]
+  std::vector<Real> coeff3(no2 * naux, Real(0));
+  for (int l = 0; l < nao; ++l)
+    for (int n = 0; n < nao; ++n)
+      for (int R = 0; R < naux; ++R) {
+        Real acc = 0;
+        for (int sig = 0; sig < nao; ++sig)
+          acc += Dm(l, sig) * G[(static_cast<std::size_t>(n) * nao + sig) * naux + R];
+        coeff3[(static_cast<std::size_t>(l) * nao + n) * naux + R] = Real(-0.5) * acc;
+      }
+  // coeff2[T*naux+U] = 1/4 sum_{sn} G[(n*nao+s)*naux+T] G[(s*nao+n)*naux+U]
+  std::vector<Real> coeff2(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int Tc = 0; Tc < naux; ++Tc)
+    for (int U = 0; U < naux; ++U) {
+      Real acc = 0;
+      for (int n = 0; n < nao; ++n)
+        for (int sig = 0; sig < nao; ++sig)
+          acc += G[(static_cast<std::size_t>(n) * nao + sig) * naux + Tc] *
+                 G[(static_cast<std::size_t>(sig) * nao + n) * naux + U];
+      coeff2[Tc * naux + U] = Real(0.25) * acc;
+    }
+
+  auto cshell = [&](bool isaux, int sidx) { return isaux ? nso + sidx : sidx; };
+  const auto ghost = [&](const PrimitiveShell<Real> &sx) { return detail::ghost_shell(sx); };
+  std::vector<Real> Hess(static_cast<std::size_t>(dim) * dim, Real(0));
+  auto Hadd = [&](int x, int y, Real v) { Hess[static_cast<std::size_t>(x) * dim + y] += v; };
+
+  // direct terms
+  for (int l = 0; l < nso; ++l)
+    for (int n = 0; n < nso; ++n)
+      for (int a = 0; a < nsa; ++a) {
+        const auto &sl = orb.shells[l], &sn = orb.shells[n], &sR = aux.shells[a];
+        const auto gh = ghost(sR);
+        const int ol = orb.ao_off[l], on = orb.ao_off[n], oR = aux.ao_off[a];
+        auto coeff = [&](int kl, int kn, int kR, int) {
+          return coeff3[((static_cast<std::size_t>(ol + kl) * nao + on + kn) * naux) + oR + kR];
+        };
+        const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, a)};
+        for (int p = 0; p < 3; ++p)
+          for (int q = 0; q < 3; ++q) {
+            Real o[3][3];
+            detail::quartet_pos_hess(sl, sn, sR, gh, p, q, grid, coeff, o);
+            for (int e = 0; e < 3; ++e)
+              for (int f = 0; f < 3; ++f) Hadd(3 * cs[p] + e, 3 * cs[q] + f, o[e][f]);
+          }
+      }
+  for (int a = 0; a < nsa; ++a)
+    for (int b = 0; b < nsa; ++b) {
+      const auto &sT = aux.shells[a], &sU = aux.shells[b];
+      const auto ghT = ghost(sT), ghU = ghost(sU);
+      const int oT = aux.ao_off[a], oU = aux.ao_off[b];
+      auto coeff = [&](int kT, int, int kU, int) {
+        return coeff2[(static_cast<std::size_t>(oT + kT) * naux) + oU + kU];
+      };
+      const int cs[2] = {cshell(true, a), cshell(true, b)};
+      const int poss[2] = {0, 2};
+      for (int pi = 0; pi < 2; ++pi)
+        for (int qi = 0; qi < 2; ++qi) {
+          Real o[3][3];
+          detail::quartet_pos_hess(sT, ghT, sU, ghU, poss[pi], poss[qi], grid, coeff, o);
+          for (int e = 0; e < 3; ++e)
+            for (int f = 0; f < 3; ++f) Hadd(3 * cs[pi] + e, 3 * cs[qi] + f, o[e][f]);
+        }
+    }
+
+  // response: R_x[(a*nao+b)*naux+Q] = dH[a,b,Q]/dx - sum_R dM_QR/dx G[a,b,R]
+  std::vector<Real> R(static_cast<std::size_t>(dim) * no2 * naux, Real(0));
+  auto Ridx = [&](int x, int a, int b, int Q) {
+    return (static_cast<std::size_t>(x) * no2 + (static_cast<std::size_t>(a) * nao + b)) * naux + Q;
+  };
+  // part 1: dH/dx = sum_l D_al d(l b|Q)/dx, 3-centre (l n | c ghost)
+  for (int l = 0; l < nso; ++l)
+    for (int n = 0; n < nso; ++n)
+      for (int c = 0; c < nsa; ++c) {
+        const auto &sl = orb.shells[l], &sn = orb.shells[n], &sc = aux.shells[c];
+        const auto gh = ghost(sc);
+        const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
+        const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
+        const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
+        for (int pos = 0; pos < 3; ++pos)
+          for (int dir = 0; dir < 3; ++dir) {
+            auto blk = detail::quartet_pos_deriv_block(sl, sn, sc, gh, pos, dir, grid);
+            const int xi = 3 * cs[pos] + dir;
+            for (int kl = 0; kl < nl; ++kl)
+              for (int kn = 0; kn < nn; ++kn)
+                for (int kQ = 0; kQ < nP; ++kQ) {
+                  const Real dv = blk[((static_cast<std::size_t>(kl) * nn + kn) * nP + kQ)];
+                  if (dv == Real(0)) continue;
+                  const int lam = ol + kl, bb = on + kn, QQ = oc + kQ;
+                  for (int aa = 0; aa < nao; ++aa) {
+                    const Real dal = Dm(aa, lam);
+                    if (dal != Real(0)) R[Ridx(xi, aa, bb, QQ)] += dal * dv;
+                  }
+                }
+          }
+      }
+  // part 2: - sum_R dM_QR/dx G[a,b,R], 2-centre (c ghost | e ghost), Q from c
+  for (int c = 0; c < nsa; ++c)
+    for (int ee = 0; ee < nsa; ++ee) {
+      const auto &sC = aux.shells[c], &sE = aux.shells[ee];
+      const auto ghC = ghost(sC), ghE = ghost(sE);
+      const int oC = aux.ao_off[c], oE = aux.ao_off[ee];
+      const int nC = ncart(sC.l), nE = ncart(sE.l);
+      for (int pos : {0, 2})
+        for (int dir = 0; dir < 3; ++dir) {
+          auto blk = detail::quartet_pos_deriv_block(sC, ghC, sE, ghE, pos, dir, grid);
+          const int cs = (pos == 0) ? cshell(true, c) : cshell(true, ee);
+          const int xi = 3 * cs + dir;
+          for (int kQ = 0; kQ < nC; ++kQ)
+            for (int kR = 0; kR < nE; ++kR) {
+              const Real dv = blk[static_cast<std::size_t>(kQ) * nE + kR];
+              if (dv == Real(0)) continue;
+              const int QQ = oC + kQ, RR = oE + kR;
+              for (int aa = 0; aa < nao; ++aa)
+                for (int bb = 0; bb < nao; ++bb)
+                  R[Ridx(xi, aa, bb, QQ)] -=
+                      dv * G[(static_cast<std::size_t>(aa) * nao + bb) * naux + RR];
+            }
+        }
+    }
+  // S = M^{-1} R (over Q); response Hess[x][y] += -1/2 sum_{ab,Q} R_x S_y
+  std::vector<Real> S(static_cast<std::size_t>(dim) * no2 * naux, Real(0));
+  for (int x = 0; x < dim; ++x)
+    for (std::size_t ab = 0; ab < no2; ++ab)
+      for (int Q = 0; Q < naux; ++Q) {
+        Real acc = 0;
+        for (int Rr = 0; Rr < naux; ++Rr)
+          acc += Minv[Q * naux + Rr] *
+                 R[(static_cast<std::size_t>(x) * no2 + ab) * naux + Rr];
+        S[(static_cast<std::size_t>(x) * no2 + ab) * naux + Q] = acc;
+      }
+  // response Hess[x][y] += -1/2 sum_{a,b,Q} R_x[b,a,Q] S_y[a,b,Q] (L_GG couples
+  // (a,b) with (b,a), so R_x carries the orbital transpose relative to S_y)
+  for (int x = 0; x < dim; ++x)
+    for (int y = 0; y < dim; ++y) {
+      Real acc = 0;
+      for (int a = 0; a < nao; ++a)
+        for (int b = 0; b < nao; ++b) {
+          const std::size_t rx = Ridx(x, b, a, 0), sy = Ridx(y, a, b, 0);
+          for (int Q = 0; Q < naux; ++Q) acc += R[rx + Q] * S[sy + Q];
+        }
+      Hadd(x, y, Real(-0.5) * acc);
+    }
+  return Hess;
 }
 
 } // namespace intti

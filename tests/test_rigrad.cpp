@@ -130,6 +130,116 @@ TEST(RIGrad, CoulombGradientVsFiniteDifference) {
   EXPECT_LT(worst, 1e-6 * (scale + 1)) << "analytic RI-J gradient != finite difference";
 }
 
+// combined per-shell RI-J gradient vector (orbital shells then auxiliary)
+std::vector<double> ri_j_grad_vec(const std::vector<Shell> &os, const std::vector<Shell> &as,
+                                  const std::vector<double> &D,
+                                  const intti::TGrid<double> &grid) {
+  auto orb = intti::make_basis(os);
+  auto g = intti::ri_j_gradient(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  std::vector<double> v;
+  for (auto &f : g.forb)
+    for (int e = 0; e < 3; ++e) v.push_back(f[e]);
+  for (auto &f : g.faux)
+    for (int e = 0; e < 3; ++e) v.push_back(f[e]);
+  return v;
+}
+
+TEST(RIGrad, CoulombHessianVsGradientFiniteDifference) {
+  auto os = orb_shells();
+  auto as = aux_shells();
+  auto orb = intti::make_basis(os);
+  auto D = density(orb.nao);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto H = intti::ri_j_hessian(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  const int nso = static_cast<int>(os.size()), nsa = static_cast<int>(as.size());
+  const int ncen = nso + nsa, dim = 3 * ncen;
+  const double h = 1e-4;
+  double worst = 0, scale = 0;
+  for (int y = 0; y < ncen; ++y)
+    for (int f = 0; f < 3; ++f) {
+      auto disp = [&](double s) {
+        auto o2 = os, a2 = as;
+        (y < nso ? o2[y] : a2[y - nso]).center[f] += s;
+        return ri_j_grad_vec(o2, a2, D, grid);
+      };
+      auto gp = disp(h), gm = disp(-h);
+      for (int x = 0; x < ncen; ++x)
+        for (int e = 0; e < 3; ++e) {
+          const double fd = (gp[3 * x + e] - gm[3 * x + e]) / (2 * h);
+          const double an = H[(3 * x + e) * static_cast<std::size_t>(dim) + 3 * y + f];
+          worst = std::max(worst, std::abs(fd - an));
+          scale = std::max(scale, std::abs(an));
+        }
+    }
+  EXPECT_GT(scale, 1e-2) << "hessian must be nonzero";
+  EXPECT_LT(worst, 5e-5 * (scale + 1)) << "analytic RI-J Hessian != FD of gradient";
+}
+
+TEST(RIGrad, CoulombHessianSymmetric) {
+  auto os = orb_shells();
+  auto as = aux_shells();
+  auto orb = intti::make_basis(os);
+  auto D = density(orb.nao);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto H = intti::ri_j_hessian(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  const int dim = 3 * (static_cast<int>(os.size()) + static_cast<int>(as.size()));
+  double asym = 0, mx = 0;
+  for (int i = 0; i < dim; ++i)
+    for (int j = 0; j < dim; ++j) {
+      asym = std::max(asym, std::abs(H[i * dim + j] - H[j * dim + i]));
+      mx = std::max(mx, std::abs(H[i * dim + j]));
+    }
+  EXPECT_LT(asym, 1e-10 * (mx + 1));
+}
+
+std::vector<double> ri_k_grad_vec(const std::vector<Shell> &os, const std::vector<Shell> &as,
+                                  const std::vector<double> &D,
+                                  const intti::TGrid<double> &grid) {
+  auto orb = intti::make_basis(os);
+  auto g = intti::ri_k_gradient(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  std::vector<double> v;
+  for (auto &f : g.forb)
+    for (int e = 0; e < 3; ++e) v.push_back(f[e]);
+  for (auto &f : g.faux)
+    for (int e = 0; e < 3; ++e) v.push_back(f[e]);
+  return v;
+}
+
+TEST(RIGrad, ExchangeHessianVsGradientFiniteDifference) {
+  auto os = orb_shells();
+  auto as = aux_shells();
+  auto orb = intti::make_basis(os);
+  auto D = density(orb.nao);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto H = intti::ri_k_hessian(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  const int nso = static_cast<int>(os.size()), nsa = static_cast<int>(as.size());
+  const int ncen = nso + nsa, dim = 3 * ncen;
+  const double h = 1e-4;
+  double worst = 0, scale = 0, asym = 0;
+  for (int y = 0; y < ncen; ++y)
+    for (int f = 0; f < 3; ++f) {
+      auto disp = [&](double s) {
+        auto o2 = os, a2 = as;
+        (y < nso ? o2[y] : a2[y - nso]).center[f] += s;
+        return ri_k_grad_vec(o2, a2, D, grid);
+      };
+      auto gp = disp(h), gm = disp(-h);
+      for (int x = 0; x < ncen; ++x)
+        for (int e = 0; e < 3; ++e) {
+          const double fd = (gp[3 * x + e] - gm[3 * x + e]) / (2 * h);
+          const double an = H[(3 * x + e) * static_cast<std::size_t>(dim) + 3 * y + f];
+          worst = std::max(worst, std::abs(fd - an));
+          scale = std::max(scale, std::abs(an));
+        }
+    }
+  for (int i = 0; i < dim; ++i)
+    for (int j = 0; j < dim; ++j)
+      asym = std::max(asym, std::abs(H[i * dim + j] - H[j * dim + i]));
+  EXPECT_GT(scale, 1e-2) << "hessian must be nonzero";
+  EXPECT_LT(asym, 1e-10 * (scale + 1)) << "Hessian must be symmetric";
+  EXPECT_LT(worst, 5e-5 * (scale + 1)) << "analytic RI-K Hessian != FD of gradient";
+}
+
 // translational invariance: summing the force over every shell centre (orbital
 // and auxiliary) must vanish -- rigid translation leaves E_J unchanged.
 TEST(RIGrad, TranslationalInvariance) {
