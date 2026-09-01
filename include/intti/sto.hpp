@@ -31,28 +31,56 @@
 
 namespace intti {
 
-/// A Slater-type-orbital shell: r^l Y_lm exp(-zeta r) on `center`, expanded
-/// with `ns` Gaussian nodes over the radial transform variable s.
+/// A Slater-type-orbital shell: r^{n-1} Y_lm exp(-zeta r) on `center` (principal
+/// quantum number n >= l+1), expanded with `ns` Gaussian nodes over the radial
+/// transform variable s. The angular r^l Y_lm is the shell's Cartesian
+/// solid harmonic; the extra radial power r^{n-1-l} is carried by the
+/// zeta-differentiated expansion coefficients.
 template <class Real> struct StoShell {
   Real zeta;
   Real center[3];
   int l;
+  int n{0};   ///< principal quantum number; 0 (or l+1) means the minimal STO
   int ns{48};
 };
 
-/// s-expansion of exp(-zeta r) = sum_k c_k exp(-s_k r^2): log-space
-/// Gauss-Legendre nodes s_k in [smin, smax] with the transform weight folded
-/// into c_k. Returns {exponents, coefficients}.
+/// Value of P_m(zeta), where f^{(m)}(zeta) = P_m(zeta) e^{-a zeta^2} with
+/// f = zeta e^{-a zeta^2}: P_0 = zeta, P_{m+1} = P_m' - 2 a zeta P_m. Used for
+/// the radial power: r^m e^{-zeta r} = (-d/dzeta)^m e^{-zeta r}.
+template <class Real> Real sto_Pm(Real zeta, Real a, int m) {
+  std::vector<Real> P = {Real(0), Real(1)}; // zeta
+  for (int j = 0; j < m; ++j) {
+    std::vector<Real> Pp(P.size(), Real(0)); // derivative
+    for (std::size_t i = 1; i < P.size(); ++i) Pp[i - 1] = Real(i) * P[i];
+    std::vector<Real> Pn(P.size() + 1, Real(0));
+    for (std::size_t i = 0; i < P.size(); ++i) {
+      Pn[i] += Pp[i];               // P'
+      Pn[i + 1] += -2 * a * P[i];   // -2 a zeta P
+    }
+    P = Pn;
+  }
+  Real v = 0, zp = 1;
+  for (std::size_t i = 0; i < P.size(); ++i) {
+    v += P[i] * zp;
+    zp *= zeta;
+  }
+  return v;
+}
+
+/// s-expansion of r^m exp(-zeta r) = sum_k c_k exp(-s_k r^2) (m the extra radial
+/// power beyond the angular r^l): log-space Gauss-Legendre nodes s_k in
+/// [smin, smax] with the transform weight and the m zeta-derivatives folded into
+/// c_k. m = 0 is the plain exponential exp(-zeta r).
 template <class Real>
-void sto_gaussians(Real zeta, int ns, std::vector<Real> &s, std::vector<Real> &c,
+void sto_gaussians(Real zeta, int ns, std::vector<Real> &s, std::vector<Real> &c, int m = 0,
                    Real smin = Real(1e-4), Real smax = Real(1e6)) {
   s.assign(ns, Real(0));
   c.assign(ns, Real(0));
   // Gauss-Legendre nodes/weights on [-1,1] (Newton on Legendre P_ns)
   const Real pi = pi_v<Real>();
-  const int m = (ns + 1) / 2;
+  const int mhalf = (ns + 1) / 2;
   std::vector<Real> x(ns), w(ns);
-  for (int i = 0; i < m; ++i) {
+  for (int i = 0; i < mhalf; ++i) {
     Real z = std::cos(pi * (i + Real(0.75)) / (ns + Real(0.5)));
     Real z1, pp;
     do {
@@ -72,14 +100,30 @@ void sto_gaussians(Real zeta, int ns, std::vector<Real> &s, std::vector<Real> &c
     w[ns - 1 - i] = w[i];
   }
   const Real lo = std::log(smin), hi = std::log(smax);
+  const Real sign = (m % 2 == 0) ? Real(1) : Real(-1); // (-d/dzeta)^m
   for (int k = 0; k < ns; ++k) {
     const Real u = Real(0.5) * (hi - lo) * (x[k] + 1) + lo;
     const Real sk = std::exp(u);
     const Real ws = Real(0.5) * (hi - lo) * w[k] * sk; // ds = s du
+    const Real a = Real(1) / (4 * sk);
     s[k] = sk;
-    c[k] = zeta / (2 * std::sqrt(pi)) * ws * std::pow(sk, Real(-1.5)) *
+    // (-d/dzeta)^m [ zeta e^{-zeta^2/4s} ] = (-1)^m P_m(zeta) e^{-zeta^2/4s}
+    c[k] = sign * sto_Pm(zeta, a, m) / (2 * std::sqrt(pi)) * ws * std::pow(sk, Real(-1.5)) *
            std::exp(-zeta * zeta / (4 * sk));
   }
+}
+
+/// Delta-function tail weight of the s-quadrature truncated at s_c:
+///   W = int_{s_c}^inf g(s,zeta) (pi/s)^{3/2} ds = (8 pi / zeta^3)[1 - (1+u)e^{-u}],
+/// u = zeta^2/(4 s_c). For a smooth kernel V, the tail of the STO's s-expansion
+/// (the tight, delta-like Gaussians beyond s_c) contributes W * V(centre) to
+/// int phi_STO(r) V(r) d^3r -- the same delta-function tail correction used for
+/// the Coulomb t-quadrature (Losilla et al.), now on the s-quadrature, so far
+/// fewer s-nodes are needed to resolve the r=0 cusp. (m = 0, 1s radial.)
+template <class Real> Real sto_delta_tail_weight(Real zeta, Real s_c) {
+  const Real pi = pi_v<Real>();
+  const Real u = zeta * zeta / (4 * s_c);
+  return (8 * pi / (zeta * zeta * zeta)) * (Real(1) - (1 + u) * std::exp(-u));
 }
 
 /// Expansion of a set of STO shells into primitive Gaussian shells plus the
@@ -105,7 +149,10 @@ StoExpansion<Real> expand_sto(const std::vector<StoShell<Real>> &shells) {
   std::vector<std::vector<int>> node_primoff(shells.size());
   for (std::size_t i = 0; i < shells.size(); ++i) {
     std::vector<Real> sk;
-    sto_gaussians(shells[i].zeta, shells[i].ns, sk, ck[i]);
+    // radial power beyond r^l: m = (n-1) - l; n<=0 defaults to the minimal STO
+    const int nn = shells[i].n > 0 ? shells[i].n : shells[i].l + 1;
+    const int m = nn - 1 - shells[i].l;
+    sto_gaussians(shells[i].zeta, shells[i].ns, sk, ck[i], m);
     for (int k = 0; k < shells[i].ns; ++k) {
       prims.push_back({sk[k],
                        {shells[i].center[0], shells[i].center[1], shells[i].center[2]},

@@ -100,8 +100,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   primitive AO matrix to the STO basis. Validated vs analytic Slater results:
   the s-expansion reproduces e^{-ζr} to 1e-9, the 1s/2p self-overlaps hit
   π/ζ³ and π/ζ⁵ to 1e-8, and the 1s self-repulsion hits 5ζ/8 to 1e-6.
-  Remaining: higher n (extra even radial powers r^{2k}) and the delta-tail
-  acceleration of the s-quadrature below. An STO is the exact
+  Higher n done: r^m e^{-ζr} = (-d/dζ)^m e^{-ζr} is the same Gaussian
+  contraction with ζ-differentiated coefficients (a Hermite-like P_m
+  polynomial), so any n>=l+1 is a contracted GTO shell; validated to 1e-6 vs
+  the analytic s-STO self-overlap 4π(2n)!/(2ζ)^{2n+1} for n=1,2,3. Delta-tail
+  acceleration done: truncating the s-grid at s_c leaves a delta-like tail
+  whose weight int_{s_c}^inf g(s,ζ)(π/s)^{3/2} ds = (8π/ζ³)[1-(1+u)e^{-u}],
+  u=ζ²/4s_c, is added as V(centre) times that weight (the Losilla tail, now on
+  the s-quadrature) -- recovering the exact int e^{-ζr}d³r from a heavily
+  truncated grid. An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.
