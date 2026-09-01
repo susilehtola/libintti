@@ -132,9 +132,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (C^T D C), run the ordinary coulomb_build/exchange_build, contract back
   (C J C^T); expand_density_to_prim is the reverse of contract_to_sto.
   Validated: the single-1s self-ERI J=K=5 pi^2/8 zeta^5 and the two-centre J
-  vs sto_coulomb_2c (hence the analytic Roothaan value). Remaining: fold the
-  delta-tail acceleration into the J/K builds so the primitive count stays
-  small. An STO is the exact
+  vs sto_coulomb_2c (hence the analytic Roothaan value). The practical cost
+  control for the STO J/K build is Schwarz screening: the tight tail primitives
+  are spatially local, so tau>0 prunes their negligible inter-centre integrals
+  exactly-to-tolerance (verified: screened == unscreened). Folding the
+  *delta-tail* into the matrix build does NOT compose from the clean 2-centre
+  correction -- the off-diagonal two-centre bra products and the several
+  tail-combination terms (bra tail x density tail, on-centre tail-tail) leave
+  leading-order corrections ~1-3% off on a coarse grid; a correct delta-tail
+  matrix build is a larger effort and remains open. An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.

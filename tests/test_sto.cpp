@@ -209,6 +209,27 @@ TEST(STO, JKBuildTwoCenterCoulomb) {
   EXPECT_NEAR(jk.J[0], ref, 5e-3 * ref) << "STO two-centre J wrong";
 }
 
+TEST(STO, JKBuildScreeningMatchesUnscreened) {
+  // Schwarz screening (tau) prunes the tight tail primitives' negligible
+  // inter-centre integrals exactly-to-tolerance -- the correct way to keep the
+  // STO J/K cost small. Screened must match unscreened.
+  const double zA = 1.2, zB = 1.0;
+  std::vector<intti::StoShell<double>> shells = {{zA, {0.0, 0.0, 0.0}, 0, 0, 16},
+                                                 {zB, {0.0, 0.0, 2.6}, 0, 0, 16}};
+  std::vector<double> D = {1.0, 0.2, 0.2, 0.8};
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto ref = intti::sto_jk_build(shells, D, grid, 0.0);        // unscreened
+  auto scr = intti::sto_jk_build(shells, D, grid, 1e-10);      // screened
+  double wj = 0, wk = 0, s = 0;
+  for (std::size_t i = 0; i < ref.J.size(); ++i) {
+    s = std::max(s, std::abs(ref.J[i]));
+    wj = std::max(wj, std::abs(ref.J[i] - scr.J[i]));
+    wk = std::max(wk, std::abs(ref.K[i] - scr.K[i]));
+  }
+  EXPECT_LT(wj, 1e-7 * s) << "screened J != unscreened";
+  EXPECT_LT(wk, 1e-7 * s) << "screened K != unscreened";
+}
+
 TEST(STO, SelfRepulsionMatchesSlater) {
   // 1s Slater self-repulsion int int rho rho / r12 = 5 zeta / 8, rho = phi^2,
   // phi = sqrt(zeta^3/pi) e^{-zeta r} normalized. Reproduced by contracting
