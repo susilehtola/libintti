@@ -178,6 +178,37 @@ TEST(STO, TwoCenterCoulombDeltaTailMatchesFull) {
   EXPECT_NEAR(delta, full, 1e-3 * full) << "two-electron delta-tail != full grid";
 }
 
+TEST(STO, JKBuildSingleSelfERI) {
+  // single 1s STO, D = [[1]] (unnormalized AO e^{-zeta r}): J[0][0] = K[0][0]
+  // = (00|00) = 5 pi^2 / (8 zeta^5) (the normalized 5 zeta/8 scaled by
+  // (pi/zeta^3)^2 for the two unnormalized densities).
+  const double zeta = 1.3;
+  std::vector<intti::StoShell<double>> shells = {{zeta, {0.0, 0.0, 0.0}, 0, 0, 40}};
+  std::vector<double> D = {1.0};
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto jk = intti::sto_jk_build(shells, D, grid);
+  const double exact = 5 * M_PI * M_PI / (8 * std::pow(zeta, 5));
+  EXPECT_NEAR(jk.J[0], exact, 2e-3 * exact) << "STO J self-ERI wrong";
+  EXPECT_NEAR(jk.K[0], exact, 2e-3 * exact) << "STO K self-ERI wrong";
+}
+
+TEST(STO, JKBuildTwoCenterCoulomb) {
+  // two 1s STOs; with only B occupied (D = diag(0,1)), J[0][0] = (00|11) =
+  // (pi^2/(zA^3 zB^3)) (rho_A|rho_B) -- cross-check vs sto_coulomb_2c.
+  const double zA = 1.2, zB = 0.9;
+  const double A[3] = {0, 0, 0}, B[3] = {0.3, 0.0, 2.2};
+  // inter-centre Coulomb is not cusp-sensitive, so a capped smax lets 20 nodes
+  // resolve the s-range well; the analytic reference uses the same density model
+  std::vector<intti::StoShell<double>> shells = {{zA, {A[0], A[1], A[2]}, 0, 0, 20, 1e-4, 500.0},
+                                                 {zB, {B[0], B[1], B[2]}, 0, 0, 20, 1e-4, 500.0}};
+  std::vector<double> D = {0, 0, 0, 1}; // only B occupied
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto jk = intti::sto_jk_build(shells, D, grid);
+  const double ref = M_PI * M_PI / (std::pow(zA, 3) * std::pow(zB, 3)) *
+                     intti::sto_coulomb_2c(zA, A, zB, B, 160);
+  EXPECT_NEAR(jk.J[0], ref, 5e-3 * ref) << "STO two-centre J wrong";
+}
+
 TEST(STO, SelfRepulsionMatchesSlater) {
   // 1s Slater self-repulsion int int rho rho / r12 = 5 zeta / 8, rho = phi^2,
   // phi = sqrt(zeta^3/pi) e^{-zeta r} normalized. Reproduced by contracting

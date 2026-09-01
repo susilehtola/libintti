@@ -332,6 +332,56 @@ std::vector<Real> sto_overlap_delta(const std::vector<StoShell<Real>> &shells, R
   return S;
 }
 
+/// Transform an STO-basis density to the primitive GTO basis: D_prim = C^T D C
+/// (nprim_ao x nprim_ao), the reverse of contract_to_sto.
+template <class Real>
+std::vector<Real> expand_density_to_prim(const std::vector<Real> &Dsto,
+                                         const StoExpansion<Real> &ex) {
+  const int na = ex.nsto_ao, np = ex.nprim_ao;
+  auto C = [&](int a, int p) { return ex.coeff[static_cast<std::size_t>(a) * np + p]; };
+  std::vector<Real> DC(static_cast<std::size_t>(na) * np, Real(0)); // D C
+  for (int a = 0; a < na; ++a)
+    for (int q = 0; q < np; ++q) {
+      Real s = 0;
+      for (int b = 0; b < na; ++b) s += Dsto[static_cast<std::size_t>(a) * na + b] * C(b, q);
+      DC[static_cast<std::size_t>(a) * np + q] = s;
+    }
+  std::vector<Real> Dp(static_cast<std::size_t>(np) * np, Real(0)); // C^T (D C)
+  for (int p = 0; p < np; ++p)
+    for (int q = 0; q < np; ++q) {
+      Real s = 0;
+      for (int a = 0; a < na; ++a) s += C(a, p) * DC[static_cast<std::size_t>(a) * np + q];
+      Dp[static_cast<std::size_t>(p) * np + q] = s;
+    }
+  return Dp;
+}
+
+/// STO-basis Coulomb (J) and exchange (K) from an STO density: every STO AO is
+/// a contracted GTO, so the STO ERI is a contraction of primitive ERIs. Push
+/// the density to the primitives (C^T D C), run the ordinary J/K builds, and
+/// contract the results back (C J C^T). Matrix-level; tau screens the
+/// primitive builds.
+template <class Real> struct StoJK {
+  std::vector<Real> J, K;
+};
+
+template <class Real>
+StoJK<Real> sto_jk_build(const std::vector<StoShell<Real>> &shells,
+                         const std::vector<Real> &Dsto, const TGrid<Real> &grid,
+                         Real tau = Real(0)) {
+  auto ex = expand_sto(shells);
+  auto Dp = expand_density_to_prim(Dsto, ex);
+  const int np = ex.nprim_ao;
+  std::vector<Real> Jp(static_cast<std::size_t>(np) * np, Real(0));
+  std::vector<Real> Kp(static_cast<std::size_t>(np) * np, Real(0));
+  coulomb_build(ex.prim, Dp.data(), grid, Jp.data(), tau);
+  exchange_build(ex.prim, Dp.data(), grid, Kp.data(), tau, 0, 1);
+  StoJK<Real> out;
+  out.J = contract_to_sto(Jp, ex);
+  out.K = contract_to_sto(Kp, ex);
+  return out;
+}
+
 namespace detail {
 /// Boys F0(x) = int_0^1 e^{-x t^2} dt = (1/2) sqrt(pi/x) erf(sqrt x), F0(0)=1.
 template <class Real> Real boys0(Real x) {

@@ -126,8 +126,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   sampling rho_B's smooth analytic Slater potential there. The full builder
   (`sto_coulomb_2c`) matches the analytic Roothaan two-centre 1s Coulomb to
   1e-6; the delta-tail recovers it to ~4e-4 from a coarse 20-node truncated
-  rho_A grid (accuracy controllable via t_c). Remaining: the general
-  STO J/K matrix builds. An STO is the exact
+  rho_A grid (accuracy controllable via t_c). General STO J/K builds done
+  (`sto_jk_build`): every STO AO is a contracted GTO, so the STO ERI is a
+  contraction of primitive ERIs -- push the density to the primitives
+  (C^T D C), run the ordinary coulomb_build/exchange_build, contract back
+  (C J C^T); expand_density_to_prim is the reverse of contract_to_sto.
+  Validated: the single-1s self-ERI J=K=5 pi^2/8 zeta^5 and the two-centre J
+  vs sto_coulomb_2c (hence the analytic Roothaan value). Remaining: fold the
+  delta-tail acceleration into the J/K builds so the primitive count stays
+  small. An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.
