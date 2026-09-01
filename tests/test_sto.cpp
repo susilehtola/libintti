@@ -97,6 +97,32 @@ TEST(STO, DeltaTailCorrectionRecoversTruncatedIntegral) {
   EXPECT_NEAR(trunc + W, exact, 1e-5 * exact) << "delta-tail correction incomplete";
 }
 
+TEST(STO, DeltaTailOverlapBuilderMatchesFullGrid) {
+  // 1s STOs on three centres. The delta-tail overlap builder on a coarse,
+  // truncated s-grid (s_c) must reproduce the full-grid overlap.
+  std::vector<intti::StoShell<double>> shells = {
+      {1.2, {0.0, 0.0, 0.0}, 0, 0, 0}, {1.0, {1.6, 0.0, 0.0}, 0, 0, 0},
+      {1.4, {0.3, 1.5, -0.4}, 0, 0, 0}};
+  const int na = static_cast<int>(shells.size());
+  // full-grid reference overlap (dense s-grid, no truncation)
+  auto ref_shells = shells;
+  for (auto &s : ref_shells) {
+    s.ns = 200;
+    s.smax = 1e6;
+  }
+  auto exref = intti::expand_sto(ref_shells);
+  auto Sref = intti::contract_to_sto(intti::overlap_matrix(exref.prim), exref);
+  // delta-tail builder: coarse truncated grid
+  auto S = intti::sto_overlap_delta(shells, 30.0, 32);
+  double worst = 0, scale = 0;
+  for (int i = 0; i < na; ++i)
+    for (int j = 0; j < na; ++j) {
+      worst = std::max(worst, std::abs(S[i * na + j] - Sref[i * na + j]));
+      scale = std::max(scale, std::abs(Sref[i * na + j]));
+    }
+  EXPECT_LT(worst, 1e-5 * scale) << "delta-tail overlap != full-grid overlap";
+}
+
 TEST(STO, SelfRepulsionMatchesSlater) {
   // 1s Slater self-repulsion int int rho rho / r12 = 5 zeta / 8, rho = phi^2,
   // phi = sqrt(zeta^3/pi) e^{-zeta r} normalized. Reproduced by contracting

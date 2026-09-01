@@ -108,7 +108,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   whose weight int_{s_c}^inf g(s,ζ)(π/s)^{3/2} ds = (8π/ζ³)[1-(1+u)e^{-u}],
   u=ζ²/4s_c, is added as V(centre) times that weight (the Losilla tail, now on
   the s-quadrature) -- recovering the exact int e^{-ζr}d³r from a heavily
-  truncated grid. An STO is the exact
+  truncated grid. The correction is wired into an STO overlap builder
+  (`sto_overlap_delta`, 1s): each orbital's s-integral is split at s_c, the
+  low-s block is an ordinary contracted-GTO overlap, and the delta tail adds
+  W_partner times the low-s value at the partner centre (tail-tail vanishes for
+  distinct centres; the diagonal is the analytic self-overlap) -- reproducing
+  the full-grid overlap to 1e-5 from a coarse 32-node truncated grid.
+  Remaining: extend the delta-tail builder to l>0 and to the two-electron
+  builds. An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.

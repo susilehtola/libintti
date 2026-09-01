@@ -42,6 +42,7 @@ template <class Real> struct StoShell {
   int l;
   int n{0};   ///< principal quantum number; 0 (or l+1) means the minimal STO
   int ns{48};
+  Real smin{1e-4}, smax{1e6}; ///< s-grid range (smax = s_c truncates the tail)
 };
 
 /// Value of P_m(zeta), where f^{(m)}(zeta) = P_m(zeta) e^{-a zeta^2} with
@@ -152,7 +153,7 @@ StoExpansion<Real> expand_sto(const std::vector<StoShell<Real>> &shells) {
     // radial power beyond r^l: m = (n-1) - l; n<=0 defaults to the minimal STO
     const int nn = shells[i].n > 0 ? shells[i].n : shells[i].l + 1;
     const int m = nn - 1 - shells[i].l;
-    sto_gaussians(shells[i].zeta, shells[i].ns, sk, ck[i], m);
+    sto_gaussians(shells[i].zeta, shells[i].ns, sk, ck[i], m, shells[i].smin, shells[i].smax);
     for (int k = 0; k < shells[i].ns; ++k) {
       prims.push_back({sk[k],
                        {shells[i].center[0], shells[i].center[1], shells[i].center[2]},
@@ -195,6 +196,61 @@ std::vector<Real> contract_to_sto(const std::vector<Real> &Mprim, const StoExpan
       Msto[static_cast<std::size_t>(a) * na + b] = s;
     }
   return Msto;
+}
+
+/// STO overlap matrix built with the delta-tail acceleration, for 1s STOs.
+/// Each orbital's s-integral is split at s_c: the low-s part (s <= s_c) is a
+/// contracted GTO handled by the ordinary overlap machinery, and the delta-like
+/// high-s tail contributes, for an off-centre partner, W_partner times the
+/// low-s value of the other orbital at the partner's centre (the tail Gaussians
+/// are narrow, so they sample the smooth partner at its centre; the tail-tail
+/// term vanishes for distinct centres). The diagonal is the exact analytic
+/// self-overlap pi/zeta^3. Reproduces the full-grid overlap from a coarse,
+/// truncated s-grid.
+template <class Real>
+std::vector<Real> sto_overlap_delta(const std::vector<StoShell<Real>> &shells, Real s_c,
+                                    int ns_low) {
+  const int na = static_cast<int>(shells.size());
+  const Real pi = pi_v<Real>();
+  // low-s truncated expansion (s in [smin, s_c]) and its contracted overlap
+  std::vector<StoShell<Real>> tsh = shells;
+  for (auto &s : tsh) {
+    s.smax = s_c;
+    s.ns = ns_low;
+  }
+  auto ex = expand_sto(tsh);
+  auto LL = contract_to_sto(overlap_matrix(ex.prim), ex);
+  // per-shell low-s nodes/coeffs (to evaluate the low-s orbital value) and the
+  // analytic delta-tail weight
+  std::vector<std::vector<Real>> sk(na), ck(na);
+  std::vector<Real> W(na);
+  for (int i = 0; i < na; ++i) {
+    sto_gaussians(shells[i].zeta, ns_low, sk[i], ck[i], 0, shells[i].smin, s_c);
+    W[i] = sto_delta_tail_weight(shells[i].zeta, s_c);
+  }
+  auto lowval = [&](int A, const Real p[3]) { // A's low-s 1s value at point p
+    Real r2 = 0;
+    for (int d = 0; d < 3; ++d) {
+      const Real dd = p[d] - shells[A].center[d];
+      r2 += dd * dd;
+    }
+    Real v = 0;
+    for (std::size_t k = 0; k < sk[A].size(); ++k) v += ck[A][k] * std::exp(-sk[A][k] * r2);
+    return v;
+  };
+  std::vector<Real> S(static_cast<std::size_t>(na) * na, Real(0));
+  for (int A = 0; A < na; ++A)
+    for (int B = 0; B < na; ++B) {
+      if (A == B) {
+        const Real z = shells[A].zeta;
+        S[static_cast<std::size_t>(A) * na + A] = pi / (z * z * z); // exact self-overlap
+      } else {
+        S[static_cast<std::size_t>(A) * na + B] =
+            LL[static_cast<std::size_t>(A) * na + B] +
+            lowval(A, shells[B].center) * W[B] + lowval(B, shells[A].center) * W[A];
+      }
+    }
+  return S;
 }
 
 } // namespace intti
