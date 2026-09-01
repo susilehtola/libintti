@@ -113,9 +113,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   low-s block is an ordinary contracted-GTO overlap, and the delta tail adds
   W_partner times the low-s value at the partner centre (tail-tail vanishes for
   distinct centres; the diagonal is the analytic self-overlap) -- reproducing
-  the full-grid overlap to 1e-5 from a coarse 32-node truncated grid.
-  Remaining: extend the delta-tail builder to l>0 and to the two-electron
-  builds. An STO is the exact
+  the full-grid overlap to 1e-5 from a coarse 32-node truncated grid. Extended
+  to l>0: the angular polynomial vanishes at the centre, so the tail acts as
+  *derivatives* of delta -- an off-centre partner contributes the component
+  weight (a lower-incomplete-gamma, C (pi zeta/2)(4/zeta^2)^{N+2} gamma(N+2,u))
+  times the parity-order (a_d mod 2) derivatives of the other orbital's low-s
+  part at the partner centre; the diagonal block comes from a dense
+  single-centre grid. Mixed s/p reproduces the full grid to 1e-4.
+  Remaining: the two-electron delta-tail builds. An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.

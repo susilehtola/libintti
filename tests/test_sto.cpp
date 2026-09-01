@@ -123,6 +123,32 @@ TEST(STO, DeltaTailOverlapBuilderMatchesFullGrid) {
   EXPECT_LT(worst, 1e-5 * scale) << "delta-tail overlap != full-grid overlap";
 }
 
+TEST(STO, DeltaTailOverlapLGreaterZero) {
+  // mixed s and p minimal STOs on three centres: the l>0 tail acts as
+  // derivatives of delta, so the builder must still match the full grid.
+  std::vector<intti::StoShell<double>> shells = {
+      {1.2, {0.0, 0.0, 0.0}, 0, 0, 0}, // 1s
+      {1.0, {1.7, 0.0, 0.0}, 1, 0, 0}, // 2p
+      {1.3, {0.2, 1.5, -0.3}, 1, 0, 0} // 2p
+  };
+  const int nao = 1 + 3 + 3;
+  auto ref_shells = shells;
+  for (auto &s : ref_shells) {
+    s.ns = 220;
+    s.smax = 1e6;
+  }
+  auto exref = intti::expand_sto(ref_shells);
+  auto Sref = intti::contract_to_sto(intti::overlap_matrix(exref.prim), exref);
+  auto S = intti::sto_overlap_delta(shells, 30.0, 40, 160);
+  double worst = 0, scale = 0;
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      worst = std::max(worst, std::abs(S[i * nao + j] - Sref[i * nao + j]));
+      scale = std::max(scale, std::abs(Sref[i * nao + j]));
+    }
+  EXPECT_LT(worst, 1e-4 * scale) << "l>0 delta-tail overlap != full-grid overlap";
+}
+
 TEST(STO, SelfRepulsionMatchesSlater) {
   // 1s Slater self-repulsion int int rho rho / r12 = 5 zeta / 8, rho = phi^2,
   // phi = sqrt(zeta^3/pi) e^{-zeta r} normalized. Reproduced by contracting
