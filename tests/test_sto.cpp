@@ -149,6 +149,35 @@ TEST(STO, DeltaTailOverlapLGreaterZero) {
   EXPECT_LT(worst, 1e-4 * scale) << "l>0 delta-tail overlap != full-grid overlap";
 }
 
+TEST(STO, TwoCenterCoulombMatchesAnalytic) {
+  // (rho_A|rho_B) between two equal-exponent 1s Slater densities at distance R
+  // has the closed form J = 1/R - e^{-2zR}(1/R + 11z/8 + 3z^2 R/4 + z^3 R^2/6).
+  const double z = 1.0, R = 2.0;
+  const double A[3] = {0, 0, 0}, B[3] = {0, 0, R};
+  const double analytic =
+      1 / R - std::exp(-2 * z * R) * (1 / R + 11 * z / 8 + 3 * z * z * R / 4 +
+                                      z * z * z * R * R / 6);
+  const double full = intti::sto_coulomb_2c(z, A, z, B, 128);
+  EXPECT_NEAR(full, analytic, 1e-6 * analytic) << "two-centre STO Coulomb wrong";
+}
+
+TEST(STO, TwoCenterCoulombDeltaTailMatchesFull) {
+  // the two-electron delta-tail: rho_A on a coarse truncated grid + the tail
+  // charge times rho_B's potential at A must reproduce the full-grid value.
+  const double zA = 1.2, zB = 0.9, R = 2.3;
+  const double A[3] = {0, 0, 0}, B[3] = {0.4, 0.0, R};
+  const double full = intti::sto_coulomb_2c(zA, A, zB, B, 160);
+  const double delta = intti::sto_coulomb_2c_delta(zA, A, zB, B, 4.0, 20, 160);
+  // the truncated-only value (no correction) is visibly short
+  const double trunc_only = delta - (zA * zA * zA / M_PI) *
+                                        intti::sto_delta_tail_weight(2 * zA, 4.0) *
+                                        intti::sto_slater_potential(zB, R);
+  EXPECT_GT(std::abs(full - trunc_only), 1e-3 * full) << "tail should matter";
+  // delta-tail is an approximation; its accuracy improves as t_c grows (tail
+  // narrower). At this aggressive t_c=4 it recovers the full value to ~4e-4.
+  EXPECT_NEAR(delta, full, 1e-3 * full) << "two-electron delta-tail != full grid";
+}
+
 TEST(STO, SelfRepulsionMatchesSlater) {
   // 1s Slater self-repulsion int int rho rho / r12 = 5 zeta / 8, rho = phi^2,
   // phi = sqrt(zeta^3/pi) e^{-zeta r} normalized. Reproduced by contracting

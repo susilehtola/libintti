@@ -120,7 +120,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   times the parity-order (a_d mod 2) derivatives of the other orbital's low-s
   part at the partner centre; the diagonal block comes from a dense
   single-centre grid. Mixed s/p reproduces the full grid to 1e-4.
-  Remaining: the two-electron delta-tail builds. An STO is the exact
+  Two-electron delta-tail done for the two-centre density Coulomb repulsion
+  (`sto_coulomb_2c_delta`): rho_A's s-grid is truncated at t_c and its tight
+  tail charge Q_tail contributes Q_tail * V_B(A), the tail sitting at A and
+  sampling rho_B's smooth analytic Slater potential there. The full builder
+  (`sto_coulomb_2c`) matches the analytic Roothaan two-centre 1s Coulomb to
+  1e-6; the delta-tail recovers it to ~4e-4 from a coarse 20-node truncated
+  rho_A grid (accuracy controllable via t_c). Remaining: the general
+  STO J/K matrix builds. An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.

@@ -332,4 +332,72 @@ std::vector<Real> sto_overlap_delta(const std::vector<StoShell<Real>> &shells, R
   return S;
 }
 
+namespace detail {
+/// Boys F0(x) = int_0^1 e^{-x t^2} dt = (1/2) sqrt(pi/x) erf(sqrt x), F0(0)=1.
+template <class Real> Real boys0(Real x) {
+  if (x < Real(1e-13)) return Real(1) - x / 3;
+  return Real(0.5) * std::sqrt(pi_v<Real>() / x) * std::erf(std::sqrt(x));
+}
+/// Two-centre (ss|ss) Coulomb of unnormalized Gaussians e^{-p r_A^2}, e^{-q r_B^2}:
+///   2 pi^{5/2} / (p q sqrt(p+q)) F0(pq/(p+q) R^2).
+template <class Real> Real ss_coulomb(Real p, Real q, Real R2) {
+  const Real pi = pi_v<Real>();
+  return 2 * std::pow(pi, Real(2.5)) / (p * q * std::sqrt(p + q)) *
+         boys0(p * q / (p + q) * R2);
+}
+} // namespace detail
+
+/// Coulomb potential at distance R of a normalized 1s Slater density
+/// rho = (zeta^3/pi) e^{-2 zeta r} (unit charge):
+///   V(R) = (1/R)[1 - (1 + zeta R) e^{-2 zeta R}],  V(0) = zeta.
+template <class Real> Real sto_slater_potential(Real zeta, Real R) {
+  if (R < Real(1e-12)) return zeta;
+  return (Real(1) / R) * (Real(1) - (1 + zeta * R) * std::exp(-2 * zeta * R));
+}
+
+/// Two-centre Coulomb repulsion (rho_A|rho_B) between the 1s Slater densities of
+/// orbitals of exponents zeta_A, zeta_B (rho = phi^2), via the s-expansion of
+/// each density (exponent 2 zeta) contracted through the analytic ss Coulomb.
+template <class Real>
+Real sto_coulomb_2c(Real zA, const Real A[3], Real zB, const Real B[3], int ns = 96) {
+  std::vector<Real> tA, dA, tB, dB;
+  sto_gaussians(2 * zA, ns, tA, dA);
+  sto_gaussians(2 * zB, ns, tB, dB);
+  const Real pi = pi_v<Real>();
+  Real R2 = 0;
+  for (int d = 0; d < 3; ++d) R2 += (A[d] - B[d]) * (A[d] - B[d]);
+  const Real CA = zA * zA * zA / pi, CB = zB * zB * zB / pi;
+  Real J = 0;
+  for (std::size_t k = 0; k < tA.size(); ++k)
+    for (std::size_t m = 0; m < tB.size(); ++m)
+      J += CA * dA[k] * CB * dB[m] * detail::ss_coulomb(tA[k], tB[m], R2);
+  return J;
+}
+
+/// (rho_A|rho_B) with the two-electron delta-tail acceleration: rho_A's s-grid
+/// is truncated at t_c, and its tight, delta-like tail charge contributes
+/// Q_tail * V_B(A) -- the tail sits at A and samples the smooth Coulomb
+/// potential of rho_B there (B != A). rho_B is kept on a full grid. Reproduces
+/// sto_coulomb_2c from a coarse truncated rho_A grid.
+template <class Real>
+Real sto_coulomb_2c_delta(Real zA, const Real A[3], Real zB, const Real B[3], Real t_c,
+                          int ns_low, int ns_B = 96) {
+  std::vector<Real> tA, dA, tB, dB;
+  sto_gaussians(2 * zA, ns_low, tA, dA, 0, Real(1e-4), t_c); // truncated at t_c
+  sto_gaussians(2 * zB, ns_B, tB, dB);
+  const Real pi = pi_v<Real>();
+  Real R2 = 0;
+  for (int d = 0; d < 3; ++d) R2 += (A[d] - B[d]) * (A[d] - B[d]);
+  const Real R = std::sqrt(R2);
+  const Real CA = zA * zA * zA / pi, CB = zB * zB * zB / pi;
+  Real J = 0;
+  for (std::size_t k = 0; k < tA.size(); ++k)
+    for (std::size_t m = 0; m < tB.size(); ++m)
+      J += CA * dA[k] * CB * dB[m] * detail::ss_coulomb(tA[k], tB[m], R2);
+  // delta tail of rho_A: tail charge Q_tail times rho_B's potential at A
+  const Real Qtail = CA * sto_delta_tail_weight(2 * zA, t_c);
+  J += Qtail * sto_slater_potential(zB, R);
+  return J;
+}
+
 } // namespace intti
