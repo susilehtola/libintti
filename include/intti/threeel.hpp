@@ -430,12 +430,35 @@ Real three_electron_moment_cross(const CartGauss<Real> &a, const CartGauss<Real>
   return N * detail::three_electron_raw_moment_cross(a, b, c, d, e, f, op12, op13);
 }
 
+/// Which three-electron quantity the matrix-level contractions use: the plain
+/// integral, the r12^2 moment, or the r12.r13 cross moment (the F12 3-body
+/// corrections built from the moment operators).
+enum class ThreeElOp { Plain, R12sq, CrossR12R13 };
+
+/// Dispatch to the requested normalised three-electron quantity.
+template <class Real>
+Real three_electron_kind(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                         const CartGauss<Real> &c, const CartGauss<Real> &d,
+                         const CartGauss<Real> &e, const CartGauss<Real> &f,
+                         const std::vector<detail::OpNode<Real>> &op12,
+                         const std::vector<detail::OpNode<Real>> &op13, ThreeElOp op) {
+  switch (op) {
+  case ThreeElOp::R12sq:
+    return three_electron_moment12(a, b, c, d, e, f, op12, op13);
+  case ThreeElOp::CrossR12R13:
+    return three_electron_moment_cross(a, b, c, d, e, f, op12, op13);
+  default:
+    return three_electron(a, b, c, d, e, f, op12, op13);
+  }
+}
+
 /// Three-body energy from a set of normalised Cartesian Gaussians and an AO
 /// density matrix D (n x n, row-major): the fully-contracted three-electron
 /// integral
 ///   E = sum_{abcdef} G_{abcdef} D_{ad} D_{be} D_{cf},
 /// electron 1 = (a,d), 2 = (b,e), 3 = (c,f), with the operators op12 (1-2) and
-/// op13 (1-3) given as node lists. Matrix-level: density in, scalar out; the
+/// op13 (1-3) given as node lists. `kind` selects the plain integral or a moment
+/// (the F12 3-body corrections). Matrix-level: density in, scalar out; the
 /// individual sextet stays internal. This is the mean-field 3-body contribution
 /// transcorrelated / F12 methods build. O(n^6) reference (the sextet loop);
 /// production would fold the density in earlier and screen.
@@ -443,7 +466,8 @@ template <class Real>
 Real three_electron_energy(const std::vector<CartGauss<Real>> &basis,
                            const std::vector<Real> &D,
                            const std::vector<detail::OpNode<Real>> &op12,
-                           const std::vector<detail::OpNode<Real>> &op13) {
+                           const std::vector<detail::OpNode<Real>> &op13,
+                           ThreeElOp kind = ThreeElOp::Plain) {
   const int n = static_cast<int>(basis.size());
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * n + j]; };
   Real E = 0;
@@ -460,8 +484,8 @@ Real three_electron_energy(const std::vector<CartGauss<Real>> &basis,
               const Real Dcf = Dm(c, f);
               if (Dcf == Real(0)) continue;
               E += Dad * Dbe * Dcf *
-                   three_electron(basis[a], basis[b], basis[c], basis[d], basis[e], basis[f],
-                                  op12, op13);
+                   three_electron_kind(basis[a], basis[b], basis[c], basis[d], basis[e],
+                                       basis[f], op12, op13, kind);
             }
         }
     }
@@ -474,11 +498,13 @@ Real three_electron_energy(const std::vector<CartGauss<Real>> &basis,
 /// sextet scatters into the three slots its pairs occupy:
 ///   F_ad += G D_be D_cf,  F_be += G D_ad D_cf,  F_cf += G D_ad D_be.
 /// Matrix in, matrix out. The cubic homogeneity of E gives sum_pq F_pq D_pq = 3E.
+/// `kind` selects the plain integral or a moment, matching three_electron_energy.
 template <class Real>
 std::vector<Real> three_electron_fock(const std::vector<CartGauss<Real>> &basis,
                                       const std::vector<Real> &D,
                                       const std::vector<detail::OpNode<Real>> &op12,
-                                      const std::vector<detail::OpNode<Real>> &op13) {
+                                      const std::vector<detail::OpNode<Real>> &op13,
+                                      ThreeElOp kind = ThreeElOp::Plain) {
   const int n = static_cast<int>(basis.size());
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * n + j]; };
   std::vector<Real> F(static_cast<std::size_t>(n) * n, Real(0));
@@ -493,8 +519,8 @@ std::vector<Real> three_electron_fock(const std::vector<CartGauss<Real>> &basis,
             for (int f = 0; f < n; ++f) {
               const Real Dcf = Dm(c, f);
               if (Dad == Real(0) && Dbe == Real(0) && Dcf == Real(0)) continue;
-              const Real G = three_electron(basis[a], basis[b], basis[c], basis[d], basis[e],
-                                            basis[f], op12, op13);
+              const Real G = three_electron_kind(basis[a], basis[b], basis[c], basis[d],
+                                                 basis[e], basis[f], op12, op13, kind);
               Fadd(a, d, G * Dbe * Dcf);
               Fadd(b, e, G * Dad * Dcf);
               Fadd(c, f, G * Dad * Dbe);

@@ -131,7 +131,9 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   transcorrelated / F12 methods build. The effective one-body reduction is done
   (`three_electron_fock`): F_pq = dE/dD_pq, the 3-body contribution to the Fock
   matrix (density in, matrix out) -- each sextet scatters into the three slots
-  its pairs occupy. This is what a mean-field SCF consumes.
+  its pairs occupy. This is what a mean-field SCF consumes. Both contractions
+  take a `kind` selector so they also drive the moment operators (r12^2, r12.r13)
+  -- the F12 3-body correction energies and their Fock derivatives.
 
   Independent validation (no circular or self-consistency references): the
   one-centre G_aaaaaa = 4 zeta/3 and Gaussian-geminal analytics (closed forms,

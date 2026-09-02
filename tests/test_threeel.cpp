@@ -344,4 +344,37 @@ TEST(ThreeEl, ThreeBodyFockIsEnergyGradient) {
     }
 }
 
+TEST(ThreeEl, ThreeBodyMomentEnergyAndFock) {
+  // The energy/Fock contractions also drive the moment operators (the F12 3-body
+  // corrections). Checked for r12^2 and the r12.r13 cross moment via the Euler
+  // identity and a finite difference of the (smooth, exact) Gaussian energy.
+  auto op12 = intti::detail::gaussian_nodes<double>({1.0}, {0.7});
+  auto op13 = intti::detail::gaussian_nodes<double>({1.0}, {0.5});
+  const int n = 2;
+  std::vector<G> basis = {G{1.0, {0.0, 0.0, 0.0}, {0, 0, 0}},
+                          G{0.8, {0.5, 0.0, 0.0}, {0, 0, 0}}};
+  std::vector<double> D = {1.0, 0.2, 0.3, 0.7};
+  for (auto kind : {intti::ThreeElOp::R12sq, intti::ThreeElOp::CrossR12R13}) {
+    const auto F = intti::three_electron_fock(basis, D, op12, op13, kind);
+    const double E = intti::three_electron_energy(basis, D, op12, op13, kind);
+    double trace = 0;
+    for (int i = 0; i < n * n; ++i) trace += F[i] * D[i];
+    EXPECT_NEAR(trace, 3 * E, 1e-9 * (std::abs(E) + 1)) << "Euler, kind " << (int)kind;
+    const double h = 1e-4;
+    auto shift = [&](int p, int q, double s) {
+      std::vector<double> Dm = D;
+      Dm[p * n + q] += s;
+      return intti::three_electron_energy(basis, Dm, op12, op13, kind);
+    };
+    for (int p = 0; p < n; ++p)
+      for (int q = 0; q < n; ++q) {
+        const double fd = (shift(p, q, -2 * h) - 8 * shift(p, q, -h) + 8 * shift(p, q, h) -
+                           shift(p, q, 2 * h)) /
+                          (12 * h);
+        EXPECT_NEAR(F[p * n + q], fd, 1e-7 * (std::abs(fd) + 1))
+            << "kind " << (int)kind << " F[" << p << "," << q << "]";
+      }
+  }
+}
+
 } // namespace
