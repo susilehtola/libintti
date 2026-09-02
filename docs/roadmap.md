@@ -139,8 +139,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   *delta-tail* into the matrix build does NOT compose from the clean 2-centre
   correction -- the off-diagonal two-centre bra products and the several
   tail-combination terms (bra tail x density tail, on-centre tail-tail) leave
-  leading-order corrections ~1-3% off on a coarse grid; a correct delta-tail
-  matrix build is a larger effort and remains open. An STO is the exact
+  leading-order corrections ~1-3% off on a coarse grid with a systematic
+  overshoot. Root cause found (`prototype/sto_delta_tail_j.py`): the delta-tail
+  must be applied at the PAIR-DENSITY level, not by truncating orbital
+  primitives -- (phi^low)^2 is a different truncation than truncating the pair
+  density e^{-2 zeta r}, and drops the "one orbital tight" pairs the point
+  charge cannot repair. At the density level it works even on-centre (R=0): the
+  1s self-repulsion 5 zeta/8 is reproduced to 1.4e-4 at t_c=20 and 6e-3 at
+  t_c=8. A production delta-tail J is therefore a re-architecture around pair
+  densities (single-centre Slater for same-atom pairs, point-charge tails for
+  two-centre pairs) plus the closed-form tail-tail self-energy; open. An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.
