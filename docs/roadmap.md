@@ -108,9 +108,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   geminal) all go through one routine (`three_electron` + coulomb_nodes /
   gaussian_nodes). Validated: the one-centre Gaussian-Gaussian analytic to
   1e-13 and the mixed Coulomb/Gaussian l>0 p-functions via the centre-derivative
-  identity. Remaining: the matrix-level F12 contractions (the sextet stays
-  internal like the ERI quartet), and the linear r12 operator (r12 = r12^2
-  r12^{-1}).
+  identity. The f/r operator done too (`geminal_over_r_nodes`): f12/r12 =
+  sum_k c_k e^{-g_k r^2}/r = sum_k (2/sqrt pi) int e^{-(g_k+t^2) r^2} dt is the
+  Coulomb grid with exponents shifted by g_k (g=0 recovers Coulomb exactly).
+  So the node-representable F12 operator family -- f (gaussian_nodes), f^2
+  (gaussian products), f/r, r^{-1} -- is complete. Remaining: the matrix-level
+  F12 contractions (the sextet stays internal like the ERI quartet); the
+  commutator [f,T] and the linear r12 operator (r12 = r12^2 r12^{-1}), which
+  need moment/kinetic factors beyond a plain node list.
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

@@ -127,4 +127,44 @@ TEST(ThreeEl, MixedCoulombGaussianPFunctionVsFD) {
   }
 }
 
+TEST(ThreeEl, GeminalOverRReducesToCoulomb) {
+  // (f/r) with f = e^{-0 r^2} = 1 is exactly the Coulomb node list, so
+  // f12/r12 * r13^{-1} must equal r12^{-1} r13^{-1}.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  G a{0.9, {0.0, 0.0, 0.0}, {1, 0, 0}}, b{1.1, {0.4, 0.0, 0.0}, {0, 0, 0}},
+      c{0.7, {0.0, 0.3, 0.5}, {0, 1, 0}}, d{1.3, {0.1, 0.0, 0.0}, {0, 0, 0}},
+      e{0.8, {0.4, 0.1, 0.0}, {0, 0, 0}}, f{1.0, {0.0, 0.3, 0.6}, {0, 0, 1}};
+  auto fr = intti::detail::geminal_over_r_nodes<double>({1.0}, {0.0}, grid);
+  auto co = intti::detail::coulomb_nodes(grid);
+  const double g1 = intti::three_electron(a, b, c, d, e, f, fr, co);
+  const double g2 = intti::three_electron_coulomb(a, b, c, d, e, f, grid);
+  EXPECT_NEAR(g1, g2, 1e-12 * std::abs(g2));
+}
+
+TEST(ThreeEl, GeminalOverRPFunctionVsFD) {
+  // f12/r12 (Gaussian geminal over r) on the 1-2 pair, Coulomb on 1-3;
+  // validate l>0 on all three densities via the centre-derivative identity.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto op12 = intti::detail::geminal_over_r_nodes<double>({0.6, 0.3}, {0.4, 1.5}, grid);
+  auto op13 = intti::detail::coulomb_nodes(grid);
+  const double zof[6] = {0.9, 1.1, 0.7, 1.3, 0.8, 1.0};
+  const double R[6][3] = {{0, 0, 0},   {0.4, 0, 0},   {0, 0.3, 0.5},
+                          {0.1, 0, 0}, {0.4, 0.1, 0}, {0, 0.3, 0.6}};
+  auto build = [&](int which, int dir, int power, double delta) {
+    G g[6];
+    for (int i = 0; i < 6; ++i) g[i] = G{zof[i], {R[i][0], R[i][1], R[i][2]}, {0, 0, 0}};
+    if (power) g[which].l[dir] = 1;
+    g[which].center[dir] += delta;
+    return intti::detail::three_electron_raw_nodes(g[0], g[1], g[2], g[3], g[4], g[5], op12,
+                                                   op13);
+  };
+  const double h = 1e-4;
+  for (int which : {0, 1, 2}) {
+    const int dir = which;
+    const double fd =
+        (build(which, dir, 0, h) - build(which, dir, 0, -h)) / (2 * h) / (2 * zof[which]);
+    EXPECT_NEAR(build(which, dir, 1, 0.0), fd, 1e-6 * (std::abs(fd) + 1)) << "which " << which;
+  }
+}
+
 } // namespace

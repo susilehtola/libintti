@@ -161,6 +161,21 @@ std::vector<OpNode<Real>> gaussian_nodes(const std::vector<Real> &c,
   for (std::size_t k = 0; k < c.size(); ++k) nd[k] = {c[k], sqrt_(g[k])};
   return nd;
 }
+/// Geminal-over-r operator (sum_k c[k] e^{-g[k] r^2}) / r as a node list: each
+/// term times 1/r = (2/sqrt pi) int e^{-t^2 r^2} dt is the Coulomb grid with the
+/// exponent shifted, t -> sqrt(g[k] + t_i^2). g[k]=0 recovers plain Coulomb.
+/// This is the F12 "f/r" operator (f a Gaussian geminal).
+template <class Real>
+std::vector<OpNode<Real>> geminal_over_r_nodes(const std::vector<Real> &c,
+                                               const std::vector<Real> &g,
+                                               const TGrid<Real> &grid) {
+  std::vector<OpNode<Real>> nd;
+  nd.reserve(c.size() * grid.n());
+  for (std::size_t k = 0; k < c.size(); ++k)
+    for (int i = 0; i < grid.n(); ++i)
+      nd.push_back({c[k] * grid.w[i], sqrt_(g[k] + grid.t[i] * grid.t[i])});
+  return nd;
+}
 
 /// Unnormalised three-electron integral of six Cartesian Gaussians with
 /// arbitrary inter-electronic operators on the 1-2 and 1-3 pairs, given as node
