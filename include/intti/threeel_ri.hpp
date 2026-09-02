@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Susi Lehtola
+#pragma once
+
+// RI (density-fitting) folding of the mean-field three-electron Coulomb energy.
+//
+// The direct term is E3 = sum_{abcdef} G_{abcdef} D_ad D_be D_cf, an O(nao^6)
+// sextet loop. It is exactly the classical functional of the density,
+//   E3 = int rho_D(r) V_D(r)^2 dr,
+// rho_D = sum_{mu nu} D_{mu nu} chi_mu chi_nu the electron density and V_D its
+// Coulomb potential. The three-electron INTEGRALS are still Mehine-direct
+// (threeel.hpp); only the CONTRACTION is refolded. Fitting rho_D to an auxiliary
+// basis, rho_D ~ sum_P d_P chi_P with d = M^{-1} g, M_{PQ}=(P|Q), g_P=(P|rho_D),
+// gives
+//   E3 ~ sum_{PQR} d_P d_Q d_R T_{RPQ},  T_{RPQ} = int chi_R V_P V_Q,
+// where T is the three-electron integral of three single auxiliary functions
+// (each its own density; the ghost-partner trick of ncenter.hpp). Cost is
+// O(naux^3) three-electron aux integrals + O(nao^2 naux) two-electron, versus
+// O(nao^6); and it is EXACT when rho_D lies in span(aux). All quantities are the
+// unnormalised primitive Cartesian convention shared by coulomb_2c/3c and the
+// detail::three_electron_raw family, so D is the unnormalised primitive density.
+
+#include <cstddef>
+#include <vector>
+
+#include "cholesky.hpp" // detail::syevd
+#include "gto.hpp"      // ShellBasis, ncart, cart_comp
+#include "ncenter.hpp"  // coulomb_2c, coulomb_3c
+#include "threeel.hpp"  // CartGauss, detail::three_electron_raw
+
+namespace intti {
+namespace detail {
+
+/// Expand a ShellBasis into one CartGauss per AO, in the AO order used by the
+/// tensor builders (ao_off + cart_comp), so a density in that order lines up.
+template <class Real>
+std::vector<CartGauss<Real>> shellbasis_to_cartgauss(const ShellBasis<Real> &b) {
+  std::vector<CartGauss<Real>> out(b.nao);
+  for (std::size_t s = 0; s < b.shells.size(); ++s) {
+    const auto &sh = b.shells[s];
+    const int nc = ncart(sh.l);
+    for (int k = 0; k < nc; ++k) {
+      CartGauss<Real> g;
+      g.alpha = sh.alpha;
+      for (int d = 0; d < 3; ++d) g.center[d] = sh.center[d];
+      cart_comp(sh.l, k, g.l[0], g.l[1], g.l[2]);
+      out[b.ao_off[s] + k] = g;
+    }
+  }
+  return out;
+}
+
+/// d = M^{-1} g via symmetric eigendecomposition, dropping eigenvalues below
+/// tau * (largest eigenvalue) to tame auxiliary linear dependence.
+template <class Real>
+std::vector<Real> te_solve_metric(std::vector<Real> M, const std::vector<Real> &g, int n,
+                                  Real tau) {
+  std::vector<Real> w(n);
+  syevd(n, M.data(), w.data()); // M -> eigenvectors (columns, col-major), w ascending
+  const Real cutoff = tau * w[n - 1];
+  std::vector<Real> d(n, Real(0));
+  for (int k = 0; k < n; ++k) {
+    if (w[k] <= cutoff) continue;
+    Real proj = 0;
+    for (int i = 0; i < n; ++i) proj += M[static_cast<std::size_t>(k) * n + i] * g[i];
+    const Real c = proj / w[k];
+    for (int i = 0; i < n; ++i) d[i] += c * M[static_cast<std::size_t>(k) * n + i];
+  }
+  return d;
+}
+
+} // namespace detail
+
+/// RI-folded three-body Coulomb energy E3 = int rho_D V_D^2. `D` is the
+/// unnormalised primitive density (nao x nao, row-major) in `orb`'s AO order;
+/// `aux` is the fitting basis; `grid` a Coulomb t-grid. `tau` drops
+/// near-dependent auxiliary directions. Exact when rho_D lies in span(aux).
+template <class Real>
+Real three_electron_energy_ri(const ShellBasis<Real> &orb, const std::vector<Real> &D,
+                              const ShellBasis<Real> &aux, const TGrid<Real> &grid,
+                              Real tau = 1e-10) {
+  const int nao = orb.nao, naux = aux.nao;
+  const auto M = coulomb_2c(aux, grid);           // (P|Q)
+  const auto T3c = coulomb_3c(orb, aux, grid);    // (mu nu|P), row-major (mu,nu,P)
+  // g_P = sum_{mu nu} D_{mu nu} (mu nu|P)
+  std::vector<Real> g(naux, Real(0));
+  for (int mu = 0; mu < nao; ++mu)
+    for (int nu = 0; nu < nao; ++nu) {
+      const Real Dmn = D[static_cast<std::size_t>(mu) * nao + nu];
+      if (Dmn == Real(0)) continue;
+      const Real *row = &T3c[(static_cast<std::size_t>(mu) * nao + nu) * naux];
+      for (int P = 0; P < naux; ++P) g[P] += Dmn * row[P];
+    }
+  const auto d = detail::te_solve_metric(M, g, naux, tau);
+  // E3 = sum_{PQR} d_P d_Q d_R T_{RPQ},  T_{RPQ} = three_electron_raw with each
+  // auxiliary function as its own electron density (ghost partner, K=1).
+  const auto auxg = detail::shellbasis_to_cartgauss(aux);
+  CartGauss<Real> ghost{Real(0), {Real(0), Real(0), Real(0)}, {0, 0, 0}};
+  Real E = 0;
+  for (int R = 0; R < naux; ++R) {
+    if (d[R] == Real(0)) continue;
+    for (int P = 0; P < naux; ++P) {
+      if (d[P] == Real(0)) continue;
+      const Real dRP = d[R] * d[P];
+      for (int Q = 0; Q < naux; ++Q) {
+        if (d[Q] == Real(0)) continue;
+        E += dRP * d[Q] *
+             detail::three_electron_raw(auxg[R], auxg[P], auxg[Q], ghost, ghost, ghost, grid);
+      }
+    }
+  }
+  return E;
+}
+
+} // namespace intti

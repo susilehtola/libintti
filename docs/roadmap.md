@@ -151,10 +151,18 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   pair-overlap magnitude), skipping a sextet when q_ad q_be q_cf < screen (max
   q)^3 -- the same pruned set for both, so the screened Fock stays the exact
   gradient of the screened energy. This folds the density and pair sparsity into
-  the loop; the fully-folded exact form E = int rho_D V_D^2 (density rho_D, its
-  Coulomb potential V_D) needs the grid (M14) or RI (M12/13) path and is the
-  remaining scaling win, along with the effective two-body reduction (contract
-  one pair into an effective 2-electron operator folded into the J/K build).
+  the loop. The fully-folded exact form E = int rho_D V_D^2 (density rho_D, its
+  Coulomb potential V_D) is done by RI (`three_electron_energy_ri`, `threeel_ri.hpp`):
+  fit rho_D to an auxiliary basis (d = M^{-1} g, M=(P|Q) via `coulomb_2c`,
+  g_P=(P|rho_D) via `coulomb_3c`), then E ~ sum_{PQR} d_P d_Q d_R T_{RPQ} with
+  T_{RPQ} = int chi_R V_P V_Q the three-electron integral of three single
+  auxiliary functions (ghost-partner trick, still Mehine-direct). O(naux^3) +
+  O(nao^2 naux) vs O(nao^6), and exact when rho_D lies in span(aux) -- validated
+  to numerical precision for s and for p x p -> d products, plus the approximate
+  (incomplete-aux) case. The integrals are never RI'd; only the contraction is
+  refolded. Remaining: the RI-folded Fock (F = d/dD of the folded energy), and
+  the effective two-body reduction (contract one pair into an effective
+  2-electron operator folded into the J/K build).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
