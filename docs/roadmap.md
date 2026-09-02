@@ -160,9 +160,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   O(nao^2 naux) vs O(nao^6), and exact when rho_D lies in span(aux) -- validated
   to numerical precision for s and for p x p -> d products, plus the approximate
   (incomplete-aux) case. The integrals are never RI'd; only the contraction is
-  refolded. Remaining: the RI-folded Fock (F = d/dD of the folded energy), and
-  the effective two-body reduction (contract one pair into an effective
-  2-electron operator folded into the J/K build).
+  refolded. The RI-folded Fock is done too (`three_electron_fock_ri`): E3^RI is
+  cubic in the fitted density d and d is linear in D, so F_{mu nu} = sum_Q (mu
+  nu|Q) [M^+ G]_Q with G the auxiliary-space gradient (each aux integral T_{ijk}
+  scattered into its three slots) -- O(naux^3), matching the energy, with
+  sum F D = 3E. Validated against the direct raw Fock in the exact-aux cases (s
+  and p) and by finite difference of E3^RI. Remaining: the effective two-body
+  reduction (contract one pair into an effective 2-electron operator folded into
+  the J/K build).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

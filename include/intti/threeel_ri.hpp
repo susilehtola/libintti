@@ -112,4 +112,57 @@ Real three_electron_energy_ri(const ShellBasis<Real> &orb, const std::vector<Rea
   return E;
 }
 
+/// Effective one-body (Fock) contribution of the RI-folded three-body energy:
+/// F_{mu nu} = dE3^RI/dD_{mu nu}, an nao x nao matrix (row-major, unnormalised
+/// primitive convention). Because E3^RI = sum_{ijk} d_i d_j d_k T_{ijk} is cubic
+/// in the fitted density d, and d = M^+ g is linear in D (g_P = sum D_{mu nu}
+/// (mu nu|P)), the chain rule gives an auxiliary-space gradient G (scattered from
+/// each T like the direct Fock), then F_{mu nu} = sum_Q (mu nu|Q) [M^+ G]_Q.
+/// O(naux^3) + O(nao^2 naux), matching the energy; sum_{mu nu} F D = 3 E3^RI.
+template <class Real>
+std::vector<Real> three_electron_fock_ri(const ShellBasis<Real> &orb, const std::vector<Real> &D,
+                                         const ShellBasis<Real> &aux, const TGrid<Real> &grid,
+                                         Real tau = 1e-10) {
+  const int nao = orb.nao, naux = aux.nao;
+  const auto M = coulomb_2c(aux, grid);
+  const auto T3c = coulomb_3c(orb, aux, grid); // (mu nu|P)
+  std::vector<Real> g(naux, Real(0));
+  for (int mu = 0; mu < nao; ++mu)
+    for (int nu = 0; nu < nao; ++nu) {
+      const Real Dmn = D[static_cast<std::size_t>(mu) * nao + nu];
+      if (Dmn == Real(0)) continue;
+      const Real *row = &T3c[(static_cast<std::size_t>(mu) * nao + nu) * naux];
+      for (int P = 0; P < naux; ++P) g[P] += Dmn * row[P];
+    }
+  const auto d = detail::te_solve_metric(M, g, naux, tau);
+  // auxiliary-space gradient: each aux 3-electron integral T_{ijk} scatters into
+  // its three slots (the derivative of d_i d_j d_k), independent of any symmetry.
+  const auto auxg = detail::shellbasis_to_cartgauss(aux);
+  CartGauss<Real> ghost{Real(0), {Real(0), Real(0), Real(0)}, {0, 0, 0}};
+  std::vector<Real> Gaux(naux, Real(0));
+  for (int i = 0; i < naux; ++i)
+    for (int j = 0; j < naux; ++j)
+      for (int k = 0; k < naux; ++k) {
+        // contributes only if at least two of d_i,d_j,d_k are nonzero
+        const int nz = (d[i] != Real(0)) + (d[j] != Real(0)) + (d[k] != Real(0));
+        if (nz < 2) continue;
+        const Real T =
+            detail::three_electron_raw(auxg[i], auxg[j], auxg[k], ghost, ghost, ghost, grid);
+        Gaux[i] += d[j] * d[k] * T;
+        Gaux[j] += d[i] * d[k] * T;
+        Gaux[k] += d[i] * d[j] * T;
+      }
+  const auto z = detail::te_solve_metric(M, Gaux, naux, tau);
+  // F_{mu nu} = sum_Q (mu nu|Q) z_Q
+  std::vector<Real> F(static_cast<std::size_t>(nao) * nao, Real(0));
+  for (int mu = 0; mu < nao; ++mu)
+    for (int nu = 0; nu < nao; ++nu) {
+      const Real *row = &T3c[(static_cast<std::size_t>(mu) * nao + nu) * naux];
+      Real s = 0;
+      for (int Q = 0; Q < naux; ++Q) s += row[Q] * z[Q];
+      F[static_cast<std::size_t>(mu) * nao + nu] = s;
+    }
+  return F;
+}
+
 } // namespace intti
