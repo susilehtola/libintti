@@ -139,12 +139,38 @@ std::vector<std::vector<Real>> te_build_phi(int mP, int mQ, int mS, Real LQ, Rea
   return phi;
 }
 
-/// Unnormalised three-electron Coulomb integral of six Cartesian Gaussians.
+/// One quadrature node for an inter-electronic operator: the operator, sampled
+/// as weight * exp(-t^2 r^2). Coulomb r^{-1} = (2/sqrt pi) int exp(-t^2 r^2) dt
+/// is the whole t-grid (weights carry 2/sqrt pi); a Gaussian geminal
+/// sum_k c_k exp(-g_k r^2) is the fixed nodes {(c_k, sqrt g_k)} (no integration).
+template <class Real> struct OpNode {
+  Real weight, t;
+};
+
+/// Coulomb operator r^{-1} as node list (the t-grid).
+template <class Real> std::vector<OpNode<Real>> coulomb_nodes(const TGrid<Real> &grid) {
+  std::vector<OpNode<Real>> nd(grid.n());
+  for (int i = 0; i < grid.n(); ++i) nd[i] = {grid.w[i], grid.t[i]};
+  return nd;
+}
+/// Gaussian geminal sum_k c[k] exp(-g[k] r^2) as node list.
 template <class Real>
-Real three_electron_raw(const CartGauss<Real> &a, const CartGauss<Real> &b,
-                        const CartGauss<Real> &c, const CartGauss<Real> &d,
-                        const CartGauss<Real> &e, const CartGauss<Real> &f,
-                        const TGrid<Real> &grid) {
+std::vector<OpNode<Real>> gaussian_nodes(const std::vector<Real> &c,
+                                         const std::vector<Real> &g) {
+  std::vector<OpNode<Real>> nd(c.size());
+  for (std::size_t k = 0; k < c.size(); ++k) nd[k] = {c[k], sqrt_(g[k])};
+  return nd;
+}
+
+/// Unnormalised three-electron integral of six Cartesian Gaussians with
+/// arbitrary inter-electronic operators on the 1-2 and 1-3 pairs, given as node
+/// lists (Coulomb -> coulomb_nodes, Gaussian geminal -> gaussian_nodes).
+template <class Real>
+Real three_electron_raw_nodes(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                              const CartGauss<Real> &c, const CartGauss<Real> &d,
+                              const CartGauss<Real> &e, const CartGauss<Real> &f,
+                              const std::vector<OpNode<Real>> &nodes12,
+                              const std::vector<OpNode<Real>> &nodes13) {
   auto pairdens = [](const CartGauss<Real> &x, const CartGauss<Real> &y, Real &alpha,
                      Real R[3], Real &K) {
     alpha = x.alpha + y.alpha;
@@ -184,13 +210,13 @@ Real three_electron_raw(const CartGauss<Real> &a, const CartGauss<Real> &b,
   const int W = MP + MQ + MS + 1;
   const Real pi = pi_v<Real>();
   const Real pi92 = pi * pi * pi * pi * sqrt_(pi);
-  const int nt = grid.n();
+  const int n12 = static_cast<int>(nodes12.size()), n13 = static_cast<int>(nodes13.size());
   Real acc = 0;
-  for (int it = 0; it < nt; ++it) {
-    const Real t2 = grid.t[it] * grid.t[it];
+  for (int it = 0; it < n12; ++it) {
+    const Real t2 = nodes12[it].t * nodes12[it].t;
     const Real LQ = t2 * aQ / (t2 + aQ);
-    for (int is = 0; is < nt; ++is) {
-      const Real s2 = grid.t[is] * grid.t[is];
+    for (int is = 0; is < n13; ++is) {
+      const Real s2 = nodes13[is].t * nodes13[is].t;
       const Real LS = s2 * aS / (s2 + aS);
       const Real denom = (aP + LQ + LS) * (aQ + t2) * (aS + s2);
       const Real M = pi92 * exp_(-LQ * RPQ2 - LS * RPS2) / (denom * sqrt_(denom));
@@ -216,10 +242,20 @@ Real three_electron_raw(const CartGauss<Real> &a, const CartGauss<Real> &b,
             }
         theta *= Th;
       }
-      acc += grid.w[it] * grid.w[is] * M * theta;
+      acc += nodes12[it].weight * nodes13[is].weight * M * theta;
     }
   }
   return Kad * Kbe * Kcf * acc;
+}
+
+/// Unnormalised three-electron Coulomb integral (both operators = r^{-1}).
+template <class Real>
+Real three_electron_raw(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                        const CartGauss<Real> &c, const CartGauss<Real> &d,
+                        const CartGauss<Real> &e, const CartGauss<Real> &f,
+                        const TGrid<Real> &grid) {
+  const auto nd = coulomb_nodes(grid);
+  return three_electron_raw_nodes(a, b, c, d, e, f, nd, nd);
 }
 
 /// s-type normalisation product N0(z) = (2 z / pi)^{3/4} (l=0) generalised:
@@ -258,6 +294,25 @@ Real three_electron_coulomb(const CartGauss<Real> &a, const CartGauss<Real> &b,
   const Real N = detail::te_norm(a) * detail::te_norm(b) * detail::te_norm(c) *
                  detail::te_norm(d) * detail::te_norm(e) * detail::te_norm(f);
   return N * detail::three_electron_raw(a, b, c, d, e, f, grid);
+}
+
+/// Three-electron integral over six NORMALISED Cartesian Gaussians with
+/// arbitrary inter-electronic operators on the 1-2 and 1-3 pairs, given as node
+/// lists (detail::coulomb_nodes for r^{-1}, detail::gaussian_nodes for a
+/// Gaussian-geminal expansion sum_k c_k e^{-g_k r^2}). This covers the
+/// explicitly-correlated / transcorrelated three-electron integrals: r12^{-1}
+/// r13^{-1}, f12 r13^{-1}, f12 f13, ... where f is a Gaussian geminal (a
+/// Gaussian geminal needs no t-integration, so its slot is just its fixed
+/// nodes).
+template <class Real>
+Real three_electron(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                    const CartGauss<Real> &c, const CartGauss<Real> &d,
+                    const CartGauss<Real> &e, const CartGauss<Real> &f,
+                    const std::vector<detail::OpNode<Real>> &op12,
+                    const std::vector<detail::OpNode<Real>> &op13) {
+  const Real N = detail::te_norm(a) * detail::te_norm(b) * detail::te_norm(c) *
+                 detail::te_norm(d) * detail::te_norm(e) * detail::te_norm(f);
+  return N * detail::three_electron_raw_nodes(a, b, c, d, e, f, op12, op13);
 }
 
 } // namespace intti

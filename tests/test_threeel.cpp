@@ -82,4 +82,49 @@ TEST(ThreeEl, PFunctionVsCentreDerivative) {
   }
 }
 
+TEST(ThreeEl, GaussianGeminalOneCentreAnalytic) {
+  // both operators Gaussian geminals e^{-gamma r^2}, e^{-delta r^2}; one centre,
+  // identical s-GTOs exponent z. No quadrature -- the analytic Gaussian result
+  // G = N pi^{9/2}/[(a+LQ+LS)(a+g)(a+d)]^{3/2}, a = 2z, LQ = a g/(a+g), etc.
+  const double z = 1.1, gamma = 0.7, delta = 1.3;
+  G a{z, {0.0, 0.0, 0.0}, {0, 0, 0}};
+  auto op12 = intti::detail::gaussian_nodes<double>({1.0}, {gamma});
+  auto op13 = intti::detail::gaussian_nodes<double>({1.0}, {delta});
+  const double got = intti::three_electron(a, a, a, a, a, a, op12, op13);
+  const double al = 2 * z, LQ = al * gamma / (al + gamma), LS = al * delta / (al + delta);
+  const double N0 = std::pow(2 * z / M_PI, 0.75); // s-type norm per function
+  const double ana = std::pow(N0, 6) * std::pow(M_PI, 4.5) /
+                     std::pow((al + LQ + LS) * (al + gamma) * (al + delta), 1.5);
+  EXPECT_NEAR(got, ana, 1e-13 * ana);
+}
+
+TEST(ThreeEl, MixedCoulombGaussianPFunctionVsFD) {
+  // r12^{-1} on the 1-2 pair, a Gaussian geminal e^{-gamma r13^2} on the 1-3
+  // pair. A p-function on any density is (1/2 alpha) d/dcentre of the s-integral,
+  // for ANY operator -- so this validates the mixed operator and l>0 at once.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const double gamma = 0.6;
+  auto op12 = intti::detail::coulomb_nodes(grid);
+  auto op13 = intti::detail::gaussian_nodes<double>({1.0}, {gamma});
+  const double za = 0.9, zb = 1.1, zc = 0.7, zd = 1.3, ze = 0.8, zf = 1.0;
+  const double R[6][3] = {{0, 0, 0},   {0.4, 0, 0}, {0, 0.3, 0.5},
+                          {0.1, 0, 0}, {0.4, 0.1, 0}, {0, 0.3, 0.6}};
+  const double zof[6] = {za, zb, zc, zd, ze, zf};
+  auto build = [&](int which, int dir, int power, double delta) {
+    G g[6];
+    for (int i = 0; i < 6; ++i) g[i] = G{zof[i], {R[i][0], R[i][1], R[i][2]}, {0, 0, 0}};
+    if (power) g[which].l[dir] = 1;
+    g[which].center[dir] += delta;
+    return intti::detail::three_electron_raw_nodes(g[0], g[1], g[2], g[3], g[4], g[5], op12, op13);
+  };
+  const double h = 1e-4;
+  for (int which : {0, 1, 2}) { // P, Q, S densities
+    const int dir = which;
+    const double fd = (build(which, dir, 0, h) - build(which, dir, 0, -h)) / (2 * h) /
+                      (2 * zof[which]);
+    const double p = build(which, dir, 1, 0.0);
+    EXPECT_NEAR(p, fd, 1e-6 * (std::abs(fd) + 1)) << "mixed op, function " << which;
+  }
+}
+
 } // namespace

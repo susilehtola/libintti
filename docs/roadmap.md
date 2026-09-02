@@ -101,9 +101,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   on the P, Q and S densities via the identity chi_{p_x} = (1/2a) d/dA_x chi_s,
   i.e. finite difference of the s-code (an independent check needing no external
   reference). Enables explicitly-correlated / transcorrelated (F12/R12)
-  methods. Remaining: the matrix-level contractions (the individual sextet
-  stays internal like the ERI quartet), and non-Coulomb geminal operators (r12,
-  Gaussian geminals) via the same 2D quadrature.
+  methods. Gaussian-geminal operators done: each inter-electronic operator is a
+  node list -- Coulomb r^{-1} = (2/sqrt pi) int e^{-t^2 r^2} dt is the whole
+  t-grid, a Gaussian geminal sum_k c_k e^{-g_k r^2} is just its fixed nodes (no
+  integration). So r12^{-1} r13^{-1}, f12 r13^{-1}, f12 f13 (f a Gaussian
+  geminal) all go through one routine (`three_electron` + coulomb_nodes /
+  gaussian_nodes). Validated: the one-centre Gaussian-Gaussian analytic to
+  1e-13 and the mixed Coulomb/Gaussian l>0 p-functions via the centre-derivative
+  identity. Remaining: the matrix-level F12 contractions (the sextet stays
+  internal like the ERI quartet), and the linear r12 operator (r12 = r12^2
+  r12^{-1}).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
