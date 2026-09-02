@@ -255,6 +255,9 @@ TEST(ThreeEl, IndependentReferenceIntegralsAndMoments) {
     const double gm =
         intti::three_electron_moment12(g[0], g[1], g[2], g[3], g[4], g[5], op12, op13);
     EXPECT_NEAR(gm, cs.moment, 1e-10 * (std::abs(cs.moment) + 1)) << "moment " << cs.name;
+    const double gx =
+        intti::three_electron_moment_cross(g[0], g[1], g[2], g[3], g[4], g[5], op12, op13);
+    EXPECT_NEAR(gx, cs.cross, 1e-10 * (std::abs(cs.cross) + 1)) << "cross " << cs.name;
   }
 }
 

@@ -121,7 +121,10 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   f^2, f/r -- all go through one routine (`three_electron`). The r^2 moment
   (`three_electron_moment12`) inserts r12^2 = sum_dir (x1-x2)^2 into the same
   moment machinery, giving the linear operator r12 = r12^2 r12^{-1} (Coulomb
-  nodes) and (grad_1 f12).(grad_1 f12) (Gaussian nodes). Matrix-level
+  nodes) and (grad_1 f12).(grad_1 f12) (Gaussian nodes); the cross moment
+  (`three_electron_moment_cross`) inserts the vector dot product r12 . r13 =
+  sum_dir (x1-x2)(x1-x3), i.e. (grad_1 f12).(grad_1 f13) with Gaussian nodes on
+  both slots -- the F12 commutator / B-matrix ingredient. Matrix-level
   contraction (`three_electron_energy`): the fully-contracted 3-body energy
   E = sum_{abcdef} G_{abcdef} D_ad D_be D_cf (density in, scalar out; sextet
   internal, like J/K from quartets) -- the mean-field 3-body term
@@ -141,9 +144,8 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   vs the erf-reduction sextet sum. The Coulomb/f-over-r centre-derivative
   finite-difference tests remain as coarse cross-checks (grid-FD noise floor
   ~1e-6). Remaining: the effective two-body reduction (contract one pair into an
-  effective 2-electron operator folded into the J/K build), screening/early
-  density folding to beat the O(n^6) sextet loop, and moments on both slots
-  simultaneously (r12 r13).
+  effective 2-electron operator folded into the J/K build) and screening/early
+  density folding to beat the O(n^6) sextet loop.
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

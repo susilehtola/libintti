@@ -162,19 +162,21 @@ std::vector<OpNode<Real>> geminal_over_r_nodes(const std::vector<Real> &c,
   return nd;
 }
 
-/// Core three-electron accumulation shared by the plain integral and the r12^2
-/// moment. When `moment12` is false it returns the unnormalised
-///   G = <ab c| op12(r12) op13(r13) |d e f>;
-/// when true it inserts r12^2, returning <ab c| r12^2 op12(r12) op13(r13) |def>
-/// (r12^2 = sum over the Cartesian directions of (x1-x2)^2). The r12^2-weighted
-/// operator is chosen by the caller through the node lists: Coulomb nodes give
-/// the linear operator r12 = r12^2 r12^{-1}; the Gaussian nodes
-/// {(4 g_k g_l c_k c_l, sqrt(g_k+g_l))} give (grad_1 f12).(grad_1 f12).
+/// Core three-electron accumulation shared by the plain integral and the moment
+/// variants. `moment` selects an inserted scalar (summed over Cartesian axes):
+///   0 -> none:        G = <ab c| op12(r12) op13(r13) |d e f>;
+///   1 -> r12^2:       <ab c| r12^2 op12 op13 |def>, r12^2 = sum (x1-x2)^2;
+///   2 -> r12 . r13:   the vector dot product, sum (x1-x2)(x1-x3).
+/// The r12^2 operator is chosen by the caller through the node lists: Coulomb
+/// nodes give the linear operator r12 = r12^2 r12^{-1}; the Gaussian nodes
+/// {(4 g_k g_l c_k c_l, sqrt(g_k+g_l))} give (grad_1 f12).(grad_1 f12). The
+/// r12.r13 moment gives the cross gradient (grad_1 f12).(grad_1 f13) with
+/// Gaussian nodes on both slots, an F12 commutator / B-matrix ingredient.
 template <class Real>
 Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss<Real> &c,
              const CartGauss<Real> &d, const CartGauss<Real> &e, const CartGauss<Real> &f,
              const std::vector<OpNode<Real>> &nodes12,
-             const std::vector<OpNode<Real>> &nodes13, bool moment12) {
+             const std::vector<OpNode<Real>> &nodes13, int moment) {
   auto pairdens = [](const CartGauss<Real> &x, const CartGauss<Real> &y, Real &alpha,
                      Real R[3], Real &K) {
     alpha = x.alpha + y.alpha;
@@ -207,10 +209,10 @@ Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss
     mQ[i] = b.l[i] + e.l[i];
     mS[i] = c.l[i] + f.l[i];
   }
-  const int ext = moment12 ? 2 : 0;
+  const int ext = moment ? 2 : 0;
   const int Im = std::max({mP[0], mP[1], mP[2]}) + ext;
   const int Jm = std::max({mQ[0], mQ[1], mQ[2]}) + ext;
-  const int Km = std::max({mS[0], mS[1], mS[2]});
+  const int Km = std::max({mS[0], mS[1], mS[2]}) + ext; // r12.r13 raises S by 1
   // binomials up to the orders we need
   const int Bn = std::max({Im, Jm, Km}) + 1;
   std::vector<std::vector<Real>> C(Bn, std::vector<Real>(Bn, Real(0)));
@@ -252,7 +254,7 @@ Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss
         const Real c0 = t2 * dpq * dpq + s2 * dps * dps;
         const Real base = exp_(b0 * mu0 + b1 * mu1 + b2 * mu2 - c0);
         // powers of the mean
-        std::vector<Real> P0(Im + 3, Real(1)), P1(Jm + 3, Real(1)), P2(Km + 1, Real(1));
+        std::vector<Real> P0(Im + 3, Real(1)), P1(Jm + 3, Real(1)), P2(Km + 3, Real(1));
         for (int i = 1; i < (int)P0.size(); ++i) P0[i] = P0[i - 1] * mu0;
         for (int i = 1; i < (int)P1.size(); ++i) P1[i] = P1[i - 1] * mu1;
         for (int i = 1; i < (int)P2.size(); ++i) P2[i] = P2[i - 1] * mu2;
@@ -266,26 +268,31 @@ Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss
                      P2[nS - k3] * cm(k1, k2, k3);
           return s;
         };
-        Real Th = 0, Thr2 = 0;
+        Real Th = 0, Thm = 0;
         for (int nP = 0; nP <= mP[dir]; ++nP)
           for (int nQ = 0; nQ <= mQ[dir]; ++nQ)
             for (int nS = 0; nS <= mS[dir]; ++nS) {
               const Real coef = TP[dir][nP] * TQ[dir][nQ] * TS[dir][nS];
               Th += coef * mom(nP, nQ, nS);
-              if (moment12) {
-                // E[(x1-x2)^2 * (x1-RP)^nP (x2-RQ)^nQ (x3-RS)^nS], with
-                // (x1-x2) = (x1-RP) - (x2-RQ) + DPQ.
-                const Real e = mom(nP + 2, nQ, nS) + mom(nP, nQ + 2, nS) +
+              // shifted coords: (x1-x2) = (x1-RP)-(x2-RQ)+DPQ, likewise (x1-x3).
+              if (moment == 1) { // r12^2 = (x1-x2)^2
+                const Real m = mom(nP + 2, nQ, nS) + mom(nP, nQ + 2, nS) +
                                dpq * dpq * mom(nP, nQ, nS) - 2 * mom(nP + 1, nQ + 1, nS) +
                                2 * dpq * mom(nP + 1, nQ, nS) - 2 * dpq * mom(nP, nQ + 1, nS);
-                Thr2 += coef * e;
+                Thm += coef * m;
+              } else if (moment == 2) { // r12.r13 = (x1-x2)(x1-x3), per direction
+                const Real m = mom(nP + 2, nQ, nS) + (dpq + dps) * mom(nP + 1, nQ, nS) -
+                               mom(nP + 1, nQ + 1, nS) - mom(nP + 1, nQ, nS + 1) -
+                               dps * mom(nP, nQ + 1, nS) - dpq * mom(nP, nQ, nS + 1) +
+                               mom(nP, nQ + 1, nS + 1) + dpq * dps * mom(nP, nQ, nS);
+                Thm += coef * m;
               }
             }
         F[dir] = base * Th;
-        Fr2[dir] = base * Thr2;
+        Fr2[dir] = base * Thm;
       }
       Real contr;
-      if (!moment12)
+      if (!moment)
         contr = F[0] * F[1] * F[2];
       else
         contr = Fr2[0] * F[1] * F[2] + F[0] * Fr2[1] * F[2] + F[0] * F[1] * Fr2[2];
@@ -304,7 +311,7 @@ Real three_electron_raw_nodes(const CartGauss<Real> &a, const CartGauss<Real> &b
                               const CartGauss<Real> &e, const CartGauss<Real> &f,
                               const std::vector<OpNode<Real>> &nodes12,
                               const std::vector<OpNode<Real>> &nodes13) {
-  return te_core(a, b, c, d, e, f, nodes12, nodes13, false);
+  return te_core(a, b, c, d, e, f, nodes12, nodes13, 0);
 }
 
 /// Unnormalised three-electron integral with an r^2 moment on the 1-2 operator:
@@ -317,7 +324,19 @@ Real three_electron_raw_moment12(const CartGauss<Real> &a, const CartGauss<Real>
                                  const CartGauss<Real> &e, const CartGauss<Real> &f,
                                  const std::vector<OpNode<Real>> &nodes12,
                                  const std::vector<OpNode<Real>> &nodes13) {
-  return te_core(a, b, c, d, e, f, nodes12, nodes13, true);
+  return te_core(a, b, c, d, e, f, nodes12, nodes13, 1);
+}
+
+/// Unnormalised three-electron integral with the cross moment r12 . r13 (vector
+/// dot product) inserted. With Gaussian-geminal derivative nodes on both slots
+/// it is the F12 cross gradient (grad_1 f12).(grad_1 f13).
+template <class Real>
+Real three_electron_raw_moment_cross(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                                     const CartGauss<Real> &c, const CartGauss<Real> &d,
+                                     const CartGauss<Real> &e, const CartGauss<Real> &f,
+                                     const std::vector<OpNode<Real>> &nodes12,
+                                     const std::vector<OpNode<Real>> &nodes13) {
+  return te_core(a, b, c, d, e, f, nodes12, nodes13, 2);
 }
 
 /// Unnormalised three-electron Coulomb integral (both operators = r^{-1}).
@@ -394,6 +413,21 @@ Real three_electron_moment12(const CartGauss<Real> &a, const CartGauss<Real> &b,
   const Real N = detail::te_norm(a) * detail::te_norm(b) * detail::te_norm(c) *
                  detail::te_norm(d) * detail::te_norm(e) * detail::te_norm(f);
   return N * detail::three_electron_raw_moment12(a, b, c, d, e, f, op12, op13);
+}
+
+/// Three-electron integral with the cross moment r12 . r13 (vector dot product),
+/// over six NORMALISED Cartesian Gaussians. With Gaussian derivative nodes on
+/// both slots it is the F12 cross gradient (grad_1 f12).(grad_1 f13) -- a
+/// commutator / B-matrix ingredient coupling the two inter-electronic distances.
+template <class Real>
+Real three_electron_moment_cross(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                                 const CartGauss<Real> &c, const CartGauss<Real> &d,
+                                 const CartGauss<Real> &e, const CartGauss<Real> &f,
+                                 const std::vector<detail::OpNode<Real>> &op12,
+                                 const std::vector<detail::OpNode<Real>> &op13) {
+  const Real N = detail::te_norm(a) * detail::te_norm(b) * detail::te_norm(c) *
+                 detail::te_norm(d) * detail::te_norm(e) * detail::te_norm(f);
+  return N * detail::three_electron_raw_moment_cross(a, b, c, d, e, f, op12, op13);
 }
 
 /// Three-body energy from a set of normalised Cartesian Gaussians and an AO

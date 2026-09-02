@@ -40,10 +40,19 @@ def norm(alpha, l):
 _GH_X, _GH_W = np.polynomial.hermite.hermgauss(10)  # exact to degree 19
 
 
-def _block(basis, gamma, delta, m, r2):
+def _insert(p, x1, x2, x3, ins):
+    if ins == "r2":
+        return p * (x1 - x2)**2
+    if ins == "cross":
+        return p * (x1 - x2) * (x1 - x3)
+    return p
+
+
+def _block(basis, gamma, delta, m, ins="none"):
     """One Cartesian-axis block int poly(x1,x2,x3) exp(-quadratic) dx1dx2dx3 by
     whitened tensor Gauss-Hermite: change x = mu + A^{-1/2} u so the exponent is
-    -u^T u (separable), then a tensor GH rule is exact for the polynomial."""
+    -u^T u (separable), then a tensor GH rule is exact for the polynomial. `ins`
+    inserts the per-axis moment factor: 'r2' -> (x1-x2)^2, 'cross' -> (x1-x2)(x1-x3)."""
     a, b, c, d, e, f = basis
     # exponent quadratic form: x^T Q x - 2 s^T x + c0, Q from a..f centres + geminals
     ca, cb, cc = a[1][m], b[1][m], c[1][m]
@@ -67,19 +76,19 @@ def _block(basis, gamma, delta, m, r2):
                 x1, x2, x3 = x
                 p = ((x1 - ca)**la[0] * (x1 - cd)**la[3] * (x2 - cb)**la[1]
                      * (x2 - ce)**la[4] * (x3 - cc)**la[2] * (x3 - cf)**la[5])
-                if r2:
-                    p *= (x1 - x2)**2
+                p = _insert(p, x1, x2, x3, ins)
                 tot += _GH_W[i] * _GH_W[j] * _GH_W[k] * p
     return base * tot
 
 
-def raw(basis, gamma, delta, moment12=False):
-    """Unnormalised three-electron Gaussian-geminal integral (or its r12^2
-    moment): G = prod_m block_m; moment = sum_m block_m[r2] prod_{m'!=m} block_m'."""
-    I = [_block(basis, gamma, delta, m, False) for m in range(3)]
-    if not moment12:
+def raw(basis, gamma, delta, mode="none"):
+    """Unnormalised three-electron Gaussian-geminal integral (mode 'none'), or a
+    moment that factorises as sum_m block_m[mode] prod_{m'!=m} block_m'[none]:
+    mode 'r2' -> r12^2, mode 'cross' -> r12 . r13."""
+    I = [_block(basis, gamma, delta, m, "none") for m in range(3)]
+    if mode == "none":
         return I[0] * I[1] * I[2]
-    J = [_block(basis, gamma, delta, m, True) for m in range(3)]
+    J = [_block(basis, gamma, delta, m, mode) for m in range(3)]
     return J[0] * I[1] * I[2] + I[0] * J[1] * I[2] + I[0] * I[1] * J[2]
 
 
@@ -92,7 +101,11 @@ def integral(basis, gamma, delta):
 
 
 def moment(basis, gamma, delta):
-    return _N(basis) * raw(basis, gamma, delta, moment12=True)
+    return _N(basis) * raw(basis, gamma, delta, "r2")
+
+
+def cross(basis, gamma, delta):
+    return _N(basis) * raw(basis, gamma, delta, "cross")
 
 
 def deriv(basis, which, dim, gamma, delta):
@@ -142,7 +155,7 @@ DERIVS = [("s_manycentre", 0, 0), ("s_manycentre", 1, 1), ("s_manycentre", 2, 2)
 _GL_X, _GL_W = np.polynomial.legendre.leggauss(96)  # fixed rule on [-L, L]
 
 
-def _gl_block(basis, gamma, delta, m, r2, L=8.0):
+def _gl_block(basis, gamma, delta, m, ins="none", L=8.0):
     """Independent second method: a fixed high-order Gauss-Legendre tensor rule
     on a box (numpy, vectorised, fast). Different weight function and nodes from
     the whitened Gauss-Hermite rule, so it anchors it without sharing math."""
@@ -158,22 +171,25 @@ def _gl_block(basis, gamma, delta, m, r2, L=8.0):
     p = ((X1 - a[1][m])**a[2][m] * (X1 - d[1][m])**d[2][m]
          * (X2 - b[1][m])**b[2][m] * (X2 - e[1][m])**e[2][m]
          * (X3 - c[1][m])**c[2][m] * (X3 - f[1][m])**f[2][m])
-    if r2:
+    if ins == "r2":
         p = p * (X1 - X2)**2
+    elif ins == "cross":
+        p = p * (X1 - X2) * (X1 - X3)
     return float(np.sum(W * p * np.exp(-E)))
 
 
 def selfcheck():
     # anchor the fast whitened Gauss-Hermite rule against an independent fixed
     # Gauss-Legendre tensor rule, across plain and l>0 configs (integral + r12^2).
-    checks = [("s_manycentre", 0, False), ("s_manycentre", 1, False), ("s_manycentre", 2, False),
-              ("px_on_a", 0, False), ("px_on_a", 0, True), ("dxy_on_a", 0, False),
-              ("pxpypz_abc", 2, False), ("mixed_high", 0, True)]
-    for name, m, r2 in checks:
+    checks = [("s_manycentre", 0, "none"), ("s_manycentre", 1, "none"), ("s_manycentre", 2, "none"),
+              ("px_on_a", 0, "none"), ("px_on_a", 0, "r2"), ("dxy_on_a", 0, "none"),
+              ("pxpypz_abc", 2, "none"), ("mixed_high", 0, "r2"),
+              ("s_manycentre", 0, "cross"), ("pxpypz_abc", 1, "cross")]
+    for name, m, ins in checks:
         b = CONFIGS[name]
-        gh = _block(b, GAMMA, DELTA, m, r2)
-        gl = _gl_block(b, GAMMA, DELTA, m, r2)
-        assert abs(gh - gl) < 1e-9 * (abs(gl) + 1), (name, m, r2, gh, gl)
+        gh = _block(b, GAMMA, DELTA, m, ins)
+        gl = _gl_block(b, GAMMA, DELTA, m, ins)
+        assert abs(gh - gl) < 1e-9 * (abs(gl) + 1), (name, m, ins, gh, gl)
     print("self-check: Gauss-Hermite matches Gauss-Legendre (%d anchors)." % len(checks))
 
 
@@ -183,16 +199,18 @@ def emit(path):
              "// Independent (scipy tplquad) three-electron reference values.",
              "#pragma once", "#include <vector>", "", "namespace te_ref {",
              "struct Fn { double alpha; double c[3]; int l[3]; };",
-             "struct Case { const char *name; Fn f[6]; double integral; double moment; };",
+             "struct Case { const char *name; Fn f[6]; double integral; double moment;"
+             " double cross; };",
              f"inline constexpr double gamma_op = {GAMMA!r};",
              f"inline constexpr double delta_op = {DELTA!r};", "",
              "inline const std::vector<Case> cases = {"]
     for name, b in CONFIGS.items():
         Ival = integral(b, GAMMA, DELTA)
         Mval = moment(b, GAMMA, DELTA)
+        Xval = cross(b, GAMMA, DELTA)
         fns = ", ".join("{%r, {%r, %r, %r}, {%d, %d, %d}}" % (g[0], g[1][0], g[1][1], g[1][2],
                                                               g[2][0], g[2][1], g[2][2]) for g in b)
-        lines.append('  {"%s", {%s}, %.17g, %.17g},' % (name, fns, Ival, Mval))
+        lines.append('  {"%s", {%s}, %.17g, %.17g, %.17g},' % (name, fns, Ival, Mval, Xval))
     lines += ["};", "",
               "struct DCase { const char *name; int which; int dim; double value; };",
               "inline const std::vector<DCase> dcases = {"]

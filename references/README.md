@@ -47,8 +47,9 @@ for polynomial x Gaussian, so it validates the engine's analytic
 moment recurrence by a different method). The script self-checks that
 Gauss-Hermite matches adaptive `scipy` quadrature on several anchors, covers:
 
-- plain integrals and r12^2 moments for s, every single p (on all six
-  functions), simultaneous p_x/p_y/p_z, d functions, and mixed high-l cases;
+- plain integrals, r12^2 moments and r12.r13 cross moments for s, every single p
+  (on all six functions), simultaneous p_x/p_y/p_z, d functions, and mixed
+  high-l cases;
 - centre derivatives, checked against the engine's McMurchie-Davidson shift
   `d/dA chi = 2 alpha chi_{l+1} - l chi_{l-1}`.
 
