@@ -15,6 +15,7 @@ using G = intti::CartGauss<double>;
 
 TEST(ThreeEl, OneCentreAnalytic) {
   // one-centre three-electron Coulomb of six identical s-GTOs: G_aaaaaa = 4z/3
+  // (derived symbolically in references/sympy_three_electron.py)
   auto grid = intti::make_tgrid(intti::coulomb());
   for (double z : {0.5, 1.0, 1.3, 4.0}) {
     G a{z, {0.0, 0.0, 0.0}, {0, 0, 0}};

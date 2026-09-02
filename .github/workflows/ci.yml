@@ -43,6 +43,25 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  references:
+    # Re-derive the analytic test oracles symbolically with SymPy; each script
+    # asserts its results, so a drift between a hard-coded C++ oracle and its
+    # closed form fails CI here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install SymPy
+        run: pip install sympy
+      - name: Derive references
+        run: |
+          for f in references/sympy_*.py; do
+            echo "== $f =="
+            python "$f"
+          done
+
   sanitize:
     runs-on: ubuntu-latest
     steps:

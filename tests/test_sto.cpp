@@ -152,6 +152,7 @@ TEST(STO, DeltaTailOverlapLGreaterZero) {
 TEST(STO, TwoCenterCoulombMatchesAnalytic) {
   // (rho_A|rho_B) between two equal-exponent 1s Slater densities at distance R
   // has the closed form J = 1/R - e^{-2zR}(1/R + 11z/8 + 3z^2 R/4 + z^3 R^2/6).
+  // (derived symbolically in references/sympy_slater.py)
   const double z = 1.0, R = 2.0;
   const double A[3] = {0, 0, 0}, B[3] = {0, 0, R};
   const double analytic =
@@ -251,6 +252,7 @@ TEST(STO, SelfRepulsionMatchesSlater) {
   intti::coulomb_build(bas, D.data(), grid, J.data());
   double selfrep = 0;
   for (std::size_t i = 0; i < J.size(); ++i) selfrep += D[i] * J[i];
+  // 5 zeta/8 derived symbolically in references/sympy_slater.py
   EXPECT_NEAR(selfrep, 5 * zeta / 8, 1e-6 * (5 * zeta / 8))
       << "STO self-repulsion != 5 zeta / 8";
 }
