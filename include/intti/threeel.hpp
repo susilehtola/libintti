@@ -434,4 +434,40 @@ Real three_electron_energy(const std::vector<CartGauss<Real>> &basis,
   return E;
 }
 
+/// Effective one-body (Fock) contribution of the three-body term: the
+/// functional derivative F_pq = dE/dD_pq of the energy above, an n x n matrix
+/// (row-major). Since the density enters E three times (once per electron), each
+/// sextet scatters into the three slots its pairs occupy:
+///   F_ad += G D_be D_cf,  F_be += G D_ad D_cf,  F_cf += G D_ad D_be.
+/// Matrix in, matrix out. The cubic homogeneity of E gives sum_pq F_pq D_pq = 3E.
+template <class Real>
+std::vector<Real> three_electron_fock(const std::vector<CartGauss<Real>> &basis,
+                                      const std::vector<Real> &D,
+                                      const std::vector<detail::OpNode<Real>> &op12,
+                                      const std::vector<detail::OpNode<Real>> &op13) {
+  const int n = static_cast<int>(basis.size());
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * n + j]; };
+  std::vector<Real> F(static_cast<std::size_t>(n) * n, Real(0));
+  auto Fadd = [&](int i, int j, Real v) { F[static_cast<std::size_t>(i) * n + j] += v; };
+  for (int a = 0; a < n; ++a)
+    for (int d = 0; d < n; ++d) {
+      const Real Dad = Dm(a, d);
+      for (int b = 0; b < n; ++b)
+        for (int e = 0; e < n; ++e) {
+          const Real Dbe = Dm(b, e);
+          for (int c = 0; c < n; ++c)
+            for (int f = 0; f < n; ++f) {
+              const Real Dcf = Dm(c, f);
+              if (Dad == Real(0) && Dbe == Real(0) && Dcf == Real(0)) continue;
+              const Real G = three_electron(basis[a], basis[b], basis[c], basis[d], basis[e],
+                                            basis[f], op12, op13);
+              Fadd(a, d, G * Dbe * Dcf);
+              Fadd(b, e, G * Dad * Dcf);
+              Fadd(c, f, G * Dad * Dbe);
+            }
+        }
+    }
+  return F;
+}
+
 } // namespace intti

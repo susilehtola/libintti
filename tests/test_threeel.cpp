@@ -309,4 +309,36 @@ TEST(ThreeEl, ThreeBodyEnergyContraction) {
   }
 }
 
+TEST(ThreeEl, ThreeBodyFockIsEnergyGradient) {
+  // The effective one-body matrix F = dE/dD. Two independent checks: the cubic
+  // homogeneity identity sum_pq F_pq D_pq = 3 E (exact), and F_pq vs a finite
+  // difference of the energy in that density entry.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto op = intti::detail::coulomb_nodes(grid);
+  const int n = 2;
+  std::vector<G> basis = {G{1.0, {0.0, 0.0, 0.0}, {0, 0, 0}},
+                          G{0.8, {0.5, 0.0, 0.0}, {0, 0, 0}}};
+  std::vector<double> D = {1.0, 0.2, 0.3, 0.7}; // general (non-symmetric)
+  const auto F = intti::three_electron_fock(basis, D, op, op);
+  const double E = intti::three_electron_energy(basis, D, op, op);
+  double trace = 0;
+  for (int i = 0; i < n * n; ++i) trace += F[i] * D[i];
+  EXPECT_NEAR(trace, 3 * E, 1e-9 * std::abs(E)) << "Euler identity sum F D = 3E";
+  const double h = 1e-3;
+  auto energy = [&](const std::vector<double> &Dm) {
+    return intti::three_electron_energy(basis, Dm, op, op);
+  };
+  for (int p = 0; p < n; ++p)
+    for (int q = 0; q < n; ++q) {
+      auto shift = [&](double s) {
+        std::vector<double> Dm = D;
+        Dm[p * n + q] += s;
+        return energy(Dm);
+      };
+      const double fd =
+          (shift(-2 * h) - 8 * shift(-h) + 8 * shift(h) - shift(2 * h)) / (12 * h);
+      EXPECT_NEAR(F[p * n + q], fd, 1e-7 * (std::abs(fd) + 1)) << "F[" << p << "," << q << "]";
+    }
+}
+
 } // namespace

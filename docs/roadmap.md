@@ -125,7 +125,10 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   contraction (`three_electron_energy`): the fully-contracted 3-body energy
   E = sum_{abcdef} G_{abcdef} D_ad D_be D_cf (density in, scalar out; sextet
   internal, like J/K from quartets) -- the mean-field 3-body term
-  transcorrelated / F12 methods build.
+  transcorrelated / F12 methods build. The effective one-body reduction is done
+  (`three_electron_fock`): F_pq = dE/dD_pq, the 3-body contribution to the Fock
+  matrix (density in, matrix out) -- each sextet scatters into the three slots
+  its pairs occupy. This is what a mean-field SCF consumes.
 
   Independent validation (no circular or self-consistency references): the
   one-centre G_aaaaaa = 4 zeta/3 and Gaussian-geminal analytics (closed forms,
@@ -137,9 +140,10 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   Gauss-Hermite quadrature anchored to scipy); and the 2-function 3-body energy
   vs the erf-reduction sextet sum. The Coulomb/f-over-r centre-derivative
   finite-difference tests remain as coarse cross-checks (grid-FD noise floor
-  ~1e-6). Remaining: the effective 2-/1-body reductions (contract one/two pairs,
-  leaving an effective operator matrix), screening/early density folding to beat
-  the O(n^6) sextet loop, and moments on both slots simultaneously (r12 r13).
+  ~1e-6). Remaining: the effective two-body reduction (contract one pair into an
+  effective 2-electron operator folded into the J/K build), screening/early
+  density folding to beat the O(n^6) sextet loop, and moments on both slots
+  simultaneously (r12 r13).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
