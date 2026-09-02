@@ -53,14 +53,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Install SymPy
-        run: pip install sympy
-      - name: Derive references
+      - name: Install SymPy and NumPy
+        run: pip install sympy numpy
+      - name: Derive symbolic references
         run: |
           for f in references/sympy_*.py; do
             echo "== $f =="
             python "$f"
           done
+      - name: Check numerical three-electron references
+        # Gauss-Hermite vs Gauss-Legendre quadrature; does not regenerate the
+        # committed header, only verifies the two independent rules agree.
+        run: python references/te_reference.py
 
   sanitize:
     runs-on: ubuntu-latest

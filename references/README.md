@@ -34,6 +34,28 @@ The six-index integral is `G_{abcdef} = <a(1)b(2)c(3)|r12^{-1} r13^{-1}|d(1)e(2)
 | --- | --- | --- |
 | one-centre Coulomb-Coulomb | `4 zeta/3` (via `int rho_G V_G^2`, `V_G=erf(sqrt(2z) r)/r`) | `OneCentreAnalytic` |
 | Gaussian-geminal one-centre | `pi^{9/2}/[(a+LQ+LS)(a+g)(a+d)]^{3/2}` (via `det A` of the quadratic form) | `GaussianGeminalOneCentreAnalytic` |
+| l>0 many-centre raw integral | closed-form multivariate-normal moment | `HigherLGaussianGeminalVsSympy` |
+
+## `te_reference.py` — three-electron l>0 / many-centre battery (`tests/threeel_reference.hpp`)
+
+Independent numerical references for the general (multi-centre, arbitrary l)
+engine, generated into `tests/threeel_reference.hpp` and consumed by
+`ThreeEl.IndependentReference{IntegralsAndMoments,Derivatives}`. Gaussian-geminal
+operators make the integral factorise per Cartesian axis into a 3-variable
+Gaussian block, evaluated by whitened tensor **Gauss-Hermite quadrature** (exact
+for polynomial x Gaussian, so it validates the engine's analytic
+moment recurrence by a different method). The script self-checks that
+Gauss-Hermite matches adaptive `scipy` quadrature on several anchors, covers:
+
+- plain integrals and r12^2 moments for s, every single p (on all six
+  functions), simultaneous p_x/p_y/p_z, d functions, and mixed high-l cases;
+- centre derivatives, checked against the engine's McMurchie-Davidson shift
+  `d/dA chi = 2 alpha chi_{l+1} - l chi_{l-1}`.
+
+Regenerate with `python references/te_reference.py --emit tests/threeel_reference.hpp`.
+The general s-type Coulomb value (`GeneralSTypeVsReference`) and the 2-function
+3-body energy (`ThreeBodyEnergyContraction`) come from an independent
+erf-potential 3D reduction (see the tests).
 
 The remaining oracles are non-closed-form and validated numerically instead:
 the general s-type reference values come from the NumPy prototypes in

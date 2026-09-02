@@ -86,49 +86,60 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
 
 ## Remaining program milestones
 
-- **M-3EL — three-electron integrals** (started, `threeel.hpp`): the
-  t-quadrature applied twice. G_abcdef = <a(1)b(2)c(3)|r12^-1 r13^-1|d(1)e(2)
-  f(3)> replaces both Coulomb operators by their Gaussian transform, giving a
-  2D (t,s) quadrature with a Cartesian-separated, analytic-per-node integrand
-  (Mehine, Losilla & Sundholm 2013 -- the same group's generalisation of the
-  scheme libintti already uses; the scaled/Mobius grid and the delta tail carry
-  over per dimension). Arbitrary angular momentum done: the angular part is the
-  paper's Phi-polynomial recursion (Eqs. 19-20, with Xi_PQ = R_Q - R_P and
-  Xi_PS = R_S - R_P) contracted with the Cartesian T (Gaussian-product)
-  coefficients. Validated: the one-centre G_aaaaaa = 4 zeta/3 to 1e-12; a
-  general multi-centre s-type case vs the Boys-free reference to 1e-11; the
-  electron-2<->3 exchange symmetry (with p-functions); and every l>0 p-function
-  on the P, Q and S densities via the identity chi_{p_x} = (1/2a) d/dA_x chi_s,
-  i.e. finite difference of the s-code (an independent check needing no external
-  reference). Enables explicitly-correlated / transcorrelated (F12/R12)
-  methods. Gaussian-geminal operators done: each inter-electronic operator is a
-  node list -- Coulomb r^{-1} = (2/sqrt pi) int e^{-t^2 r^2} dt is the whole
-  t-grid, a Gaussian geminal sum_k c_k e^{-g_k r^2} is just its fixed nodes (no
-  integration). So r12^{-1} r13^{-1}, f12 r13^{-1}, f12 f13 (f a Gaussian
-  geminal) all go through one routine (`three_electron` + coulomb_nodes /
-  gaussian_nodes). Validated: the one-centre Gaussian-Gaussian analytic to
-  1e-13 and the mixed Coulomb/Gaussian l>0 p-functions via the centre-derivative
-  identity. The f/r operator done too (`geminal_over_r_nodes`): f12/r12 =
-  sum_k c_k e^{-g_k r^2}/r = sum_k (2/sqrt pi) int e^{-(g_k+t^2) r^2} dt is the
-  Coulomb grid with exponents shifted by g_k (g=0 recovers Coulomb exactly).
-  So the node-representable F12 operator family -- f (gaussian_nodes), f^2
-  (gaussian products), f/r, r^{-1} -- is complete. The r^2 moment operator done
-  too (`three_electron_moment12`): r12^2 e^{-t^2 r12^2} = -d/du(M Theta),
-  u = t^2, so the integrand differentiates M and Theta w.r.t. the 1-2 slot,
-  which needs d Phi / d Lambda_Q built by the differentiated recursion
-  (`te_build_phi_dLQ`). This gives BOTH the linear operator r12 = r12^2 r12^{-1}
-  (Coulomb nodes) and the F12 (grad_1 f12).(grad_1 f12) = sum 4 g_k g_l c_k c_l
-  r12^2 e^{-(g_k+g_l) r12^2} (Gaussian nodes). Validated at arbitrary l vs the
-  exponent derivative -d/dg (finite difference) on the P, Q and S densities.
-  Matrix-level contraction started (`three_electron_energy`): the
-  fully-contracted 3-body energy E = sum_{abcdef} G_{abcdef} D_ad D_be D_cf
-  (density in, scalar out; sextet internal, like J/K from quartets) -- the
-  mean-field 3-body term transcorrelated / F12 methods build. Validated vs the
-  analytic single-function c^3 (4 zeta/3) and an independent 2-function
-  reference. Remaining: the effective 2-/1-body reductions (contract one/two
-  pairs, leaving an effective operator matrix), screening/early density folding
-  to beat the O(n^6) sextet loop, and moments on both slots simultaneously
-  (r12 r13, the cross derivative).
+- **M-3EL — three-electron integrals** (`threeel.hpp`): the t-quadrature
+  applied twice. G_abcdef = <a(1)b(2)c(3)|r12^-1 r13^-1|d(1)e(2)f(3)> replaces
+  both Coulomb operators by their Gaussian transform, giving a 2D (t,s)
+  quadrature (Mehine, Losilla & Sundholm 2013 -- the same group's generalisation
+  of the scheme libintti already uses; the scaled/Mobius grid and the delta tail
+  carry over per dimension). At each (t,s) node the six-fold integral over the
+  three electron coordinates is a product of Gaussians -- electron 1 (density
+  P = a d) is shared, electron 2 (Q = b e) couples through t^2, electron 3
+  (S = c f) through s^2 -- that factorises over the Cartesian axes into a
+  3-variable (x1,x2,x3) Gaussian with quadratic form A (det A = (aP+LQ+LS)
+  (aQ+t^2)(aS+s^2)) and a centre-offset source. The s-value is pi^{9/2}/
+  det(A)^{3/2} exp(-Phi) with the FULL three-term exponent Phi = [aP LQ R_PQ^2
+  + aP LS R_PS^2 + LQ LS R_QS^2]/(aP+LQ+LS); arbitrary angular momentum is a
+  polynomial moment E[(x1-RP)^nP (x2-RQ)^nQ (x3-RS)^nS] of that Gaussian
+  (Isserlis recurrence, `te_central_moments`), contracted with the Cartesian T
+  (Gaussian-product) coefficients (`te_core`).
+
+  *Correctness note.* An earlier version used the truncated exponent
+  exp(-LQ R_PQ^2 - LS R_PS^2), which drops the aP/(aP+LQ+LS) scaling and the
+  entire Q-S coupling term. It was wrong for every multi-centre geometry but
+  passed its tests: the one-centre analytics have R^2 = 0, the "general s-type
+  reference" had been generated with the same formula (circular), and the
+  finite-difference l>0 checks compared the explicit integral to a difference of
+  the same wrong s-integral (internally consistent). It was caught by adding a
+  genuinely independent l>0 oracle. The engine was rebuilt on the correct
+  three-variable Gaussian-moment form and is now pinned by independent
+  references (below).
+
+  Operators are node lists: Coulomb r^{-1} = (2/sqrt pi) int e^{-t^2 r^2} dt is
+  the t-grid, a Gaussian geminal sum_k c_k e^{-g_k r^2} its fixed nodes, and
+  f/r (`geminal_over_r_nodes`) the Coulomb grid with exponents shifted by g_k
+  (g=0 recovers Coulomb). So the node-representable F12 family -- r^{-1}, f,
+  f^2, f/r -- all go through one routine (`three_electron`). The r^2 moment
+  (`three_electron_moment12`) inserts r12^2 = sum_dir (x1-x2)^2 into the same
+  moment machinery, giving the linear operator r12 = r12^2 r12^{-1} (Coulomb
+  nodes) and (grad_1 f12).(grad_1 f12) (Gaussian nodes). Matrix-level
+  contraction (`three_electron_energy`): the fully-contracted 3-body energy
+  E = sum_{abcdef} G_{abcdef} D_ad D_be D_cf (density in, scalar out; sextet
+  internal, like J/K from quartets) -- the mean-field 3-body term
+  transcorrelated / F12 methods build.
+
+  Independent validation (no circular or self-consistency references): the
+  one-centre G_aaaaaa = 4 zeta/3 and Gaussian-geminal analytics (closed forms,
+  `references/sympy_three_electron.py`); a general multi-centre s-type Coulomb
+  value from an erf-potential 3D reduction; an l>0 many-centre Gaussian-geminal
+  value from a closed-form multivariate-normal moment (SymPy); a whole battery
+  of l>0 / many-centre integrals, r12^2 moments AND centre derivatives
+  (`references/te_reference.py` -> `tests/threeel_reference.hpp`, independent
+  Gauss-Hermite quadrature anchored to scipy); and the 2-function 3-body energy
+  vs the erf-reduction sextet sum. The Coulomb/f-over-r centre-derivative
+  finite-difference tests remain as coarse cross-checks (grid-FD noise floor
+  ~1e-6). Remaining: the effective 2-/1-body reductions (contract one/two pairs,
+  leaving an effective operator matrix), screening/early density folding to beat
+  the O(n^6) sextet loop, and moments on both slots simultaneously (r12 r13).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
