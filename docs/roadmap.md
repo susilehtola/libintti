@@ -112,10 +112,17 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   sum_k c_k e^{-g_k r^2}/r = sum_k (2/sqrt pi) int e^{-(g_k+t^2) r^2} dt is the
   Coulomb grid with exponents shifted by g_k (g=0 recovers Coulomb exactly).
   So the node-representable F12 operator family -- f (gaussian_nodes), f^2
-  (gaussian products), f/r, r^{-1} -- is complete. Remaining: the matrix-level
-  F12 contractions (the sextet stays internal like the ERI quartet); the
-  commutator [f,T] and the linear r12 operator (r12 = r12^2 r12^{-1}), which
-  need moment/kinetic factors beyond a plain node list.
+  (gaussian products), f/r, r^{-1} -- is complete. The r^2 moment operator done
+  too (`three_electron_moment12`): r12^2 e^{-t^2 r12^2} = -d/du(M Theta),
+  u = t^2, so the integrand differentiates M and Theta w.r.t. the 1-2 slot,
+  which needs d Phi / d Lambda_Q built by the differentiated recursion
+  (`te_build_phi_dLQ`). This gives BOTH the linear operator r12 = r12^2 r12^{-1}
+  (Coulomb nodes) and the F12 (grad_1 f12).(grad_1 f12) = sum 4 g_k g_l c_k c_l
+  r12^2 e^{-(g_k+g_l) r12^2} (Gaussian nodes). Validated at arbitrary l vs the
+  exponent derivative -d/dg (finite difference) on the P, Q and S densities.
+  Remaining: the matrix-level F12 contractions (the sextet stays internal like
+  the ERI quartet), and moments on both slots simultaneously (r12 r13, needing
+  the cross derivative).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

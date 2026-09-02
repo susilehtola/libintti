@@ -263,6 +263,188 @@ Real three_electron_raw_nodes(const CartGauss<Real> &a, const CartGauss<Real> &b
   return Kad * Kbe * Kcf * acc;
 }
 
+/// Like te_build_phi, but also returns dphi = d Phi / d Lambda_Q (same layout),
+/// via the recursion differentiated w.r.t. Lambda_Q (explicit +2u/-2u terms).
+template <class Real>
+void te_build_phi_dLQ(int mP, int mQ, int mS, Real LQ, Real LS, Real aP, Real aQ, Real aS,
+                      std::vector<std::vector<Real>> &phi,
+                      std::vector<std::vector<Real>> &dphi) {
+  const int Dg = mP + mQ + mS, W = Dg + 1;
+  const int nphi = (mP + 1) * (mQ + 1) * (mS + 1);
+  const std::size_t sz = static_cast<std::size_t>(W) * W;
+  phi.assign(nphi, std::vector<Real>(sz, Real(0)));
+  dphi.assign(nphi, std::vector<Real>(sz, Real(0)));
+  auto id = [&](int nP, int nQ, int nS) { return (nP * (mQ + 1) + nQ) * (mS + 1) + nS; };
+  auto du = [&](const std::vector<Real> &p, std::vector<Real> &r) {
+    std::fill(r.begin(), r.end(), Real(0));
+    for (int iu = 1; iu < W; ++iu)
+      for (int iv = 0; iv < W; ++iv) r[(iu - 1) * W + iv] += Real(iu) * p[iu * W + iv];
+  };
+  auto dv = [&](const std::vector<Real> &p, std::vector<Real> &r) {
+    std::fill(r.begin(), r.end(), Real(0));
+    for (int iu = 0; iu < W; ++iu)
+      for (int iv = 1; iv < W; ++iv) r[iu * W + iv - 1] += Real(iv) * p[iu * W + iv];
+  };
+  phi[id(0, 0, 0)][0] = 1;
+  std::vector<Real> ta(sz), tb(sz), tc(sz), td(sz);
+  for (int i = 0; i < mP; ++i) {
+    const auto &c = phi[id(i, 0, 0)];
+    const auto &dc = dphi[id(i, 0, 0)];
+    auto &o = phi[id(i + 1, 0, 0)];
+    auto &dobj = dphi[id(i + 1, 0, 0)];
+    du(c, ta); dv(c, tb); du(dc, tc); dv(dc, td);
+    for (int iu = 0; iu < W; ++iu)
+      for (int iv = 0; iv < W; ++iv) {
+        Real v = -(ta[iu * W + iv] + tb[iu * W + iv]);
+        Real dvv = -(tc[iu * W + iv] + td[iu * W + iv]);
+        if (iu >= 1) { v += 2 * LQ * c[(iu - 1) * W + iv]; dvv += 2 * c[(iu - 1) * W + iv] + 2 * LQ * dc[(iu - 1) * W + iv]; }
+        if (iv >= 1) { v += 2 * LS * c[iu * W + iv - 1]; dvv += 2 * LS * dc[iu * W + iv - 1]; }
+        o[iu * W + iv] = v / (2 * aP);
+        dobj[iu * W + iv] = dvv / (2 * aP);
+      }
+    if (i >= 1)
+      for (std::size_t k = 0; k < sz; ++k) {
+        o[k] += Real(i) / (2 * aP) * phi[id(i - 1, 0, 0)][k];
+        dobj[k] += Real(i) / (2 * aP) * dphi[id(i - 1, 0, 0)][k];
+      }
+  }
+  for (int i = 0; i <= mP; ++i)
+    for (int j = 0; j < mQ; ++j) {
+      const auto &c = phi[id(i, j, 0)];
+      const auto &dc = dphi[id(i, j, 0)];
+      auto &o = phi[id(i, j + 1, 0)];
+      auto &dobj = dphi[id(i, j + 1, 0)];
+      du(c, ta); du(dc, tc);
+      for (int iu = 0; iu < W; ++iu)
+        for (int iv = 0; iv < W; ++iv) {
+          Real v = ta[iu * W + iv], dvv = tc[iu * W + iv];
+          if (iu >= 1) { v -= 2 * LQ * c[(iu - 1) * W + iv]; dvv += -2 * c[(iu - 1) * W + iv] - 2 * LQ * dc[(iu - 1) * W + iv]; }
+          o[iu * W + iv] = v / (2 * aQ);
+          dobj[iu * W + iv] = dvv / (2 * aQ);
+        }
+      if (j >= 1)
+        for (std::size_t k = 0; k < sz; ++k) {
+          o[k] += Real(j) / (2 * aQ) * phi[id(i, j - 1, 0)][k];
+          dobj[k] += Real(j) / (2 * aQ) * dphi[id(i, j - 1, 0)][k];
+        }
+    }
+  for (int i = 0; i <= mP; ++i)
+    for (int j = 0; j <= mQ; ++j)
+      for (int k = 0; k < mS; ++k) {
+        const auto &c = phi[id(i, j, k)];
+        const auto &dc = dphi[id(i, j, k)];
+        auto &o = phi[id(i, j, k + 1)];
+        auto &dobj = dphi[id(i, j, k + 1)];
+        dv(c, tb); dv(dc, td);
+        for (int iu = 0; iu < W; ++iu)
+          for (int iv = 0; iv < W; ++iv) {
+            Real v = tb[iu * W + iv], dvv = td[iu * W + iv];
+            if (iv >= 1) { v -= 2 * LS * c[iu * W + iv - 1]; dvv += -2 * LS * dc[iu * W + iv - 1]; }
+            o[iu * W + iv] = v / (2 * aS);
+            dobj[iu * W + iv] = dvv / (2 * aS);
+          }
+        if (k >= 1)
+          for (std::size_t q = 0; q < sz; ++q) {
+            o[q] += Real(k) / (2 * aS) * phi[id(i, j, k - 1)][q];
+            dobj[q] += Real(k) / (2 * aS) * dphi[id(i, j, k - 1)][q];
+          }
+      }
+}
+
+/// Unnormalised three-electron integral with an r^2 moment on the 1-2 operator:
+/// the 1-2 slot carries r12^2 exp(-t^2 r12^2) = -d/d(t^2) exp(-t^2 r12^2), so the
+/// integrand is -d/du(M Theta), u = t^2. With Coulomb nodes on 1-2 this is the
+/// linear operator r12 = r12^2 r12^{-1}; with a Gaussian-geminal node list
+/// {(4 g_k g_l c_k c_l, sqrt(g_k+g_l))} it is (grad_1 f12).(grad_1 f12).
+template <class Real>
+Real three_electron_raw_moment12(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                                 const CartGauss<Real> &c, const CartGauss<Real> &d,
+                                 const CartGauss<Real> &e, const CartGauss<Real> &f,
+                                 const std::vector<OpNode<Real>> &nodes12,
+                                 const std::vector<OpNode<Real>> &nodes13) {
+  auto pairdens = [](const CartGauss<Real> &x, const CartGauss<Real> &y, Real &alpha,
+                     Real R[3], Real &K) {
+    alpha = x.alpha + y.alpha;
+    Real ab2 = 0;
+    for (int i = 0; i < 3; ++i) {
+      R[i] = (x.alpha * x.center[i] + y.alpha * y.center[i]) / alpha;
+      const Real dd = x.center[i] - y.center[i];
+      ab2 += dd * dd;
+    }
+    K = exp_(-x.alpha * y.alpha / alpha * ab2);
+  };
+  Real aP, aQ, aS, RP[3], RQ[3], RS[3], Kad, Kbe, Kcf;
+  pairdens(a, d, aP, RP, Kad);
+  pairdens(b, e, aQ, RQ, Kbe);
+  pairdens(c, f, aS, RS, Kcf);
+  Real RPQ2 = 0, RPS2 = 0, XiPQ[3], XiPS[3];
+  for (int i = 0; i < 3; ++i) {
+    RPQ2 += (RP[i] - RQ[i]) * (RP[i] - RQ[i]);
+    RPS2 += (RP[i] - RS[i]) * (RP[i] - RS[i]);
+    XiPQ[i] = RQ[i] - RP[i];
+    XiPS[i] = RS[i] - RP[i];
+  }
+  std::vector<Real> TP[3], TQ[3], TS[3];
+  int mP[3], mQ[3], mS[3];
+  for (int i = 0; i < 3; ++i) {
+    te_prod_coeffs(a.l[i], RP[i] - a.center[i], d.l[i], RP[i] - d.center[i], TP[i]);
+    te_prod_coeffs(b.l[i], RQ[i] - b.center[i], e.l[i], RQ[i] - e.center[i], TQ[i]);
+    te_prod_coeffs(c.l[i], RS[i] - c.center[i], f.l[i], RS[i] - f.center[i], TS[i]);
+    mP[i] = a.l[i] + d.l[i];
+    mQ[i] = b.l[i] + e.l[i];
+    mS[i] = c.l[i] + f.l[i];
+  }
+  const int MP = std::max({mP[0], mP[1], mP[2]}), MQ = std::max({mQ[0], mQ[1], mQ[2]}),
+            MS = std::max({mS[0], mS[1], mS[2]}), W = MP + MQ + MS + 1;
+  const Real pi = pi_v<Real>(), pi92 = pi * pi * pi * pi * sqrt_(pi);
+  std::vector<std::vector<Real>> phi, dphi;
+  auto evalp = [&](const std::vector<Real> &p, int dir) {
+    Real val = 0, up = 1;
+    for (int iu = 0; iu < W; ++iu) {
+      Real vp = 1;
+      for (int iv = 0; iv < W; ++iv) {
+        val += p[iu * W + iv] * up * vp;
+        vp *= XiPS[dir];
+      }
+      up *= XiPQ[dir];
+    }
+    return val;
+  };
+  Real acc = 0;
+  for (const auto &n12 : nodes12) {
+    const Real u1 = n12.t * n12.t;
+    const Real LQ = u1 * aQ / (u1 + aQ), LQp = aQ * aQ / ((u1 + aQ) * (u1 + aQ));
+    for (const auto &n13 : nodes13) {
+      const Real s2 = n13.t * n13.t, LS = s2 * aS / (s2 + aS);
+      const Real sum = aP + LQ + LS, denom = sum * (aQ + u1) * (aS + s2);
+      const Real M = pi92 * exp_(-LQ * RPQ2 - LS * RPS2) / (denom * sqrt_(denom));
+      const Real dM = M * (-RPQ2 * LQp - Real(1.5) * (LQp / sum + 1 / (aQ + u1)));
+      te_build_phi_dLQ(MP, MQ, MS, LQ, LS, aP, aQ, aS, phi, dphi);
+      Real Th[3], dTh[3];
+      for (int dir = 0; dir < 3; ++dir) {
+        Real t = 0, dt = 0;
+        for (int nP = 0; nP <= mP[dir]; ++nP)
+          for (int nQ = 0; nQ <= mQ[dir]; ++nQ)
+            for (int nS = 0; nS <= mS[dir]; ++nS) {
+              const int q = (nP * (MQ + 1) + nQ) * (MS + 1) + nS;
+              const Real coef = TP[dir][nP] * TQ[dir][nQ] * TS[dir][nS];
+              t += coef * evalp(phi[q], dir);
+              dt += coef * evalp(dphi[q], dir);
+            }
+        Th[dir] = t;
+        dTh[dir] = dt;
+      }
+      const Real Theta = Th[0] * Th[1] * Th[2];
+      const Real dTheta_dLQ =
+          dTh[0] * Th[1] * Th[2] + Th[0] * dTh[1] * Th[2] + Th[0] * Th[1] * dTh[2];
+      // integrand = -d/du1 (M Theta) = -(dM Theta + M LQ' dTheta/dLQ)
+      const Real integ = -(dM * Theta + M * LQp * dTheta_dLQ);
+      acc += n12.weight * n13.weight * integ;
+    }
+  }
+  return Kad * Kbe * Kcf * acc;
+}
+
 /// Unnormalised three-electron Coulomb integral (both operators = r^{-1}).
 template <class Real>
 Real three_electron_raw(const CartGauss<Real> &a, const CartGauss<Real> &b,
@@ -328,6 +510,21 @@ Real three_electron(const CartGauss<Real> &a, const CartGauss<Real> &b,
   const Real N = detail::te_norm(a) * detail::te_norm(b) * detail::te_norm(c) *
                  detail::te_norm(d) * detail::te_norm(e) * detail::te_norm(f);
   return N * detail::three_electron_raw_nodes(a, b, c, d, e, f, op12, op13);
+}
+
+/// Three-electron integral with an r^2 moment on the 1-2 operator (op12), over
+/// six NORMALISED Cartesian Gaussians. The linear operator r12 = r12^2 r12^{-1}
+/// uses coulomb_nodes for op12; the F12 (grad_1 f12).(grad_1 f12) uses the
+/// Gaussian nodes {(4 g_k g_l c_k c_l, sqrt(g_k+g_l))}.
+template <class Real>
+Real three_electron_moment12(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                             const CartGauss<Real> &c, const CartGauss<Real> &d,
+                             const CartGauss<Real> &e, const CartGauss<Real> &f,
+                             const std::vector<detail::OpNode<Real>> &op12,
+                             const std::vector<detail::OpNode<Real>> &op13) {
+  const Real N = detail::te_norm(a) * detail::te_norm(b) * detail::te_norm(c) *
+                 detail::te_norm(d) * detail::te_norm(e) * detail::te_norm(f);
+  return N * detail::three_electron_raw_moment12(a, b, c, d, e, f, op12, op13);
 }
 
 } // namespace intti

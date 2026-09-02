@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (C) 2026 Susi Lehtola
 
+#include <array>
 #include <cmath>
 
 #include <gtest/gtest.h>
@@ -164,6 +165,38 @@ TEST(ThreeEl, GeminalOverRPFunctionVsFD) {
     const double fd =
         (build(which, dir, 0, h) - build(which, dir, 0, -h)) / (2 * h) / (2 * zof[which]);
     EXPECT_NEAR(build(which, dir, 1, 0.0), fd, 1e-6 * (std::abs(fd) + 1)) << "which " << which;
+  }
+}
+
+TEST(ThreeEl, R2MomentVsExponentDerivative) {
+  // r12^2 e^{-g r12^2} = -d/dg e^{-g r12^2}, so the moment integral must equal
+  // -d/dg of the Gaussian-geminal integral. Checked s-type and every l>0
+  // p-function (P, Q, S densities), with Coulomb on the 1-3 pair.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto op13 = intti::detail::coulomb_nodes(grid);
+  const double gam = 0.7;
+  const double zof[6] = {0.9, 1.1, 0.7, 1.3, 0.8, 1.0};
+  const double R[6][3] = {{0, 0, 0},   {0.4, 0, 0},   {0, 0.3, 0.5},
+                          {0.1, 0, 0}, {0.4, 0.1, 0}, {0, 0.3, 0.6}};
+  auto shells = [&](int which, int dir, int power) {
+    std::array<G, 6> g;
+    for (int i = 0; i < 6; ++i) g[i] = G{zof[i], {R[i][0], R[i][1], R[i][2]}, {0, 0, 0}};
+    if (power) g[which].l[dir] = 1;
+    return g;
+  };
+  const double h = 1e-5;
+  for (int which : {-1, 0, 1, 2}) { // -1 = pure s-type; 0,1,2 = p on P,Q,S
+    auto g = shells(which < 0 ? 0 : which, which < 0 ? 0 : which, which < 0 ? 0 : 1);
+    auto mom = intti::detail::three_electron_raw_moment12(
+        g[0], g[1], g[2], g[3], g[4], g[5], intti::detail::gaussian_nodes<double>({1.0}, {gam}),
+        op13);
+    auto ig = [&](double gg) {
+      return intti::detail::three_electron_raw_nodes(
+          g[0], g[1], g[2], g[3], g[4], g[5],
+          intti::detail::gaussian_nodes<double>({1.0}, {gg}), op13);
+    };
+    const double fd = -(ig(gam + h) - ig(gam - h)) / (2 * h);
+    EXPECT_NEAR(mom, fd, 1e-5 * (std::abs(fd) + 1)) << "case " << which;
   }
 }
 
