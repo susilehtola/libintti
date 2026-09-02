@@ -120,9 +120,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (Coulomb nodes) and the F12 (grad_1 f12).(grad_1 f12) = sum 4 g_k g_l c_k c_l
   r12^2 e^{-(g_k+g_l) r12^2} (Gaussian nodes). Validated at arbitrary l vs the
   exponent derivative -d/dg (finite difference) on the P, Q and S densities.
-  Remaining: the matrix-level F12 contractions (the sextet stays internal like
-  the ERI quartet), and moments on both slots simultaneously (r12 r13, needing
-  the cross derivative).
+  Matrix-level contraction started (`three_electron_energy`): the
+  fully-contracted 3-body energy E = sum_{abcdef} G_{abcdef} D_ad D_be D_cf
+  (density in, scalar out; sextet internal, like J/K from quartets) -- the
+  mean-field 3-body term transcorrelated / F12 methods build. Validated vs the
+  analytic single-function c^3 (4 zeta/3) and an independent 2-function
+  reference. Remaining: the effective 2-/1-body reductions (contract one/two
+  pairs, leaving an effective operator matrix), screening/early density folding
+  to beat the O(n^6) sextet loop, and moments on both slots simultaneously
+  (r12 r13, the cross derivative).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

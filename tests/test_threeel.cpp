@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cmath>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -197,6 +198,28 @@ TEST(ThreeEl, R2MomentVsExponentDerivative) {
     };
     const double fd = -(ig(gam + h) - ig(gam - h)) / (2 * h);
     EXPECT_NEAR(mom, fd, 1e-5 * (std::abs(fd) + 1)) << "case " << which;
+  }
+}
+
+TEST(ThreeEl, ThreeBodyEnergyContraction) {
+  // matrix-level: E = sum_{abcdef} G_{abcdef} D_ad D_be D_cf.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto op = intti::detail::coulomb_nodes(grid);
+  // single s-function, D = [[c]]: E = c^3 G_aaaaaa = c^3 * 4 zeta/3
+  {
+    const double z = 1.3, c = 1.5;
+    std::vector<G> basis = {G{z, {0.0, 0.0, 0.0}, {0, 0, 0}}};
+    std::vector<double> D = {c};
+    const double E = intti::three_electron_energy(basis, D, op, op);
+    EXPECT_NEAR(E, c * c * c * 4 * z / 3, 1e-11 * std::abs(E));
+  }
+  // two s-functions vs independent reference
+  {
+    std::vector<G> basis = {G{1.0, {0.0, 0.0, 0.0}, {0, 0, 0}},
+                            G{0.8, {0.5, 0.0, 0.0}, {0, 0, 0}}};
+    std::vector<double> D = {1.0, 0.2, 0.2, 0.7};
+    const double E = intti::three_electron_energy(basis, D, op, op);
+    EXPECT_NEAR(E, 9.674661513439341, 1e-9);
   }
 }
 

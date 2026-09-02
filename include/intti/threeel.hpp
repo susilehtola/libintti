@@ -527,4 +527,42 @@ Real three_electron_moment12(const CartGauss<Real> &a, const CartGauss<Real> &b,
   return N * detail::three_electron_raw_moment12(a, b, c, d, e, f, op12, op13);
 }
 
+/// Three-body energy from a set of normalised Cartesian Gaussians and an AO
+/// density matrix D (n x n, row-major): the fully-contracted three-electron
+/// integral
+///   E = sum_{abcdef} G_{abcdef} D_{ad} D_{be} D_{cf},
+/// electron 1 = (a,d), 2 = (b,e), 3 = (c,f), with the operators op12 (1-2) and
+/// op13 (1-3) given as node lists. Matrix-level: density in, scalar out; the
+/// individual sextet stays internal. This is the mean-field 3-body contribution
+/// transcorrelated / F12 methods build. O(n^6) reference (the sextet loop);
+/// production would fold the density in earlier and screen.
+template <class Real>
+Real three_electron_energy(const std::vector<CartGauss<Real>> &basis,
+                           const std::vector<Real> &D,
+                           const std::vector<detail::OpNode<Real>> &op12,
+                           const std::vector<detail::OpNode<Real>> &op13) {
+  const int n = static_cast<int>(basis.size());
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * n + j]; };
+  Real E = 0;
+  for (int a = 0; a < n; ++a)
+    for (int d = 0; d < n; ++d) {
+      const Real Dad = Dm(a, d);
+      if (Dad == Real(0)) continue;
+      for (int b = 0; b < n; ++b)
+        for (int e = 0; e < n; ++e) {
+          const Real Dbe = Dm(b, e);
+          if (Dbe == Real(0)) continue;
+          for (int c = 0; c < n; ++c)
+            for (int f = 0; f < n; ++f) {
+              const Real Dcf = Dm(c, f);
+              if (Dcf == Real(0)) continue;
+              E += Dad * Dbe * Dcf *
+                   three_electron(basis[a], basis[b], basis[c], basis[d], basis[e], basis[f],
+                                  op12, op13);
+            }
+        }
+    }
+  return E;
+}
+
 } // namespace intti
