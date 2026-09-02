@@ -86,6 +86,20 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
 
 ## Remaining program milestones
 
+- **M-3EL — three-electron integrals** (started, `threeel.hpp`): the
+  t-quadrature applied twice. G_abcdef = <a(1)b(2)c(3)|r12^-1 r13^-1|d(1)e(2)
+  f(3)> replaces both Coulomb operators by their Gaussian transform, giving a
+  2D (t,s) quadrature with a Cartesian-separated, analytic-per-node integrand
+  (Mehine, Losilla & Sundholm 2013 -- the same group's generalisation of the
+  scheme libintti already uses; the scaled/Mobius grid and the delta tail carry
+  over per dimension). s-type primitive done and validated: the one-centre
+  G_aaaaaa = 4 zeta/3 to 1e-12, a general multi-centre case vs the Boys-free
+  reference to 1e-11, and the electron-2<->3 exchange symmetry. Enables
+  explicitly-correlated / transcorrelated (F12/R12) methods. Remaining: higher
+  angular momentum via the two-electron recursion machinery, and the
+  matrix-level contractions (the individual sextet stays internal like the
+  ERI quartet).
+
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
   once), so all NAO integrals reduce to GTO 2-/3-center RI; grid path kept as
