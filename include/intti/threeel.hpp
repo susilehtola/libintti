@@ -366,6 +366,32 @@ template <class Real> Real te_norm(const CartGauss<Real> &g) {
   return N0 * gam;
 }
 
+/// Pair-overlap magnitude o_pq used to screen the sextet loop: the (s-type)
+/// overlap of the normalised pair p,q,
+///   o_pq = (2 a_p/pi)^{3/4}(2 a_q/pi)^{3/4} (pi/(a_p+a_q))^{3/2} K_pq,
+/// K_pq = exp(-a_p a_q/(a_p+a_q) |R_p-R_q|^2). o_pp = 1; o_pq in (0,1] falls off
+/// with the pair separation, the quantity a diffuse/negligible pair contributes
+/// through. Angular factors are dropped (a conservative scalar scale).
+template <class Real>
+std::vector<Real> te_pair_overlap_scale(const std::vector<CartGauss<Real>> &basis) {
+  const int n = static_cast<int>(basis.size());
+  const Real pi = pi_v<Real>();
+  std::vector<Real> o(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      const Real ai = basis[i].alpha, aj = basis[j].alpha, p = ai + aj;
+      Real r2 = 0;
+      for (int d = 0; d < 3; ++d) {
+        const Real dd = basis[i].center[d] - basis[j].center[d];
+        r2 += dd * dd;
+      }
+      const Real K = exp_(-ai * aj / p * r2);
+      const Real Ni = std::pow(2 * ai / pi, Real(0.75)), Nj = std::pow(2 * aj / pi, Real(0.75));
+      o[static_cast<std::size_t>(i) * n + j] = Ni * Nj * std::pow(pi / p, Real(1.5)) * K;
+    }
+  return o;
+}
+
 } // namespace detail
 
 /// Three-electron Coulomb integral G_abcdef over six NORMALISED Cartesian
@@ -460,29 +486,43 @@ Real three_electron_kind(const CartGauss<Real> &a, const CartGauss<Real> &b,
 /// op13 (1-3) given as node lists. `kind` selects the plain integral or a moment
 /// (the F12 3-body corrections). Matrix-level: density in, scalar out; the
 /// individual sextet stays internal. This is the mean-field 3-body contribution
-/// transcorrelated / F12 methods build. O(n^6) reference (the sextet loop);
-/// production would fold the density in earlier and screen.
+/// transcorrelated / F12 methods build. `screen` (default 0 = exact) prunes the
+/// O(n^6) sextet loop: with q_pq = |D_pq| o_pq (density folded into the pair
+/// overlap), a sextet is skipped when q_ad q_be q_cf < screen * (max q)^3, so
+/// only pairs whose density-weighted overlap is significant enter.
 template <class Real>
 Real three_electron_energy(const std::vector<CartGauss<Real>> &basis,
                            const std::vector<Real> &D,
                            const std::vector<detail::OpNode<Real>> &op12,
                            const std::vector<detail::OpNode<Real>> &op13,
-                           ThreeElOp kind = ThreeElOp::Plain) {
+                           ThreeElOp kind = ThreeElOp::Plain, Real screen = 0) {
   const int n = static_cast<int>(basis.size());
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * n + j]; };
+  const auto o = detail::te_pair_overlap_scale(basis);
+  std::vector<Real> q(o.size());
+  Real qmax = 0;
+  for (std::size_t i = 0; i < o.size(); ++i) {
+    q[i] = std::abs(D[i]) * o[i];
+    qmax = std::max(qmax, q[i]);
+  }
+  auto qm = [&](int i, int j) { return q[static_cast<std::size_t>(i) * n + j]; };
+  const Real cut = screen * qmax * qmax * qmax;
   Real E = 0;
   for (int a = 0; a < n; ++a)
     for (int d = 0; d < n; ++d) {
       const Real Dad = Dm(a, d);
       if (Dad == Real(0)) continue;
+      const Real qad = qm(a, d);
       for (int b = 0; b < n; ++b)
         for (int e = 0; e < n; ++e) {
           const Real Dbe = Dm(b, e);
           if (Dbe == Real(0)) continue;
+          const Real qadbe = qad * qm(b, e);
           for (int c = 0; c < n; ++c)
             for (int f = 0; f < n; ++f) {
               const Real Dcf = Dm(c, f);
               if (Dcf == Real(0)) continue;
+              if (qadbe * qm(c, f) < cut) continue;
               E += Dad * Dbe * Dcf *
                    three_electron_kind(basis[a], basis[b], basis[c], basis[d], basis[e],
                                        basis[f], op12, op13, kind);
@@ -499,26 +539,40 @@ Real three_electron_energy(const std::vector<CartGauss<Real>> &basis,
 ///   F_ad += G D_be D_cf,  F_be += G D_ad D_cf,  F_cf += G D_ad D_be.
 /// Matrix in, matrix out. The cubic homogeneity of E gives sum_pq F_pq D_pq = 3E.
 /// `kind` selects the plain integral or a moment, matching three_electron_energy.
+/// `screen` prunes the same sextets as three_electron_energy, so the result stays
+/// the exact gradient of the screened energy (and the 3E identity holds for it).
 template <class Real>
 std::vector<Real> three_electron_fock(const std::vector<CartGauss<Real>> &basis,
                                       const std::vector<Real> &D,
                                       const std::vector<detail::OpNode<Real>> &op12,
                                       const std::vector<detail::OpNode<Real>> &op13,
-                                      ThreeElOp kind = ThreeElOp::Plain) {
+                                      ThreeElOp kind = ThreeElOp::Plain, Real screen = 0) {
   const int n = static_cast<int>(basis.size());
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * n + j]; };
+  const auto o = detail::te_pair_overlap_scale(basis);
+  std::vector<Real> q(o.size());
+  Real qmax = 0;
+  for (std::size_t i = 0; i < o.size(); ++i) {
+    q[i] = std::abs(D[i]) * o[i];
+    qmax = std::max(qmax, q[i]);
+  }
+  auto qm = [&](int i, int j) { return q[static_cast<std::size_t>(i) * n + j]; };
+  const Real cut = screen * qmax * qmax * qmax;
   std::vector<Real> F(static_cast<std::size_t>(n) * n, Real(0));
   auto Fadd = [&](int i, int j, Real v) { F[static_cast<std::size_t>(i) * n + j] += v; };
   for (int a = 0; a < n; ++a)
     for (int d = 0; d < n; ++d) {
       const Real Dad = Dm(a, d);
+      const Real qad = qm(a, d);
       for (int b = 0; b < n; ++b)
         for (int e = 0; e < n; ++e) {
           const Real Dbe = Dm(b, e);
+          const Real qadbe = qad * qm(b, e);
           for (int c = 0; c < n; ++c)
             for (int f = 0; f < n; ++f) {
               const Real Dcf = Dm(c, f);
               if (Dad == Real(0) && Dbe == Real(0) && Dcf == Real(0)) continue;
+              if (qadbe * qm(c, f) < cut) continue;
               const Real G = three_electron_kind(basis[a], basis[b], basis[c], basis[d],
                                                  basis[e], basis[f], op12, op13, kind);
               Fadd(a, d, G * Dbe * Dcf);

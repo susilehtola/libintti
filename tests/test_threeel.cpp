@@ -377,4 +377,32 @@ TEST(ThreeEl, ThreeBodyMomentEnergyAndFock) {
   }
 }
 
+TEST(ThreeEl, ScreeningPrunesNegligibleSextets) {
+  // Three s-functions on well-separated centres: the cross-centre pairs have
+  // tiny overlap, so their sextets are negligible and should be prunable.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto op = intti::detail::coulomb_nodes(grid);
+  const int n = 3;
+  std::vector<G> basis = {G{1.0, {0.0, 0.0, 0.0}, {0, 0, 0}},
+                          G{1.0, {0.0, 0.0, 4.0}, {0, 0, 0}},
+                          G{1.0, {0.0, 0.0, 8.0}, {0, 0, 0}}};
+  std::vector<double> D(n * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = (i == j) ? 1.0 : 0.3;
+  const double E0 = intti::three_electron_energy(basis, D, op, op); // screen = 0 (exact)
+  // A negligible screen must not change the answer.
+  const double Etight = intti::three_electron_energy(basis, D, op, op, intti::ThreeElOp::Plain, 1e-12);
+  EXPECT_NEAR(Etight, E0, 1e-10 * std::abs(E0));
+  // A loose screen actually prunes (result moves) but the pruned terms are small.
+  const double Eloose = intti::three_electron_energy(basis, D, op, op, intti::ThreeElOp::Plain, 1e-2);
+  EXPECT_GT(std::abs(Eloose - E0), 1e-14 * std::abs(E0)) << "loose screen pruned nothing";
+  EXPECT_NEAR(Eloose, E0, 1e-2 * std::abs(E0)) << "pruned terms should be small";
+  // The screened Fock is the exact gradient of the screened energy (same pruned
+  // set), so the cubic-homogeneity identity holds for the screened quantities.
+  const auto Fs = intti::three_electron_fock(basis, D, op, op, intti::ThreeElOp::Plain, 1e-2);
+  double trace = 0;
+  for (int i = 0; i < n * n; ++i) trace += Fs[i] * D[i];
+  EXPECT_NEAR(trace, 3 * Eloose, 1e-9 * std::abs(Eloose)) << "Euler under screening";
+}
+
 } // namespace

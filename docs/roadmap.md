@@ -145,9 +145,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   Gauss-Hermite quadrature anchored to scipy); and the 2-function 3-body energy
   vs the erf-reduction sextet sum. The Coulomb/f-over-r centre-derivative
   finite-difference tests remain as coarse cross-checks (grid-FD noise floor
-  ~1e-6). Remaining: the effective two-body reduction (contract one pair into an
-  effective 2-electron operator folded into the J/K build) and screening/early
-  density folding to beat the O(n^6) sextet loop.
+  ~1e-6). Density screening of the sextet loop is done: `three_electron_energy`
+  and `three_electron_fock` take a `screen` threshold (default 0 = exact) that
+  prunes on the density-weighted pair overlap q_pq = |D_pq| o_pq (o_pq the
+  pair-overlap magnitude), skipping a sextet when q_ad q_be q_cf < screen (max
+  q)^3 -- the same pruned set for both, so the screened Fock stays the exact
+  gradient of the screened energy. This folds the density and pair sparsity into
+  the loop; the fully-folded exact form E = int rho_D V_D^2 (density rho_D, its
+  Coulomb potential V_D) needs the grid (M14) or RI (M12/13) path and is the
+  remaining scaling win, along with the effective two-body reduction (contract
+  one pair into an effective 2-electron operator folded into the J/K build).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
