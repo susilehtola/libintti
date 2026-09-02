@@ -92,13 +92,18 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   2D (t,s) quadrature with a Cartesian-separated, analytic-per-node integrand
   (Mehine, Losilla & Sundholm 2013 -- the same group's generalisation of the
   scheme libintti already uses; the scaled/Mobius grid and the delta tail carry
-  over per dimension). s-type primitive done and validated: the one-centre
-  G_aaaaaa = 4 zeta/3 to 1e-12, a general multi-centre case vs the Boys-free
-  reference to 1e-11, and the electron-2<->3 exchange symmetry. Enables
-  explicitly-correlated / transcorrelated (F12/R12) methods. Remaining: higher
-  angular momentum via the two-electron recursion machinery, and the
-  matrix-level contractions (the individual sextet stays internal like the
-  ERI quartet).
+  over per dimension). Arbitrary angular momentum done: the angular part is the
+  paper's Phi-polynomial recursion (Eqs. 19-20, with Xi_PQ = R_Q - R_P and
+  Xi_PS = R_S - R_P) contracted with the Cartesian T (Gaussian-product)
+  coefficients. Validated: the one-centre G_aaaaaa = 4 zeta/3 to 1e-12; a
+  general multi-centre s-type case vs the Boys-free reference to 1e-11; the
+  electron-2<->3 exchange symmetry (with p-functions); and every l>0 p-function
+  on the P, Q and S densities via the identity chi_{p_x} = (1/2a) d/dA_x chi_s,
+  i.e. finite difference of the s-code (an independent check needing no external
+  reference). Enables explicitly-correlated / transcorrelated (F12/R12)
+  methods. Remaining: the matrix-level contractions (the individual sextet
+  stays internal like the ERI quartet), and non-Coulomb geminal operators (r12,
+  Gaussian geminals) via the same 2D quadrature.
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
