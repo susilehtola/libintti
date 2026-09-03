@@ -173,8 +173,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   densities fitted), O(nao^2 naux^2) vs O(nao^6). Dc = Db = D is the electron-1
   slot <mu|V_D^2|nu> of the three-body Fock; a separate Db is the transcorrelated
   / response use. Validated against the direct raw contraction (s, s with Dc!=Db,
-  and p x p -> d). Remaining: the exchange (K) channel of the effective 2-body
-  operator (needs the nao^4 x naux W-tensor), a heavier follow-up.
+  and p x p -> d). The exchange (K) channel is done too
+  (`three_electron_effective_exchange_ri`): K_{mu la} = sum_P dc_P sum_{nu si}
+  Db_{nu si} W^P_{mu nu, la si}, W^P = int rho_{mu nu} rho_{la si} chi_P/r12/r13
+  = three_electron_raw(mu,la,P,nu,si,ghost) -- only V_Dc fitted, Db carried
+  through the density-matrix kernel, so O(nao^4 naux) and NOT symmetric in
+  (mu,la) (only electron 1 is dressed). Validated against the direct raw exchange
+  (s with Dc!=Db, and p). The three-electron / F12 matrix-level program is now
+  complete: integrals (r^-1, f, f^2, f/r, arbitrary l, many-centre), moments
+  (r12^2, r12.r13), and every contraction -- energy, Fock, RI-folded energy/Fock,
+  and the effective two-body J and K -- all independently validated.
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

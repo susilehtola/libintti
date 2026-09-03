@@ -223,4 +223,59 @@ std::vector<Real> three_electron_effective_coulomb_ri(const ShellBasis<Real> &or
   return J;
 }
 
+/// Effective two-body EXCHANGE (K) channel of the three-body term, via RI.
+/// The same effective operator Omega (electron 3 contracted with Dc) folded into
+/// an exchange build with Db does NOT collapse to one body, because Db couples
+/// the two kets across electrons:
+///   K_{mu la} = sum_{nu si} Omega_{mu nu, la si} Db_{nu si}
+///             = int V_Dc(1) chi_mu(1) chi_la(2) Gamma_Db(1,2) / r12,
+/// Gamma_Db(1,2) = sum_{nu si} chi_nu(1) Db_{nu si} chi_si(2) the density-matrix
+/// kernel. Fitting only V_Dc ~ sum_P dc_P V_P,
+///   K_{mu la} = sum_P dc_P sum_{nu si} Db_{nu si} W^P_{mu nu, la si},
+///   W^P_{mu nu, la si} = int rho_{mu nu}(1) rho_{la si}(2) chi_P(3) / r12 / r13
+///                      = three_electron_raw(mu, la, P, nu, si, ghost),
+/// so cost is O(nao^4 naux) (no nao^6). Exact when Dc lies in span(aux); Db is
+/// used directly. Note K is NOT symmetric in (mu,la): only electron 1 carries
+/// the V_Dc dressing. Unnormalised primitive convention; nao x nao, row-major.
+template <class Real>
+std::vector<Real> three_electron_effective_exchange_ri(const ShellBasis<Real> &orb,
+                                                       const std::vector<Real> &Dc,
+                                                       const std::vector<Real> &Db,
+                                                       const ShellBasis<Real> &aux,
+                                                       const TGrid<Real> &grid, Real tau = 1e-10) {
+  const int nao = orb.nao, naux = aux.nao;
+  const auto M = coulomb_2c(aux, grid);
+  const auto T3c = coulomb_3c(orb, aux, grid);
+  std::vector<Real> g(naux, Real(0));
+  for (int mu = 0; mu < nao; ++mu)
+    for (int nu = 0; nu < nao; ++nu) {
+      const Real Dmn = Dc[static_cast<std::size_t>(mu) * nao + nu];
+      if (Dmn == Real(0)) continue;
+      const Real *row = &T3c[(static_cast<std::size_t>(mu) * nao + nu) * naux];
+      for (int P = 0; P < naux; ++P) g[P] += Dmn * row[P];
+    }
+  const auto dc = detail::te_solve_metric(M, g, naux, tau);
+  const auto orbg = detail::shellbasis_to_cartgauss(orb);
+  const auto auxg = detail::shellbasis_to_cartgauss(aux);
+  CartGauss<Real> ghost{Real(0), {Real(0), Real(0), Real(0)}, {0, 0, 0}};
+  std::vector<Real> K(static_cast<std::size_t>(nao) * nao, Real(0));
+  for (int P = 0; P < naux; ++P) {
+    if (dc[P] == Real(0)) continue;
+    const Real dcP = dc[P];
+    for (int mu = 0; mu < nao; ++mu)
+      for (int la = 0; la < nao; ++la) {
+        Real acc = 0;
+        for (int nu = 0; nu < nao; ++nu)
+          for (int si = 0; si < nao; ++si) {
+            const Real Dbns = Db[static_cast<std::size_t>(nu) * nao + si];
+            if (Dbns == Real(0)) continue;
+            acc += Dbns * detail::three_electron_raw(orbg[mu], orbg[la], auxg[P], orbg[nu],
+                                                     orbg[si], ghost, grid);
+          }
+        K[static_cast<std::size_t>(mu) * nao + la] += dcP * acc;
+      }
+  }
+  return K;
+}
+
 } // namespace intti
