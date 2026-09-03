@@ -577,6 +577,15 @@ template <class Real> bool is_grid_rep(const ProductFunction<Real> &f) {
 /// TGrid; the truncated tail is restored with the delta-function correction,
 /// with the overlap taken exactly (GTO x grid) or estimated self-consistently
 /// from the kernel value at t_c (see docs/psc.md).
+///
+/// Tail order: GTO x GTO goes through eri_quartet and so inherits the FULL
+/// higher-order tail series (grid.tail_order, tgrid.hpp). The grid-represented
+/// paths use only the leading (order-0) delta term pi*S/t_c^2 -- higher orders
+/// need the Laplacian-overlap moments M_k = int rho_f (nabla^2)^k rho_g, which
+/// are feasible for GTO x cloud (the Laplacian lands on the analytic GTO,
+/// evaluated at the cloud points) but not for cloud x cloud / coaxial PSC, where
+/// even the overlap S is only estimated from the kernel value at t_c. So
+/// tail_order > 0 is honoured for GTO x GTO and ignored by the grid branches.
 template <class Real>
 Real interaction(const ProductFunction<Real> &f, const ProductFunction<Real> &g,
                  const TGrid<Real> &grid) {

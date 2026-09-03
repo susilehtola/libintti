@@ -412,11 +412,18 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   the tested exponent regime; very tight all-electron cores (alpha_max ~ 1e6,
   floor t_c ~ 1e3) want separate validation of the explicit-grid resolution.
 
-  Remaining: the PSC/grid consumer (`product.hpp` still uses the leading term
-  only), the STO s-quadrature tail (same series corrects the tight-Gaussian
-  delta-like tail), and minimax t-node placement for the explicit [0, t_c]
-  range. Prototypes: prototype/sto_validation.py (STO = quadrature-contracted
-  GTO, 5*zeta/8 to 7e-12).
+  The PSC/grid consumer (`product.hpp::interaction`) is audited: GTO x GTO
+  routes through eri_quartet and so inherits the FULL higher-order tail
+  automatically (tested); the grid-represented paths keep the leading (order-0)
+  delta term -- higher orders there need M_k = int rho_f (nabla^2)^k rho_g,
+  feasible for GTO x cloud (the Laplacian lands on the analytic GTO, evaluated at
+  the cloud points -- a future extension) but not for cloud x cloud / coaxial
+  PSC, where even the overlap S is only estimated from the kernel value at t_c.
+  Remaining: the STO s-quadrature tail (same series corrects the tight-Gaussian
+  delta-like tail), the optional GTO x cloud higher-order, and minimax t-node
+  placement for the explicit [0, t_c] range. Prototypes:
+  prototype/sto_validation.py (STO = quadrature-contracted GTO, 5*zeta/8 to
+  7e-12).
 
 ## Standing items
 

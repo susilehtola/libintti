@@ -15,6 +15,7 @@
 #endif
 
 #include "intti/fock.hpp"
+#include "intti/product.hpp"
 #include "intti/quartet.hpp"
 
 namespace {
@@ -200,6 +201,32 @@ TEST(Tail, AdaptiveSpecMeetsTargetAtFloor) {
                             << " worst=" << worst;
     }
   }
+}
+
+TEST(Tail, InteractionGtoInheritsHigherOrder) {
+  // interaction() routes GTO x GTO through eri_quartet, so it inherits the
+  // higher-order tail: order 2 is far tighter than the leading term.
+  using GTO = intti::GTOProduct<double>;
+  using PF = intti::ProductFunction<double>;
+  const auto bra = intti::make_pair(PrimitiveShell<double>{0.9, {0, 0, 0}, 0},
+                                    PrimitiveShell<double>{1.2, {0.3, 0, 0}, 0});
+  const auto ket = intti::make_pair(PrimitiveShell<double>{1.1, {0, 0, 1.0}, 0},
+                                    PrimitiveShell<double>{0.4, {0, 0.2, 1.0}, 0});
+  intti::TGridSpec<double> ms;
+  ms.mapping = intti::TMapping::Mobius;
+  ms.n = 200;
+  const double ref = intti::interaction<double>(
+      PF{GTO{bra, 0, 0}}, PF{GTO{ket, 0, 0}}, intti::make_tgrid(intti::coulomb(), ms));
+  auto err = [&](int K) {
+    auto sp = intti::linlog_for<double>(10.0, 1e-15);
+    sp.tail_order = K;
+    const double v = intti::interaction<double>(PF{GTO{bra, 0, 0}}, PF{GTO{ket, 0, 0}},
+                                                intti::make_tgrid(intti::coulomb(), sp));
+    return std::abs((v - ref) / ref);
+  };
+  const double e0 = err(0), e2 = err(2);
+  EXPECT_LT(e2, e0 * 1e-3) << "e0=" << e0 << " e2=" << e2;
+  EXPECT_LT(e2, 1e-9);
 }
 
 #ifdef INTTI_HAVE_QUADMATH
