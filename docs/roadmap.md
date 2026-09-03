@@ -165,9 +165,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   nu|Q) [M^+ G]_Q with G the auxiliary-space gradient (each aux integral T_{ijk}
   scattered into its three slots) -- O(naux^3), matching the energy, with
   sum F D = 3E. Validated against the direct raw Fock in the exact-aux cases (s
-  and p) and by finite difference of E3^RI. Remaining: the effective two-body
-  reduction (contract one pair into an effective 2-electron operator folded into
-  the J/K build).
+  and p) and by finite difference of E3^RI. The effective two-body reduction is
+  done for the Coulomb (J) channel (`three_electron_effective_coulomb_ri`):
+  contracting electron 3 with a density Dc gives an effective 2-electron operator
+  Omega, and folding it into a J build with a density Db collapses to the
+  one-body matrix <mu nu|V_Dc V_Db> = sum_{PQ} dc_P db_Q T_{mu nu,PQ} (both
+  densities fitted), O(nao^2 naux^2) vs O(nao^6). Dc = Db = D is the electron-1
+  slot <mu|V_D^2|nu> of the three-body Fock; a separate Db is the transcorrelated
+  / response use. Validated against the direct raw contraction (s, s with Dc!=Db,
+  and p x p -> d). Remaining: the exchange (K) channel of the effective 2-body
+  operator (needs the nao^4 x naux W-tensor), a heavier follow-up.
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

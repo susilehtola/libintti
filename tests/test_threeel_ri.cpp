@@ -137,6 +137,67 @@ TEST(ThreeElRI, FockMatchesDirectWhenAuxSpansProducts) {
   }
 }
 
+// Direct effective two-body Coulomb: J_mu nu = sum_{la si, c f} Db_la si Dc_c f
+// G_{mu la c, nu si f}, electron 2 contracted by Db and electron 3 by Dc.
+std::vector<double> direct_eff_coulomb(const std::vector<CartGauss<double>> &g,
+                                       const std::vector<double> &Dc, const std::vector<double> &Db,
+                                       int n, const intti::TGrid<double> &grid) {
+  std::vector<double> J(static_cast<std::size_t>(n) * n, 0.0);
+  for (int mu = 0; mu < n; ++mu)
+    for (int nu = 0; nu < n; ++nu) {
+      double j = 0;
+      for (int la = 0; la < n; ++la)
+        for (int si = 0; si < n; ++si) {
+          const double Dl = Db[la * n + si];
+          if (Dl == 0) continue;
+          for (int c = 0; c < n; ++c)
+            for (int f = 0; f < n; ++f)
+              j += Dl * Dc[c * n + f] *
+                   intti::detail::three_electron_raw(g[mu], g[la], g[c], g[nu], g[si], g[f], grid);
+        }
+      J[mu * n + nu] = j;
+    }
+  return J;
+}
+
+TEST(ThreeElRI, EffectiveCoulombMatchesDirect) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto cmp = [](const std::vector<double> &A, const std::vector<double> &B, double tol,
+                const char *msg) {
+    double mx = 0, md = 0;
+    for (std::size_t i = 0; i < A.size(); ++i) {
+      mx = std::max(mx, std::abs(B[i]));
+      md = std::max(md, std::abs(A[i] - B[i]));
+    }
+    EXPECT_LT(md, tol * mx) << msg;
+  };
+  // s orbitals, aux = the three products; check Dc=Db and Dc!=Db.
+  {
+    auto orb = intti::make_basis<double>({{1.0, {0.0, 0.0, 0.0}, 0}, {0.8, {0.5, 0.0, 0.0}, 0}});
+    const double p01 = (1.0 * 0.0 + 0.8 * 0.5) / 1.8;
+    auto aux = intti::make_basis<double>({{2.0, {0.0, 0.0, 0.0}, 0},
+                                          {1.6, {0.5, 0.0, 0.0}, 0},
+                                          {1.8, {p01, 0.0, 0.0}, 0}});
+    const auto og = intti::detail::shellbasis_to_cartgauss(orb);
+    const std::vector<double> D = {1.0, 0.3, 0.3, 0.7};
+    cmp(intti::three_electron_effective_coulomb_ri(orb, D, D, aux, grid),
+        direct_eff_coulomb(og, D, D, 2, grid), 1e-8, "s Dc=Db");
+    const std::vector<double> Dc = {0.9, -0.2, -0.2, 0.4}, Db = {0.5, 0.1, 0.1, 1.1};
+    cmp(intti::three_electron_effective_coulomb_ri(orb, Dc, Db, aux, grid),
+        direct_eff_coulomb(og, Dc, Db, 2, grid), 1e-8, "s Dc!=Db");
+  }
+  // p x p -> d (cart_comp ordering in the effective-Coulomb path)
+  {
+    const double a = 0.9;
+    auto orb = intti::make_basis<double>({{a, {0.1, 0.2, 0.3}, 1}});
+    auto aux = intti::make_basis<double>({{2 * a, {0.1, 0.2, 0.3}, 2}});
+    const auto og = intti::detail::shellbasis_to_cartgauss(orb);
+    const std::vector<double> D = {0.7, 0.2, -0.1, 0.2, 0.5, 0.15, -0.1, 0.15, 0.9};
+    cmp(intti::three_electron_effective_coulomb_ri(orb, D, D, aux, grid),
+        direct_eff_coulomb(og, D, D, 3, grid), 1e-8, "p Dc=Db");
+  }
+}
+
 TEST(ThreeElRI, FockIsEnergyGradientAndObeysEuler) {
   // The RI Fock is the gradient of the RI energy (finite difference) and, by
   // cubic homogeneity of E3^RI in D, satisfies sum_{mu nu} F_{mu nu} D_{mu nu} = 3E.

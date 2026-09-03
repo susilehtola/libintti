@@ -165,4 +165,62 @@ std::vector<Real> three_electron_fock_ri(const ShellBasis<Real> &orb, const std:
   return F;
 }
 
+/// Effective two-body Coulomb reduction of the three-body term, via RI.
+/// Contracting electron 3 of G with a density Dc gives an effective 2-electron
+/// operator Omega_{mu nu, la si} = sum_cf G_{mu la c, nu si f} Dc_cf; folding it
+/// into a Coulomb (J) build with a density Db (contract electron 2) collapses to
+/// the one-body matrix
+///   J_{mu nu} = <mu nu | V_Dc V_Db> = int rho_{mu nu}(r) V_Dc(r) V_Db(r) dr,
+/// V_D the Coulomb potential of density D. With Dc = Db = D this is the
+/// electron-1-slot piece <mu|V_D^2|nu> of the three-body Fock; a separate build
+/// density Db is the transcorrelated / response use. Fitting both densities to
+/// `aux`, J_{mu nu} = sum_{PQ} dc_P db_Q T_{mu nu, P Q}, where
+/// T_{mu nu, P Q} = int rho_{mu nu} V_P V_Q is the three-electron integral of the
+/// orbital pair (mu,nu) with two single auxiliaries. O(nao^2 naux^2) vs O(nao^6),
+/// exact when both densities lie in span(aux). (The exchange, K, part needs the
+/// full nao^4 x naux W-tensor and is a heavier follow-up.) Unnormalised
+/// primitive convention; returns the nao x nao matrix, row-major.
+template <class Real>
+std::vector<Real> three_electron_effective_coulomb_ri(const ShellBasis<Real> &orb,
+                                                      const std::vector<Real> &Dc,
+                                                      const std::vector<Real> &Db,
+                                                      const ShellBasis<Real> &aux,
+                                                      const TGrid<Real> &grid, Real tau = 1e-10) {
+  const int nao = orb.nao, naux = aux.nao;
+  const auto M = coulomb_2c(aux, grid);
+  const auto T3c = coulomb_3c(orb, aux, grid); // (mu nu|P)
+  auto fit = [&](const std::vector<Real> &D) {
+    std::vector<Real> g(naux, Real(0));
+    for (int mu = 0; mu < nao; ++mu)
+      for (int nu = 0; nu < nao; ++nu) {
+        const Real Dmn = D[static_cast<std::size_t>(mu) * nao + nu];
+        if (Dmn == Real(0)) continue;
+        const Real *row = &T3c[(static_cast<std::size_t>(mu) * nao + nu) * naux];
+        for (int P = 0; P < naux; ++P) g[P] += Dmn * row[P];
+      }
+    return detail::te_solve_metric(M, g, naux, tau);
+  };
+  const auto dc = fit(Dc), db = fit(Db);
+  const auto orbg = detail::shellbasis_to_cartgauss(orb);
+  const auto auxg = detail::shellbasis_to_cartgauss(aux);
+  CartGauss<Real> ghost{Real(0), {Real(0), Real(0), Real(0)}, {0, 0, 0}};
+  std::vector<Real> J(static_cast<std::size_t>(nao) * nao, Real(0));
+  for (int mu = 0; mu < nao; ++mu)
+    for (int nu = mu; nu < nao; ++nu) { // J symmetric in mu,nu
+      Real jval = 0;
+      for (int P = 0; P < naux; ++P) {
+        if (dc[P] == Real(0)) continue;
+        for (int Q = 0; Q < naux; ++Q) {
+          const Real w = dc[P] * db[Q];
+          if (w == Real(0)) continue;
+          jval += w * detail::three_electron_raw(orbg[mu], auxg[P], auxg[Q], orbg[nu], ghost,
+                                                 ghost, grid);
+        }
+      }
+      J[static_cast<std::size_t>(mu) * nao + nu] = jval;
+      J[static_cast<std::size_t>(nu) * nao + mu] = jval;
+    }
+  return J;
+}
+
 } // namespace intti
