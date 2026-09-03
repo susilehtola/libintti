@@ -216,6 +216,18 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   path stays Kokkos (only float/double/long double are device scalars); no
   mplapack/Eigen -- extended precision is CPU-only by nature (no __float128 GPU).
 
+- **Adaptive t-grid range** (`tgrid.hpp`): the default Mobius grid (n=64, s=2)
+  is calibrated for exponents [1e-2, 1e6]; real basis sets exceed this (heavy
+  cores ~1e7-1e9, doubly-diffuse/Rydberg ~1e-3-1e-4). `mobius_spec_for_range`
+  (and `adaptive_mobius_spec(basis)`) sizes one shared grid from the basis's
+  exponent span, anchored to the proven default and growing the node count as
+  (decades/10)^2.5 (a single Mobius map's tails thin out superlinearly with the
+  span), with s tracking the geometric-mean exponent. Opt-in; the default spec
+  is unchanged. Validated vs analytic (ss|ss) across [1e-5, 1e9] (14 decades) to
+  <1e-7 where the default is off by ~4e-3. Future: a Beylkin-Monzon
+  (exponential-sum/sinc) mapping is provably near-optimal for 1/r over a finite
+  range -- fewer nodes at wide spans -- and slots in as a new TMapping.
+
 - **M15 — NAO support: OUT OF SCOPE (dropped).** libintti does everything
   natively in GTOs; the STO path earns its place because it is the *integral
   transform* (Gaussian resolution of e^{-zeta r}) plus the delta-tail

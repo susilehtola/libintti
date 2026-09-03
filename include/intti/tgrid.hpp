@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Susi Lehtola
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -107,6 +109,28 @@ TGridSpec<Real> linlog_for(Real t_c, Real target_eps = Real(1e-10)) {
   const Real span = t_c > spec.t_lin ? log_(Real(t_c / spec.t_lin)) : Real(0);
   int nl = ceil_int(27 * f * span);
   spec.n_log = nl < 20 ? 20 : nl;
+  return spec;
+}
+
+/// Mobius TGridSpec sized to a basis's Gaussian exponent span, so one shared
+/// grid resolves every pair. Anchored to the calibrated default (n=64, s=2
+/// covers exponents [1e-2, 1e6], i.e. 8 decades): the node count grows ~8 per
+/// decade of exponent span, and the map scale s tracks the geometric-mean
+/// exponent relative to the reference (G0 = 1e2). Opt-in -- make_tgrid's default
+/// spec is unchanged. `pad_decades` widens the effective range on each side for
+/// the geometry factor (well-separated diffuse pairs need slightly smaller t).
+template <class Real>
+TGridSpec<Real> mobius_spec_for_range(Real alpha_min, Real alpha_max, double pad_decades = 1.0) {
+  TGridSpec<Real> spec; // mapping defaults to Mobius
+  const double amin = static_cast<double>(alpha_min), amax = static_cast<double>(alpha_max);
+  const double lo = std::log10(amin) - pad_decades, hi = std::log10(amax) + pad_decades;
+  // A single Mobius map needs superlinearly more nodes for a wider range (its
+  // tails thin out), so anchor to the proven default -- 64 nodes at 10 padded
+  // decades -- and grow as (decades/10)^2.5.
+  const double decades = std::max(10.0, hi - lo);
+  spec.n = std::max(64, static_cast<int>(std::ceil(64.0 * std::pow(decades / 10.0, 2.5))));
+  const double G = std::pow(10.0, 0.5 * (lo + hi)); // padded geometric-mean exponent
+  spec.s = static_cast<Real>(2.0 * std::sqrt(G / 1e2));
   return spec;
 }
 

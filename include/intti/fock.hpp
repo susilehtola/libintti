@@ -5,6 +5,7 @@
 // Shell-level AO-matrix Fock builders: the user-facing entry point wrapping
 // the pair-space Hermite t-space kernels.
 
+#include <algorithm>
 #include <cmath>
 #include <utility>
 #include <vector>
@@ -32,6 +33,19 @@ ShellBasis<Real> make_basis(std::vector<PrimitiveShell<Real>> shells) {
     b.ao_off[i + 1] = b.ao_off[i] + ncart(b.shells[i].l);
   b.nao = b.ao_off.back();
   return b;
+}
+
+/// Mobius t-grid spec sized to a basis's Gaussian exponent range, so a single
+/// grid resolves every pair (see tgrid.hpp::mobius_spec_for_range). Opt-in.
+template <class Real>
+TGridSpec<Real> adaptive_mobius_spec(const ShellBasis<Real> &b) {
+  if (b.shells.empty()) return {};
+  Real amin = b.shells[0].alpha, amax = amin;
+  for (const auto &s : b.shells) {
+    amin = std::min(amin, s.alpha);
+    amax = std::max(amax, s.alpha);
+  }
+  return mobius_spec_for_range(amin, amax);
 }
 
 /// Triangular shell-pair list of a basis, plus the (i, j) shell indices of
