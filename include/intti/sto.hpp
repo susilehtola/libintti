@@ -517,4 +517,85 @@ Real sto_coulomb_2c_delta(Real zA, const Real A[3], Real zB, const Real B[3], Re
   return J;
 }
 
+namespace detail {
+/// Radial delta-tail weight of a 1s density of decay zd (= 2 zeta):
+///   W_k = (8 pi / (k! zd^{3+2k})) gamma(k+2, u_c),  u_c = zd^2/(4 t_c).
+/// The tail of the density samples the partner potential's Laplacians:
+/// (rho^tail | V) = sum_k W_k (nabla^2)^k V(centre) (times the density norm).
+template <class Real> Real sto_radial_weight(Real zd, Real t_c, int k) {
+  const Real pi = pi_v<Real>();
+  const Real u = zd * zd / (4 * t_c);
+  Real zpow = 1;
+  for (int i = 0; i < 3 + 2 * k; ++i) zpow *= zd;
+  Real kfact = 1;
+  for (int i = 2; i <= k; ++i) kfact *= i;
+  return 8 * pi / (kfact * zpow) * lower_gamma_int(k + 2, u);
+}
+
+/// Same-centre Coulomb of two 1s Slater densities rho = phi^2 (orbital exponents
+/// zA, zB, density decays 2 zA, 2 zB), in closed form:
+///   (rho_A|rho_B) = zA - zA^3/s^2 - zA^3 zB/s^3,  s = zA + zB.
+/// Symmetric in A,B; reduces to 5 zeta/8 for zA=zB. (references/sympy_slater.py.)
+/// Handles R=0 exactly, so the delta-tail is used only for R>0 (all smooth).
+template <class Real> Real sto_coulomb_1c(Real zA, Real zB) {
+  const Real s = zA + zB;
+  return zA - zA * zA * zA / (s * s) - zA * zA * zA * zB / (s * s * s);
+}
+} // namespace detail
+
+/// Symmetric two-electron delta-tail (rho_A|rho_B) of two 1s Slater densities
+/// rho = phi^2 (the pair-density level -- see prototype/sto_delta_tail_j.py).
+/// Same centre (R=0) is exact via the closed-form 1-centre Coulomb
+/// (detail::sto_coulomb_1c), so the delta tail is used only for R>0, where every
+/// term is smooth. There BOTH densities are truncated at t_c and, exact under the
+/// point-charge tail approximation,
+///   (rho_A|rho_B) = (low_A|low_B) + (tail_A|rho_B) + (rho_A|tail_B) - Q_A Q_B/R,
+/// with the cross terms carried to order radial_order via the Gaussian-smoothing
+/// series (tail_A|rho_B) = sum_k W_{A,k} (nabla^2)^k V_B(A). Poisson makes those
+/// closed form: (nabla^2)^k V_B = -4 pi (nabla^2)^{k-1} rho_B, and for a Slater
+/// density (nabla^2)^j e^{-kappa r} = (kappa^{2j} - 2j kappa^{2j-1}/r) e^{-kappa r}.
+/// Order 0 recovers Q_A V_B(A) + Q_B V_A(B); each order removes a 1/t_c^2 factor.
+template <class Real>
+Real sto_coulomb_2c_delta_sym(Real zA, const Real A[3], Real zB, const Real B[3],
+                              Real t_c, int ns_low, int radial_order = 0) {
+  const Real pi = pi_v<Real>();
+  Real R2 = 0;
+  for (int d = 0; d < 3; ++d) R2 += (A[d] - B[d]) * (A[d] - B[d]);
+  const Real R = std::sqrt(R2);
+  if (R < Real(1e-9)) return detail::sto_coulomb_1c(zA, zB);
+  const int K = radial_order < TAIL_KMAX ? radial_order : TAIL_KMAX;
+  std::vector<Real> tA, dA, tB, dB;
+  sto_gaussians(2 * zA, ns_low, tA, dA, 0, Real(1e-4), t_c);
+  sto_gaussians(2 * zB, ns_low, tB, dB, 0, Real(1e-4), t_c);
+  const Real CA = zA * zA * zA / pi, CB = zB * zB * zB / pi;
+  Real J = 0;
+  for (std::size_t k = 0; k < tA.size(); ++k)
+    for (std::size_t m = 0; m < tB.size(); ++m)
+      J += CA * dA[k] * CB * dB[m] * detail::ss_coulomb(tA[k], tB[m], R2);
+  // (tail of density with norm CT, decay 2 zT | potential of the zP density at R)
+  auto cross = [&](Real zT, Real CT, Real zP, Real CP) {
+    Real v = CT * sto_delta_tail_weight(2 * zT, t_c) * sto_slater_potential(zP, R);
+    const Real kappa = 2 * zP, eKR = std::exp(-kappa * R);
+    for (int k = 1; k <= K; ++k) {
+      // (nabla^2)^{k-1} rho_P(R) = CP (kappa^{2(k-1)} - 2(k-1) kappa^{2k-3}/R) e^{-kR}
+      Real k2 = 1;
+      for (int t = 0; t < 2 * (k - 1); ++t) k2 *= kappa;
+      Real term2 = 0;
+      if (k >= 2) {
+        Real k3 = 1;
+        for (int t = 0; t < 2 * k - 3; ++t) k3 *= kappa;
+        term2 = 2 * (k - 1) * k3 / R;
+      }
+      const Real lapV = -4 * pi * CP * (k2 - term2) * eKR; // (nabla^2)^k V_P(R)
+      v += CT * detail::sto_radial_weight(2 * zT, t_c, k) * lapV;
+    }
+    return v;
+  };
+  J += cross(zA, CA, zB, CB) + cross(zB, CB, zA, CA);
+  const Real QA = CA * sto_delta_tail_weight(2 * zA, t_c);
+  const Real QB = CB * sto_delta_tail_weight(2 * zB, t_c);
+  J -= QA * QB / R;
+  return J;
+}
+
 } // namespace intti

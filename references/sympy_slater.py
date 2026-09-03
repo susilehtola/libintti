@@ -65,6 +65,16 @@ for kk in range(1, 4):
     want = 8 * pi / (sp.factorial(kk) * zeta**(3 + 2 * kk)) * sp.lowergamma(kk + 2, uu)
     check(f"radial tail weight W_{kk}", Wk, want)
 
+# same-centre Coulomb of two 1s Slater densities rho = phi^2 (orbital exponents
+# zA, zB): (rho_A|rho_B) = int rho_A V_B d^3r, closed form used for R=0.
+zA, zB = sp.symbols("z_A z_B", positive=True)
+VB = (1 / r) * (1 - (1 + zB * r) * sp.exp(-2 * zB * r))  # Slater potential of the zB density
+J1c = 4 * pi * sp.integrate((zA**3 / pi) * sp.exp(-2 * zA * r) * VB * r**2, (r, 0, sp.oo))
+J1c_form = zA - zA**3 / (zA + zB)**2 - zA**3 * zB / (zA + zB)**3
+check("1-centre 2-density Coulomb  zA - zA^3/s^2 - zA^3 zB/s^3", J1c, J1c_form)
+check("... symmetric in A,B", J1c_form, J1c_form.subs({zA: zB, zB: zA}, simultaneous=True))
+check("... equal exponents = 5z/8", J1c_form.subs(zB, zA), 5 * zA / 8)
+
 # two-centre 1s Slater Coulomb (equal exponents), the Roothaan formula. Derived
 # as J(R) = int rho_A(r) V_B(|r-B|) d^3r via the shell-averaged potential; check
 # the closed form and its R->0 (self-repulsion) and R->oo (1/R) limits.

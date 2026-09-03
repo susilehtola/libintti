@@ -336,9 +336,21 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   density e^{-2 zeta r}, and drops the "one orbital tight" pairs the point
   charge cannot repair. At the density level it works even on-centre (R=0): the
   1s self-repulsion 5 zeta/8 is reproduced to 1.4e-4 at t_c=20 and 6e-3 at
-  t_c=8. A production delta-tail J is therefore a re-architecture around pair
-  densities (single-centre Slater for same-atom pairs, point-charge tails for
-  two-centre pairs) plus the closed-form tail-tail self-energy; open. An STO is the exact
+  t_c=8. The pair-density-level building block is now done for 1s
+  (`sto_coulomb_2c_delta_sym`). Same centre (R=0) is EXACT via the closed-form
+  1-centre Coulomb of two Slater densities, (rho_A|rho_B) = zA - zA^3/s^2 -
+  zA^3 zB/s^3, s = zA+zB (`detail::sto_coulomb_1c`, references/sympy_slater.py;
+  reduces to 5 zeta/8), so the cusp-cusp case is trivial and the delta tail is
+  used only for R>0, where every term is smooth. There BOTH densities are
+  truncated at t_c: (low_A|low_B) + (tail_A|rho_B) + (rho_A|tail_B) - Q_A Q_B/R,
+  the cross terms carried to any order via the Gaussian-smoothing series
+  (tail_A|rho_B) = sum_k W_{A,k} (nabla^2)^k V_B(A) -- Poisson makes them closed
+  form ((nabla^2)^k V_B = -4 pi (nabla^2)^{k-1} rho_B, and (nabla^2)^j e^{-kr} =
+  (k^{2j} - 2j k^{2j-1}/r) e^{-kr}). Validated: R=0 exact, and two-centre order 2
+  is ~1e4x tighter than order 0 (t_c=6: 1.8e-4 -> 1.4e-8), each order removing a
+  1/t_c^2 factor. Remaining for a production matrix J: the l>0 pair densities and
+  the matrix assembly ((ab|cd) = pair-pair Coulomb scattered into J, with Schwarz
+  screening still the exact cost control meanwhile). An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.

@@ -238,6 +238,28 @@ TEST(STO, TwoCenterCoulombDeltaTailMatchesFull) {
   EXPECT_NEAR(delta, full, 1e-3 * full) << "two-electron delta-tail != full grid";
 }
 
+TEST(STO, SymmetricDeltaTailBothTruncated) {
+  // Pair-density-level (rho_A|rho_B). Same centre (R=0) is exact via the
+  // closed-form 1-centre Coulomb: self = 5 zeta/8, and the unequal case matches
+  // the full-grid value.
+  const double O[3] = {0.0, 0.0, 0.0};
+  EXPECT_NEAR(intti::sto_coulomb_2c_delta_sym(1.3, O, 1.3, O, 8.0, 32), 5 * 1.3 / 8, 1e-13);
+  EXPECT_NEAR(intti::sto_coulomb_2c_delta_sym(1.3, O, 0.7, O, 8.0, 32),
+              intti::sto_coulomb_2c(1.3, O, 0.7, O, 160), 1e-9);
+  // Two centres (R>0): the higher-order cross terms (Poisson, closed form) make
+  // each order remove a 1/t_c^2 factor, so order 2 is far tighter than order 0.
+  const double zb = 0.9;
+  const double B[3] = {0.4, 0.0, 2.0};
+  const double full = intti::sto_coulomb_2c(1.3, O, zb, B, 160);
+  auto err = [&](int K) {
+    return std::abs((intti::sto_coulomb_2c_delta_sym(1.3, O, zb, B, 6.0, 64, K) - full) / full);
+  };
+  const double e0 = err(0), e2 = err(2);
+  EXPECT_LT(e0, 1e-3);
+  EXPECT_LT(e2, 1e-6) << "order-2 two-centre cross terms";
+  EXPECT_LT(e2, e0 * 1e-3) << "higher order not tighter: e0=" << e0 << " e2=" << e2;
+}
+
 TEST(STO, JKBuildSingleSelfERI) {
   // single 1s STO, D = [[1]] (unnormalized AO e^{-zeta r}): J[0][0] = K[0][0]
   // = (00|00) = 5 pi^2 / (8 zeta^5) (the normalized 5 zeta/8 scaled by
