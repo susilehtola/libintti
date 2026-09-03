@@ -52,20 +52,30 @@ std::vector<CartGauss<Real>> shellbasis_to_cartgauss(const ShellBasis<Real> &b) 
 }
 
 /// d = M^{-1} g via symmetric eigendecomposition, dropping eigenvalues below
-/// tau * (largest eigenvalue) to tame auxiliary linear dependence.
+/// tau * (largest eigenvalue) to tame auxiliary linear dependence. Uses host
+/// LAPACK (syevd) for float/double and the precision-generic Jacobi eigensolver
+/// otherwise (long double / __float128), so the whole fit runs at any precision.
 template <class Real>
 std::vector<Real> te_solve_metric(std::vector<Real> M, const std::vector<Real> &g, int n,
                                   Real tau) {
-  std::vector<Real> w(n);
-  syevd(n, M.data(), w.data()); // M -> eigenvectors (columns, col-major), w ascending
-  const Real cutoff = tau * w[n - 1];
+  std::vector<Real> w(n), vecs; // vecs: col-major eigenvectors, vecs[k*n+i]
+  if constexpr (std::is_same_v<Real, double> || std::is_same_v<Real, float>) {
+    syevd(n, M.data(), w.data());
+    vecs = std::move(M); // syevd overwrites M with the eigenvectors
+  } else {
+    jacobi_eigh(n, std::move(M), w, vecs);
+  }
+  Real wmax = 0;
+  for (int k = 0; k < n; ++k)
+    if (w[k] > wmax) wmax = w[k];
+  const Real cutoff = tau * wmax;
   std::vector<Real> d(n, Real(0));
   for (int k = 0; k < n; ++k) {
     if (w[k] <= cutoff) continue;
     Real proj = 0;
-    for (int i = 0; i < n; ++i) proj += M[static_cast<std::size_t>(k) * n + i] * g[i];
+    for (int i = 0; i < n; ++i) proj += vecs[static_cast<std::size_t>(k) * n + i] * g[i];
     const Real c = proj / w[k];
-    for (int i = 0; i < n; ++i) d[i] += c * M[static_cast<std::size_t>(k) * n + i];
+    for (int i = 0; i < n; ++i) d[i] += c * vecs[static_cast<std::size_t>(k) * n + i];
   }
   return d;
 }
@@ -177,7 +187,7 @@ std::vector<Real> three_electron_fock_ri(const ShellBasis<Real> &orb, const std:
 template <class Real>
 ShellBasis<Real> cholesky_product_aux(const ShellBasis<Real> &orb, const TGrid<Real> &grid,
                                       const CholeskyOptions<Real> &opt = {}) {
-  const auto cb = two_step_cholesky(orb, grid, opt); // pivots + pair_shells
+  const auto cb = pivoted_cholesky(orb, grid, opt); // precision-generic; pivots + pair_shells
   std::vector<char> used(cb.pair_shells.size(), 0);
   for (const auto &piv : cb.pivots) used[piv.first] = 1;
   std::vector<PrimitiveShell<Real>> aux;

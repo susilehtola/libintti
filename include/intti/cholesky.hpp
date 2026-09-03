@@ -67,6 +67,56 @@ void syevd(int n, Real *a, Real *w) {
   if (info != 0) throw std::runtime_error("intti: syevd failed");
 }
 
+/// Precision-generic symmetric eigensolver (cyclic Jacobi) for the scalars host
+/// LAPACK cannot take (long double, __float128, MPFR). `a` is an n x n symmetric
+/// matrix (row-major); on return w[k] holds the eigenvalues and evec is the
+/// column-major eigenvector matrix, evec[k*n+i] = component i of eigenvector k
+/// (the same layout syevd's 'V' produces). Iterates to the scalar's floor.
+template <class Real>
+void jacobi_eigh(int n, std::vector<Real> a, std::vector<Real> &w, std::vector<Real> &evec) {
+  auto at = [&](int i, int j) -> Real & { return a[static_cast<std::size_t>(i) * n + j]; };
+  evec.assign(static_cast<std::size_t>(n) * n, Real(0));
+  for (int i = 0; i < n; ++i) evec[static_cast<std::size_t>(i) * n + i] = 1;
+  auto offnorm = [&]() {
+    Real s = 0;
+    for (int i = 0; i < n; ++i)
+      for (int j = i + 1; j < n; ++j) s += at(i, j) * at(i, j);
+    return s;
+  };
+  Real prev = offnorm();
+  for (int sweep = 0; sweep < 100 && prev > Real(0); ++sweep) {
+    for (int p = 0; p < n; ++p)
+      for (int qq = p + 1; qq < n; ++qq) {
+        const Real apq = at(p, qq);
+        if (apq == Real(0)) continue;
+        const Real beta = (at(qq, qq) - at(p, p)) / (2 * apq);
+        const Real t = (beta >= Real(0) ? Real(1) : Real(-1)) / (abs_(beta) + sqrt_(beta * beta + 1));
+        const Real c = Real(1) / sqrt_(t * t + 1), s = t * c;
+        for (int i = 0; i < n; ++i) { // A <- J^T A J (rows then columns)
+          const Real aip = at(i, p), aiq = at(i, qq);
+          at(i, p) = c * aip - s * aiq;
+          at(i, qq) = s * aip + c * aiq;
+        }
+        for (int i = 0; i < n; ++i) {
+          const Real api = at(p, i), aqi = at(qq, i);
+          at(p, i) = c * api - s * aqi;
+          at(qq, i) = s * api + c * aqi;
+        }
+        for (int i = 0; i < n; ++i) { // eigenvectors: rotate columns p,q
+          const Real vip = evec[static_cast<std::size_t>(p) * n + i];
+          const Real viq = evec[static_cast<std::size_t>(qq) * n + i];
+          evec[static_cast<std::size_t>(p) * n + i] = c * vip - s * viq;
+          evec[static_cast<std::size_t>(qq) * n + i] = s * vip + c * viq;
+        }
+      }
+    const Real cur = offnorm();
+    if (cur >= prev) break; // converged to the scalar's roundoff floor
+    prev = cur;
+  }
+  w.resize(n);
+  for (int i = 0; i < n; ++i) w[i] = at(i, i);
+}
+
 template <class Real>
 void gemm_nn(int m, int n, int k, const Real *A, int lda, const Real *B, int ldb,
              Real *C, int ldc) {

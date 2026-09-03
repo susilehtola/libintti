@@ -190,6 +190,10 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   Gaussians (l = 0..l_i+l_j at the product centre, exponent alpha_i+alpha_j) that
   span the pair block exactly, so the set spans rho_D to the CD threshold with
   O(rank) auxiliaries. Validated exact (tight tau) vs the direct sum, s and p.
+  The _cd path is precision-generic end to end: it drives the precision-generic
+  `pivoted_cholesky` (batched/serial by scalar) and a Jacobi metric solve
+  (`detail::jacobi_eigh`) in place of LAPACK, so `three_electron_energy_cd` runs
+  at long double and __float128 -- validated against the direct sum at both.
 
 - **Precision-generic Cholesky** (`cholesky.hpp`): the one-step pivoted Cholesky
   (ab|cd) ~= sum_J L_ab^J L_cd^J is LAPACK-free (pivoted recurrence + sqrt), so
@@ -212,10 +216,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   path stays Kokkos (only float/double/long double are device scalars); no
   mplapack/Eigen -- extended precision is CPU-only by nature (no __float128 GPU).
 
-- **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
-  GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
-  once), so all NAO integrals reduce to GTO 2-/3-center RI; grid path kept as
-  the exact reference. Oracle: NAO-via-fit vs NAO-via-grid.
+- **M15 — NAO support: OUT OF SCOPE (dropped).** libintti does everything
+  natively in GTOs; the STO path earns its place because it is the *integral
+  transform* (Gaussian resolution of e^{-zeta r}) plus the delta-tail
+  correction, which is more exact than a plain Gaussian fit of a Slater. NAO
+  integrals, by contrast, would be a fitting approximation (NAO products onto a
+  GTO aux, or NAOs onto GTO expansions) with residuals that are hard to control
+  for cusped / strictly-confined NAOs -- an approximation the library declines to
+  bless as a first-class feature. Anyone wanting it can build it on top of the
+  GTO/STO machinery themselves. So there is no `nao.hpp`.
 
 - **M-STO — Slater-type orbitals** (minimal STOs done, `sto.hpp`): a minimal
   STO (n = l+1), r^l Y_lm e^{-ζr}, is a contracted Cartesian GTO shell of
@@ -287,13 +296,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   s-quadrature — the tight components need no brute quadrature and are
   spatially local (they screen). Reuses: `eri_quartets_accumulate`
   (STO = contracted GTO shell), the delta-tail correction, the Möbius/log
-  grid mappings. Two complementary routes: (a) the integral-transform route
-  above, exact in the node limit; (b) RI-fit STO products to GTOs like NAOs.
-  Plan: Python-prototype the nested s×t + delta-tail against analytic Slater
-  integrals (e.g. the 1s self-repulsion 5ζ/8) first, pin the s-grid and node
-  counts, then implement a matrix-level STO basis on the existing engine.
-  User is interested in STOs *widely* — treat as a first-class basis type
-  alongside GTOs/NAOs, not a niche add-on.
+  grid mappings. The route is the integral transform (exact in the node limit)
+  with the delta-tail correction -- NOT a plain Gaussian fit of the Slater, which
+  is what makes it more exact and is the reason STOs are in scope where NAOs are
+  not (see M15). Plan: Python-prototype the nested s×t + delta-tail against
+  analytic Slater integrals (e.g. the 1s self-repulsion 5ζ/8) first, pin the
+  s-grid and node counts, then implement a matrix-level STO basis on the existing
+  engine. User is interested in STOs *widely* -- a first-class basis type
+  alongside GTOs, not a niche add-on.
 
 - **M17 — spin-orbit** (`soc.hpp`): 1e SO off moment+t-quad; 2e SO
   (SOMF/Breit-Pauli) as the new operator.

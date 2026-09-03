@@ -8,15 +8,20 @@
 
 #include "intti/threeel_ri.hpp"
 
+#ifdef INTTI_HAVE_QUADMATH
+#include <quadmath.h>
+#endif
+
 namespace {
 
 using intti::CartGauss;
 
 // Exact O(nao^6) reference: E3 = sum_{abcdef} G_abcdef D_ad D_be D_cf over the
 // unnormalised primitive orbitals (the same convention the RI path uses).
-double exact_e3(const std::vector<CartGauss<double>> &g, const std::vector<double> &D, int n,
-                const intti::TGrid<double> &grid) {
-  double E = 0;
+template <class Real>
+Real exact_e3(const std::vector<intti::CartGauss<Real>> &g, const std::vector<Real> &D, int n,
+              const intti::TGrid<Real> &grid) {
+  Real E = 0;
   for (int a = 0; a < n; ++a)
     for (int d = 0; d < n; ++d)
       for (int b = 0; b < n; ++b)
@@ -162,6 +167,37 @@ TEST(ThreeElRI, CholeskyAuxEnergyMatchesExact) {
     EXPECT_NEAR(Ecd, Eex, 1e-6 * std::abs(Eex)) << "p CD-aux energy != exact";
   }
 }
+
+TEST(ThreeElRI, CdEnergyLongDouble) {
+  // The CD-aux 3-body folding runs at long double end to end: precision-generic
+  // pivoted Cholesky (one-step, no LAPACK) + Jacobi metric solve.
+  using LD = long double;
+  auto grid = intti::make_tgrid(intti::coulomb<LD>());
+  auto orb = intti::make_basis<LD>(
+      {{1.0L, {0.0L, 0.0L, 0.0L}, 0}, {0.8L, {0.5L, 0.0L, 0.0L}, 0}, {1.3L, {0.0L, 0.4L, 0.0L}, 0}});
+  const std::vector<LD> D = {1.0L, 0.3L, 0.1L, 0.3L, 0.7L, 0.2L, 0.1L, 0.2L, 0.9L};
+  intti::CholeskyOptions<LD> opt;
+  opt.tau = 1e-14L;
+  const LD Ecd = intti::three_electron_energy_cd(orb, D, grid, opt, static_cast<LD>(1e-14L));
+  const LD Eex = exact_e3(intti::detail::shellbasis_to_cartgauss(orb), D, 3, grid);
+  EXPECT_LT(static_cast<double>(std::abs(Ecd - Eex)), 1e-9 * static_cast<double>(std::abs(Eex)));
+}
+
+#ifdef INTTI_HAVE_QUADMATH
+TEST(ThreeElRI, CdEnergyQuad) {
+  using Q = __float128;
+  auto q = [](const char *s) { return strtoflt128(s, nullptr); };
+  auto grid = intti::make_tgrid(intti::coulomb<Q>());
+  auto orb = intti::make_basis<Q>(
+      {{q("1.0"), {q("0"), q("0"), q("0")}, 0}, {q("0.8"), {q("0.5"), q("0"), q("0")}, 0}});
+  const std::vector<Q> D = {q("1.0"), q("0.3"), q("0.3"), q("0.7")};
+  intti::CholeskyOptions<Q> opt;
+  opt.tau = q("1e-28");
+  const Q Ecd = intti::three_electron_energy_cd(orb, D, grid, opt, q("1e-28"));
+  const Q Eex = exact_e3(intti::detail::shellbasis_to_cartgauss(orb), D, 2, grid);
+  EXPECT_LT(static_cast<double>(fabsq(Ecd - Eex)), 1e-12 * static_cast<double>(fabsq(Eex)));
+}
+#endif
 
 // Direct effective two-body Coulomb: J_mu nu = sum_{la si, c f} Db_la si Dc_c f
 // G_{mu la c, nu si f}, electron 2 contracted by Db and electron 3 by Dc.
