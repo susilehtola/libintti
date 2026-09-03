@@ -191,6 +191,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   span the pair block exactly, so the set spans rho_D to the CD threshold with
   O(rank) auxiliaries. Validated exact (tight tau) vs the direct sum, s and p.
 
+- **Precision-generic Cholesky** (`cholesky.hpp`): the one-step pivoted Cholesky
+  (ab|cd) ~= sum_J L_ab^J L_cd^J is LAPACK-free (pivoted recurrence + sqrt), so
+  `pivoted_cholesky` runs at float/double/long double (the batched-integral
+  scalars). two_step_cholesky's static_assert is relaxed to any such scalar and
+  its step 2 (dense S^{-1/2}, host LAPACK) is if-constexpr-guarded to
+  float/double, throwing for long double (which uses the one_step path).
+  Validated: long-double pivoted CD reconstructs the ERI to threshold.
+  __float128/MPFR still need the serial (non-batched) integral path.
+
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit
   once), so all NAO integrals reduce to GTO 2-/3-center RI; grid path kept as

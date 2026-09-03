@@ -104,8 +104,11 @@ CholeskyBasis<Real> two_step_cholesky(const PairTable<Real> &pairs,
                                       const TGrid<Real> &grid,
                                       QuartetWorkspace<Real> &ws,
                                       const CholeskyOptions<Real> &opt = {}) {
-  static_assert(std::is_same_v<Real, double> || std::is_same_v<Real, float>,
-                "two_step_cholesky requires float or double (host LAPACK)");
+  // Step 1 (the pivoted Cholesky, the one_step result) is LAPACK-free and works
+  // for any batch-integral scalar; only step 2's dense S^{-1/2} needs host
+  // LAPACK, so long double is supported via one_step (see below).
+  static_assert(kokkos_scalar_v<Real>,
+                "two_step_cholesky needs a batched-integral scalar (float/double/long double)");
   CholeskyBasis<Real> basis;
   const int npair = pairs.npair;
   basis.prod_offset.resize(npair + 1);
@@ -210,7 +213,10 @@ CholeskyBasis<Real> two_step_cholesky(const PairTable<Real> &pairs,
     return basis;
   }
 
-  // step 2: RI-style vector construction over the fixed pivot set
+  // step 2: RI-style vector construction over the fixed pivot set. Needs a
+  // dense S^{-1/2} (host LAPACK eigensolver), so it is float/double only; long
+  // double uses the LAPACK-free one_step path above.
+  if constexpr (std::is_same_v<Real, double> || std::is_same_v<Real, float>) {
   const int naux = basis.naux;
   if (naux == 0) return basis;
   // unique pivot pairs
@@ -275,6 +281,20 @@ CholeskyBasis<Real> two_step_cholesky(const PairTable<Real> &pairs,
   detail::gemm_nn(nprod, naux, naux, M.data(), nprod, Shalf.data(), naux,
                   basis.L.data(), nprod);
   return basis;
+  } else {
+    throw std::runtime_error("two_step_cholesky: the two-step S^{-1/2} path needs "
+                             "float/double LAPACK; pass one_step=true for long double");
+  }
+}
+
+/// Precision-generic pivoted Cholesky of the ERI over a shell-pair set: the
+/// LAPACK-free one-step decomposition (ab|cd) ~= sum_J L_ab^J L_cd^J. Works for
+/// float/double/long double (the batched-integral scalars); no host eigensolver.
+template <class Real>
+CholeskyBasis<Real> pivoted_cholesky(const PairTable<Real> &pairs, const TGrid<Real> &grid,
+                                     QuartetWorkspace<Real> &ws, CholeskyOptions<Real> opt = {}) {
+  opt.one_step = true;
+  return two_step_cholesky(pairs, grid, ws, opt);
 }
 
 } // namespace intti

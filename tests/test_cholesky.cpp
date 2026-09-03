@@ -112,4 +112,49 @@ TEST(Cholesky, TwoStepMatchesOneStep) {
   EXPECT_LT(maxdiff, 1e-10);
 }
 
+TEST(Cholesky, PivotedLongDoublePrecisionGeneric) {
+  // The one-step pivoted Cholesky is LAPACK-free, so it runs at long double
+  // (unavailable to the two-step S^{-1/2} path). It must reconstruct the ERG
+  // matrix to the threshold.
+  using LD = long double;
+  using ShellLD = intti::PrimitiveShell<LD>;
+  const std::vector<ShellLD> shells = {
+      {1.2L, {0.0L, 0.0L, 0.0L}, 0}, {0.3L, {0.0L, 0.0L, 0.0L}, 0},
+      {0.8L, {0.0L, 0.0L, 0.0L}, 1}, {1.5L, {0.0L, 0.0L, 1.4L}, 0},
+      {0.5L, {0.0L, 0.0L, 1.4L}, 1}, {0.9L, {0.0L, 0.0L, 1.4L}, 2},
+  };
+  std::vector<intti::ShellPair<LD>> pairs;
+  for (std::size_t i = 0; i < shells.size(); ++i)
+    for (std::size_t j = i; j < shells.size(); ++j)
+      pairs.push_back(intti::make_pair(shells[i], shells[j]));
+  auto tab = intti::make_pair_table(pairs);
+  auto grid = intti::make_tgrid(intti::coulomb<LD>());
+  intti::QuartetWorkspace<LD> ws;
+  intti::CholeskyOptions<LD> opt;
+  opt.tau = 1e-10L;
+  auto basis = intti::pivoted_cholesky(tab, grid, ws, opt);
+  ASSERT_GT(basis.naux, 0);
+  const int nprod = basis.nprod;
+  std::vector<LD> V(static_cast<std::size_t>(nprod) * nprod);
+  for (std::size_t ib = 0; ib < pairs.size(); ++ib)
+    for (std::size_t ik = 0; ik < pairs.size(); ++ik) {
+      const int nci = intti::ncart(pairs[ib].la) * intti::ncart(pairs[ib].lb);
+      const int nck = intti::ncart(pairs[ik].la) * intti::ncart(pairs[ik].lb);
+      std::vector<LD> block(nci * nck);
+      intti::eri_quartet(pairs[ib], pairs[ik], grid, block.data());
+      for (int ci = 0; ci < nci; ++ci)
+        for (int ck = 0; ck < nck; ++ck)
+          V[(basis.prod_offset[ib] + ci) + static_cast<std::size_t>(nprod) * (basis.prod_offset[ik] + ck)] =
+              block[ci * nck + ck];
+    }
+  LD maxerr = 0;
+  for (int i = 0; i < nprod; ++i)
+    for (int j = 0; j < nprod; ++j) {
+      LD lij = 0;
+      for (int J = 0; J < basis.naux; ++J) lij += basis.L(i, J) * basis.L(j, J);
+      maxerr = std::max(maxerr, std::abs(lij - V[i + static_cast<std::size_t>(nprod) * j]));
+    }
+  EXPECT_LT(static_cast<double>(maxerr), 1e-9) << "long double pivoted CD reconstruction";
+}
+
 } // namespace
