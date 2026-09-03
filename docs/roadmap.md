@@ -239,8 +239,22 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   whose e^{-kappa^2/4t^2} factor kills the slow small-t tail, so both ends decay
   and the sinc rule is cleanly exponential (validated: Yukawa kernel reproduced
   to 1e-9). erf/erfc have a hard boundary at omega where the integrand is nonzero
-  -- the trapezoidal rule is only O(h^2) there -- so ExpSum refuses them; Mobius
-  (Gauss-Legendre, spectral on the finite/shifted range) is the tool for those.
+  -- the trapezoidal rule is only O(h^2) there -- so ExpSum refuses them.
+
+  The double-exponential (tanh-sinh) mapping is done for erf/erfc
+  (`TMapping::DoubleExp`, `de_spec_for_range`), the DFT-relevant range-separated
+  kernels. tanh-sinh sends the omega boundary to a doubly-exponentially clustered
+  endpoint, restoring spectral convergence across it. erf = int_0^omega integrates
+  the finite interval directly (spectral: ~80 nodes to machine precision). erfc =
+  int_omega^inf substitutes t = omega e^v to map the half-line onto v in [0,
+  v_max]; in the log variable the Gaussian's transition at t ~ 1/r has an
+  r-independent width, so one grid resolves every r (a linear map over [omega,
+  t_max], or exp-sinh, spreads the far nodes too fast and under-resolves small r).
+  erfc is the limiting case (its wide v-interval converges slower than erf's narrow
+  one): de_spec_for_range sizes de_h=0.028 and de_tmax=12 sqrt(alpha_max) for the
+  erfc grid, giving < 1e-9 over ~8 exponent decades at ~285 nodes (erf reuses the
+  spec and is over-resolved to machine precision; an erf-only caller can pass a
+  coarser de_h). Validated vs std::erf/erfc across r in [1e-3, 1e1].
 
 - **M15 — NAO support: OUT OF SCOPE (dropped).** libintti does everything
   natively in GTOs; the STO path earns its place because it is the *integral

@@ -195,9 +195,27 @@ TEST(TGrid, ExpSumYukawaPointwise) {
         << "r=" << r << " n=" << grid.n();
 }
 
+TEST(TGrid, DoubleExpErfErfcWideRange) {
+  // The tanh-sinh DE grids reproduce erf/erfc across a wide r-range, where the
+  // plain sinc/ExpSum rule is only O(h^2) (nonzero integrand at the omega
+  // boundary). erf uses the finite interval [0, omega] directly; erfc the log
+  // map t = omega*e^v. Sized from the exponent span.
+  const double omega = 0.7;
+  auto erf_de = intti::make_tgrid(intti::erf_rs(omega), intti::de_spec_for_range(1e-2, 1e6));
+  auto erfc_de = intti::make_tgrid(intti::erfc_rs(omega), intti::de_spec_for_range(1e-2, 1e6));
+  double err_erf = 0, err_erfc = 0;
+  for (double r : {1e-3, 1e-2, 1e-1, 1e0, 3e0, 1e1}) {
+    const double ref_e = std::erf(omega * r) / r, ref_c = std::erfc(omega * r) / r;
+    err_erf = std::max(err_erf, std::abs(kernel_quad(erf_de, r) - ref_e) / std::abs(ref_e));
+    err_erfc = std::max(err_erfc, std::abs(kernel_quad(erfc_de, r) - ref_c) / std::abs(ref_c));
+  }
+  EXPECT_LT(err_erf, 1e-9) << "erf DE (n=" << erf_de.n() << ")";
+  EXPECT_LT(err_erfc, 1e-9) << "erfc DE (n=" << erfc_de.n() << ")";
+}
+
 TEST(TGrid, ExpSumRejectsRangeSeparated) {
   // erf/erfc have a hard boundary at omega (only O(h^2) for the sinc rule), so
-  // the ExpSum mapping refuses them -- Mobius (Gauss-Legendre) is the tool there.
+  // the ExpSum mapping refuses them -- DoubleExp (tanh-sinh) is the tool there.
   intti::TGridSpec<double> spec;
   spec.mapping = intti::TMapping::ExpSum;
   EXPECT_THROW(intti::make_tgrid(intti::erf_rs(0.7), spec), std::invalid_argument);

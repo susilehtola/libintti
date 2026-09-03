@@ -42,7 +42,18 @@ namespace intti {
 /// tail growth. For [0, inf) kernels with tail decay -- Coulomb and Yukawa (whose
 /// e^{-kappa^2/4t^2} factor even kills the slow small-t tail). erf/erfc have a
 /// hard boundary at omega (only O(h^2) for the sinc rule) -- use Mobius there.
-enum class TMapping { Mobius, LinLog, ExpSum };
+/// DoubleExp: double-exponential (tanh-sinh) quadrature for the range-separated
+/// kernels erf and erfc, whose integrands have a hard boundary at t = omega
+/// where the integrand is nonzero (only O(h^2) for the plain sinc/ExpSum rule).
+/// tanh-sinh sends that boundary to a doubly-exponentially clustered endpoint,
+/// restoring spectral convergence across it. erf integrates the finite interval
+/// [0, omega] directly; erfc substitutes t = omega*e^v to map [omega, inf) onto
+/// v in [0, v_max] (v_max = log(de_tmax/omega)), where the Gaussian's transition
+/// at t ~ 1/r has an r-independent width, so one grid resolves every r. Nodes are
+/// uniform in the DE variable x with step de_h, |x| <= de_xmax. erf converges far
+/// faster than erfc (finite narrow interval), so a coarser de_h suffices when
+/// only the erf grid is needed; de_spec_for_range sizes de_h for the erfc case.
+enum class TMapping { Mobius, LinLog, ExpSum, DoubleExp };
 
 template <class Real = double> struct TGridSpec {
   TMapping mapping{TMapping::Mobius};
@@ -58,6 +69,10 @@ template <class Real = double> struct TGridSpec {
   Real es_tmin{Real(1e-2)}; ///< smallest quadrature node t
   Real es_tmax{Real(1e4)};  ///< largest quadrature node t
   Real es_h{Real(0.35)};    ///< trapezoidal spacing in s = log t
+  // DoubleExp (tanh-sinh) parameters
+  Real de_h{Real(0.028)};  ///< trapezoidal spacing in the DE variable x
+  Real de_xmax{Real(4)};   ///< |x| range of the DE variable
+  Real de_tmax{Real(1e6)}; ///< erfc log-map upper t (v_max = log(de_tmax/omega))
 };
 
 /// Quadrature grid in t. The weights include the overall 2/sqrt(pi) factor
@@ -164,6 +179,25 @@ TGridSpec<Real> exp_sum_spec_for_range(Real alpha_min, Real alpha_max, Real h = 
   return spec;
 }
 
+/// Double-exponential (tanh-sinh) TGridSpec for erf/erfc sized to a basis's
+/// exponent span. The DE map reaches arbitrarily small t (large r) through its
+/// doubly-exponential clustering, so only the erfc log-map upper t depends on the
+/// range: de_tmax ~ sqrt(alpha_max) sets v_max = log(de_tmax/omega), which must
+/// cover t ~ 6/r_min ~ 6*sqrt(alpha_max) (a 12x margin). de_h is the trapezoidal
+/// step (smaller -> more accurate, near-exponentially); the default resolves the
+/// erfc case to < 1e-9 over ~8 exponent decades. erf converges much faster and a
+/// caller building only the erf grid can pass a coarser h.
+template <class Real>
+TGridSpec<Real> de_spec_for_range(Real alpha_min, Real alpha_max, Real h = Real(0.028)) {
+  (void)alpha_min;
+  TGridSpec<Real> spec;
+  spec.mapping = TMapping::DoubleExp;
+  spec.de_h = h;
+  spec.de_xmax = Real(4);
+  spec.de_tmax = static_cast<Real>(std::sqrt(static_cast<double>(alpha_max)) * 12.0);
+  return spec;
+}
+
 template <class Real = double>
 TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec = {}) {
   const Real pi = pi_v<Real>();
@@ -230,6 +264,41 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
       Real wk = hh * t;                     // trapezoidal step times dt = t ds
       if (k == 0 || k == nn) wk *= Real(0.5); // trapezoidal endpoints
       grid.w.push_back(wk);
+    }
+    grid.t_c = Real(0);
+    grid.tail_coeff = Real(0);
+  } else if (spec.mapping == TMapping::DoubleExp) { // tanh-sinh / exp-sinh, erf/erfc
+    if (kernel.type != KernelType::Erf && kernel.type != KernelType::Erfc)
+      throw std::invalid_argument("DoubleExp supports erf/erfc; use ExpSum/Mobius for Coulomb/Yukawa");
+    if (kernel.omega <= Real(0)) throw std::invalid_argument("erf/erfc kernel needs omega > 0");
+    if (spec.de_h <= Real(0) || spec.de_xmax <= Real(0))
+      throw std::invalid_argument("DoubleExp needs de_h > 0 and de_xmax > 0");
+    // tanh-sinh: the boundary at t = omega (where the integrand is nonzero)
+    // becomes a doubly-exponentially clustered endpoint, giving convergence a
+    // trapezoidal (ExpSum) rule cannot reach there (only O(h^2)).
+    //   erf  = int_0^omega e^{-t^2 r^2} dt: tanh-sinh linear in t on [0, omega]
+    //     (a finite range, so the map needs no stretch).
+    //   erfc = int_omega^inf e^{-t^2 r^2} dt: substitute t = omega*e^v so the
+    //     half-line becomes v in [0, v_max]. The Gaussian's transition at t ~ 1/r
+    //     has an r-independent width in the log variable v, so one uniform DE
+    //     grid resolves every r; a linear map over [omega, t_max] would not.
+    const Real halfpi = pi / 2;
+    const bool log_map = kernel.type == KernelType::Erfc;
+    const Real omega = kernel.omega;
+    const Real hi = log_map ? log_(spec.de_tmax / omega) : omega; // v_max or omega
+    const Real mid = hi / 2, halfw = hi / 2;
+    const int M = static_cast<int>(spec.de_xmax / spec.de_h);
+    for (int k = -M; k <= M; ++k) {
+      const Real x = Real(k) * spec.de_h;
+      const Real ex = exp_(x), ch = (ex + 1 / ex) / 2;         // cosh(x)
+      const Real phi = halfpi * (ex - 1 / ex) / 2;             // (pi/2) sinh(x)
+      const Real ep = exp_(phi), u = (ep - 1 / ep) / (ep + 1 / ep); // tanh(phi)
+      const Real q = mid + halfw * u;                    // v (log) or t (linear)
+      const Real dqdx = halfw * (1 - u * u) * halfpi * ch;
+      const Real t = log_map ? omega * exp_(q) : q;
+      const Real dtdx = log_map ? t * dqdx : dqdx; // chain rule for t = omega*e^v
+      grid.t.push_back(t);
+      grid.w.push_back(spec.de_h * dtdx);
     }
     grid.t_c = Real(0);
     grid.tail_coeff = Real(0);
