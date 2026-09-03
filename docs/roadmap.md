@@ -392,6 +392,50 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   real GPU elsewhere. Also: minimax/Beylkin–Monzón t-grid and STO weight
   optimization via the arbitrary-precision core.
 
+- **M-SHARK — BLAS-3 factorization, LKC architecture, digestion**
+  (techniques from Neese, *J. Comput. Chem.* 2023, 44, 381, "The SHARK integral
+  generation and digestion system"; ideas/architecture only, ORCA/SHARK is not
+  open — do not copy code). Five items, in recommended order 2 -> 1 -> 3, then
+  4, 5:
+
+  1. **BLAS-3 (GEMM) factorization of the contraction** (SHARK Eq 21, 25-26) --
+     the headline performance item, = the M18 "batched-GEMM." Recast the
+     per-quartet Hermite contraction as matrix multiplications. It fits the
+     universal t-grid unusually well: the shared t-nodes are a natural batch/
+     matrix dimension, and the per-t-node Hermite integrals (`hermite_b`) play
+     SHARK's R-matrix role, so phase G becomes G_d = fh_d^T B_d (per direction,
+     ncomb x nf times nf x nt -> ncomb x nt) and the assembly is a t-weighted
+     contraction of G_x G_y G_z. Replaces the hand-written loops in
+     quartet.hpp/batch.hpp; drives peak vendor BLAS on any hardware.
+  2. **Loop/Kernel/Consumer (LKC) architecture** (SHARK Sec 3.10) -- one
+     IntegralLoop, pluggable Kernels (operators) x Consumers (tasks: J, K,
+     gradient, transformation), to consolidate the builder sprawl
+     (jbuild/kbuild/coulomb_build/exchange_build/nuclear/ncenter/threeel). Our
+     "operators = node lists" already unifies the KERNEL side more elegantly
+     than SHARK's per-kernel functions, so the work is mainly the CONSUMER
+     (digestion) abstraction. Do this first: it is the seam #1 and #3 slot into.
+  3. **Digestion / permutational-redundancy** (SHARK Sec 3.6, Eq 29-37) -- the
+     rewrite SHARK credits with ~an order of magnitude on many-density tasks.
+     Exploit full 8-fold symmetry with the redundancy factor
+     (1/(1+d_mn))(1/(1+d_kt))(1 - 1/2 d_mn,kt), sub-block J/K assembly, cache
+     blocked. Audit whether our J/K builders capture this beyond the current
+     D_ij + D_ji fold.
+  4. **Helgaker-Taylor D,P derivative reformulation** (SHARK Eq 55-60): shift to
+     (D = R_A - R_B, P) so a derivative increments the Hermite order with no
+     incremented sums (dOmega/dP = sum E^t Lambda_{t+1}), then map back to A,B.
+     A cleaner/faster recursion than the center-shift in deriv.hpp/geoderiv.hpp
+     (efficiency, not a correctness gap).
+  5. **General & partial-general contraction** (SHARK Sec 3.3-3.4): "giant"
+     E-matrices per atom+angular-momentum GEMM-contracted; PGC via
+     decontract -> recontract. Needed for efficiency on real def2/ANO basis sets
+     (we have no contraction strategy yet).
+
+  Note where we are AHEAD of SHARK and must not regress: range separation is a
+  node-list (erf/erfc/Yukawa) with native position-dependent omega(r) for local
+  hybrids -- SHARK's Boys-based route cannot easily do that; plus arbitrary
+  precision and the higher-order delta tail. The factorization idea transfers,
+  the Boys machinery does not.
+
 - **M-QUAD — optimal Losilla tuning** (higher-order delta tail done; minimax
   node placement open). Use as small a truncation t_c as possible so the
   explicit t-quadrature covers only the expensive dense small-t region, pushing
