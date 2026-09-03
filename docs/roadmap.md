@@ -224,9 +224,17 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (decades/10)^2.5 (a single Mobius map's tails thin out superlinearly with the
   span), with s tracking the geometric-mean exponent. Opt-in; the default spec
   is unchanged. Validated vs analytic (ss|ss) across [1e-5, 1e9] (14 decades) to
-  <1e-7 where the default is off by ~4e-3. Future: a Beylkin-Monzon
-  (exponential-sum/sinc) mapping is provably near-optimal for 1/r over a finite
-  range -- fewer nodes at wide spans -- and slots in as a new TMapping.
+  <1e-7 where the default is off by ~4e-3.
+
+  The Beylkin-Monzon / sinc mapping is done (`TMapping::ExpSum`,
+  `exp_sum_spec_for_range`): substituting t = e^s in the Gaussian resolution and
+  applying the trapezoidal rule gives log-spaced nodes t_k = e^{s_k} with weight
+  (2/sqrt pi) h t_k, exponentially convergent. Its node count grows ~log(range),
+  not the Mobius map's (decades/10)^2.5, so it is more efficient at wide spans:
+  over [1e-5, 1e9] (14 decades) it matches accuracy (6.6e-9) at 161 nodes vs the
+  Mobius 208, and the gap widens with the range. The small-t (large-r) side has a
+  slow e^s tail needing a wide low-t margin (the large-t side cuts off
+  super-exponentially). Coulomb kernel only. Validated vs analytic (ss|ss).
 
 - **M15 — NAO support: OUT OF SCOPE (dropped).** libintti does everything
   natively in GTOs; the STO path earns its place because it is the *integral

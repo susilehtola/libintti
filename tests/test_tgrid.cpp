@@ -149,4 +149,34 @@ TEST(TGrid, AdaptiveRangeWideExponents) {
   EXPECT_GT(err_def, 1e-4) << "default grid should not cover this range (gap not exercised)";
 }
 
+TEST(TGrid, BeylkinMonzonFewerNodesThanMobius) {
+  // Over the same wide span, the Beylkin-Monzon (ExpSum) grid must be as
+  // accurate as the Mobius grid but with substantially fewer nodes (its node
+  // count grows logarithmically, not superlinearly, with the range).
+  using Shell = intti::PrimitiveShell<double>;
+  auto bm = intti::make_tgrid(intti::coulomb(), intti::exp_sum_spec_for_range(1e-5, 1e9));
+  auto mob = intti::make_tgrid(intti::coulomb(), intti::mobius_spec_for_range(1e-5, 1e9));
+  const std::vector<double> exps = {1e-5, 1e-2, 1e1, 1e4, 1e7, 1e9};
+  const double A[3] = {0, 0, 0}, B[3] = {0.3, 0.0, 0.0};
+  const double C[3] = {0.0, 0.4, 0.7}, D[3] = {0.1, 0.0, 0.0};
+  double err_bm = 0, err_mob = 0;
+  for (double a : exps)
+    for (double b : exps)
+      for (double c : exps)
+        for (double d : exps) {
+          Shell sa{a, {A[0], A[1], A[2]}, 0}, sb{b, {B[0], B[1], B[2]}, 0};
+          Shell sc{c, {C[0], C[1], C[2]}, 0}, sd{d, {D[0], D[1], D[2]}, 0};
+          const double ref = ssss_analytic(a, A, b, B, c, C, d, D);
+          if (std::abs(ref) < 1e-290) continue;
+          double vb = 0, vm = 0;
+          intti::eri_quartet(intti::make_pair(sa, sb), intti::make_pair(sc, sd), bm, &vb);
+          intti::eri_quartet(intti::make_pair(sa, sb), intti::make_pair(sc, sd), mob, &vm);
+          err_bm = std::max(err_bm, std::abs((vb - ref) / ref));
+          err_mob = std::max(err_mob, std::abs((vm - ref) / ref));
+        }
+  EXPECT_LT(err_bm, 1e-7) << "BM grid inaccurate (n=" << bm.n() << ")";
+  EXPECT_LT(err_mob, 1e-7) << "Mobius control inaccurate (n=" << mob.n() << ")";
+  EXPECT_LT(bm.n(), mob.n()) << "BM should need fewer nodes: bm=" << bm.n() << " mob=" << mob.n();
+}
+
 } // namespace

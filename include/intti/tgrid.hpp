@@ -33,7 +33,14 @@ namespace intti {
 /// four-orbital overlap for an ERI quartet), turning the O(1/t_c^2)
 /// truncation error into O(1/t_c^4). Use this mapping when t_c is imposed
 /// externally, e.g. by the spatial resolution of a real-space grid.
-enum class TMapping { Mobius, LinLog };
+/// ExpSum: the Beylkin-Monzon / sinc quadrature for 1/r. Substituting t = e^s in
+/// 1/r = (2/sqrt pi) int e^{-t^2 r^2} dt gives (2/sqrt pi) int e^{s - e^{2s} r^2}
+/// ds; the trapezoidal rule on the (analytic, doubly-exponentially decaying)
+/// integrand converges exponentially and is near-optimal for 1/r over a finite
+/// range -- log-spaced nodes t_k = e^{s_k} with weight (2/sqrt pi) h t_k. Node
+/// count grows only ~log(range)*log(1/eps), unlike the Mobius map's superlinear
+/// tail growth. Coulomb kernel only.
+enum class TMapping { Mobius, LinLog, ExpSum };
 
 template <class Real = double> struct TGridSpec {
   TMapping mapping{TMapping::Mobius};
@@ -45,6 +52,10 @@ template <class Real = double> struct TGridSpec {
   int n_lin{50}; ///< nodes on the linear panel
   int n_log{80}; ///< nodes on the logarithmic panel
   Real t_c{60};  ///< truncation point of infinite-range kernels
+  // ExpSum (Beylkin-Monzon / sinc) parameters
+  Real es_tmin{Real(1e-2)}; ///< smallest quadrature node t
+  Real es_tmax{Real(1e4)};  ///< largest quadrature node t
+  Real es_h{Real(0.35)};    ///< trapezoidal spacing in s = log t
 };
 
 /// Quadrature grid in t. The weights include the overall 2/sqrt(pi) factor
@@ -134,6 +145,23 @@ TGridSpec<Real> mobius_spec_for_range(Real alpha_min, Real alpha_max, double pad
   return spec;
 }
 
+/// Beylkin-Monzon / sinc (ExpSum) TGridSpec for the Coulomb kernel sized to a
+/// basis's exponent span. Log-spaced nodes cover t ~ [sqrt(alpha_min),
+/// sqrt(alpha_max)] with margins for the integrand tails; `h` is the trapezoidal
+/// spacing (smaller -> more accurate, exponentially). Node count grows only
+/// logarithmically with the range, so it beats the Mobius map at wide spans.
+template <class Real>
+TGridSpec<Real> exp_sum_spec_for_range(Real alpha_min, Real alpha_max, Real h = Real(0.25)) {
+  TGridSpec<Real> spec;
+  spec.mapping = TMapping::ExpSum;
+  // The small-t (large-r) side has a slow e^s tail, so it needs a wide margin;
+  // the large-t (small-r) side cuts off super-exponentially, so a modest one.
+  spec.es_tmin = static_cast<Real>(std::sqrt(static_cast<double>(alpha_min)) * 1e-9);
+  spec.es_tmax = static_cast<Real>(std::sqrt(static_cast<double>(alpha_max)) * 30.0);
+  spec.es_h = h;
+  return spec;
+}
+
 template <class Real = double>
 TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec = {}) {
   const Real pi = pi_v<Real>();
@@ -173,6 +201,22 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
     }
     }
     // untruncated (or exactly finite): no tail correction
+    grid.t_c = Real(0);
+    grid.tail_coeff = Real(0);
+  } else if (spec.mapping == TMapping::ExpSum) { // Beylkin-Monzon / sinc, Coulomb only
+    if (kernel.type != KernelType::Coulomb)
+      throw std::invalid_argument("ExpSum mapping is implemented for the Coulomb kernel only");
+    if (spec.es_tmin <= Real(0) || spec.es_tmax <= spec.es_tmin || spec.es_h <= Real(0))
+      throw std::invalid_argument("ExpSum needs 0 < es_tmin < es_tmax and es_h > 0");
+    const Real smin = log_(spec.es_tmin), smax = log_(spec.es_tmax);
+    const int nn = static_cast<int>((smax - smin) / spec.es_h) + 1;
+    grid.t.reserve(nn);
+    grid.w.reserve(nn);
+    for (int k = 0; k < nn; ++k) {
+      const Real t = exp_(smin + Real(k) * spec.es_h);
+      grid.t.push_back(t);
+      grid.w.push_back(spec.es_h * t); // trapezoidal step times the jacobian dt = t ds
+    }
     grid.t_c = Real(0);
     grid.tail_coeff = Real(0);
   } else { // TMapping::LinLog
