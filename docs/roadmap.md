@@ -395,8 +395,13 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
 - **M-SHARK — BLAS-3 factorization, LKC architecture, digestion**
   (techniques from Neese, *J. Comput. Chem.* 2023, 44, 381, "The SHARK integral
   generation and digestion system"; ideas/architecture only, ORCA/SHARK is not
-  open — do not copy code). Five items, in recommended order 2 -> 1 -> 3, then
-  4, 5:
+  open — do not copy code). Five items. Assessment after measuring: **#1 and #3
+  DO NOT apply** to our t-quadrature J-engine (both optimize SHARK's
+  explicit-integral MD architecture; ours is already integral-free -- see the
+  per-item notes). #1 is at best a future GPU item gated on batched-GEMM infra.
+  The applicable, realizable items are **#2** (LKC -- maintainability), **#4**
+  (Helgaker-Taylor derivatives -- a real algorithmic win), and **#5** (general
+  contraction -- needed for def2/ANO). Recommended order now: 2 -> 4 -> 5.
 
   1. **BLAS-3 (GEMM) factorization of the contraction** (SHARK Eq 21, 25-26) --
      the headline performance item, = the M18 "batched-GEMM." Recast the
@@ -436,12 +441,21 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      "operators = node lists" already unifies the KERNEL side more elegantly
      than SHARK's per-kernel functions, so the work is mainly the CONSUMER
      (digestion) abstraction. Do this first: it is the seam #1 and #3 slot into.
-  3. **Digestion / permutational-redundancy** (SHARK Sec 3.6, Eq 29-37) -- the
-     rewrite SHARK credits with ~an order of magnitude on many-density tasks.
-     Exploit full 8-fold symmetry with the redundancy factor
-     (1/(1+d_mn))(1/(1+d_kt))(1 - 1/2 d_mn,kt), sub-block J/K assembly, cache
-     blocked. Audit whether our J/K builders capture this beyond the current
-     D_ij + D_ji fold.
+  3. **Digestion / permutational-redundancy** (SHARK Sec 3.6, Eq 29-37) --
+     ANALYSED, DOES NOT APPLY to our J-engine. SHARK's digestion redundancy
+     de-duplicates EXPLICIT integrals; jbuild is a J-engine that never forms
+     them -- it fuses the Hermite-Coulomb coupling (the hermite_b B arrays) with
+     the density contraction (t1/t2/jp stages). The bra-ket symmetry (p|q)=(q|p)
+     makes only the B arrays shareable across (p,q)/(q,p); the dominant
+     contraction is density-specific (dq(q)->jp(p) vs dq(p)->jp(q)) and cannot be
+     shared. Measured (`prototype/jengine_digest_bench.cpp`): B is 0.8-2.5% of the
+     per-node cost (contraction 97.5-99.2%), so a triangular+atomic-scatter
+     version saves ~1-2% AT BEST and the atomics would erase it. So #3 is not
+     worth doing -- the same conclusion as #1: SHARK's #1 (BLAS-3) and #3
+     (digestion) both optimize its explicit-integral MD architecture, while our
+     t-quadrature J-engine is already integral-free, past the regime they
+     optimize. (Where #3 could ever apply -- the explicit-integral consumers
+     schwarz/cholesky via eri_quartets -- those are not the Fock hot path.)
   4. **Helgaker-Taylor D,P derivative reformulation** (SHARK Eq 55-60): shift to
      (D = R_A - R_B, P) so a derivative increments the Hermite order with no
      incremented sums (dOmega/dP = sum E^t Lambda_{t+1}), then map back to A,B.
