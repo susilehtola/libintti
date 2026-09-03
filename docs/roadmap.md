@@ -197,8 +197,13 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   scalars). two_step_cholesky's static_assert is relaxed to any such scalar and
   its step 2 (dense S^{-1/2}, host LAPACK) is if-constexpr-guarded to
   float/double, throwing for long double (which uses the one_step path).
-  Validated: long-double pivoted CD reconstructs the ERI to threshold.
-  __float128/MPFR still need the serial (non-batched) integral path.
+  Validated: long-double pivoted CD reconstructs the ERI to threshold. For
+  __float128 / MPFR (which the Kokkos batch path rejects), a serial pivoted
+  Cholesky drives the single-quartet eri_quartet() host path directly (no
+  PairTable, no LAPACK); `pivoted_cholesky` over a shell-pair list dispatches to
+  the batched path for kokkos scalars and the serial path otherwise -- one entry,
+  all precisions. Validated: the serial path matches the batched at double, and
+  reconstructs the ERI far below the double floor at __float128.
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

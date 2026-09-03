@@ -297,4 +297,100 @@ CholeskyBasis<Real> pivoted_cholesky(const PairTable<Real> &pairs, const TGrid<R
   return two_step_cholesky(pairs, grid, ws, opt);
 }
 
+namespace detail {
+/// Serial pivoted Cholesky driven by the single-quartet eri_quartet() host
+/// path -- no batch, no LAPACK -- so it runs at ANY real scalar, including
+/// __float128 / MPFR wrappers that the Kokkos batch path (PairTable) rejects.
+/// Same pivoted recurrence as two_step_cholesky's step 1.
+template <class Real>
+CholeskyBasis<Real> pivoted_cholesky_serial(const std::vector<ShellPair<Real>> &pairs,
+                                            const TGrid<real_t<Real>> &grid,
+                                            const CholeskyOptions<Real> &opt) {
+  CholeskyBasis<Real> basis;
+  const int npair = static_cast<int>(pairs.size());
+  auto pn = [&](int ip) { return ncart(pairs[ip].la) * ncart(pairs[ip].lb); };
+  basis.prod_offset.assign(npair + 1, 0);
+  for (int ip = 0; ip < npair; ++ip) basis.prod_offset[ip + 1] = basis.prod_offset[ip] + pn(ip);
+  const int nprod = basis.prod_offset[npair];
+  basis.nprod = nprod;
+  // diagonal D_ab = (ab|ab)
+  std::vector<Real> D(nprod);
+  for (int ip = 0; ip < npair; ++ip) {
+    const int nc = pn(ip);
+    std::vector<Real> blk(static_cast<std::size_t>(nc) * nc);
+    eri_quartet(pairs[ip], pairs[ip], grid, blk.data());
+    for (int c = 0; c < nc; ++c) D[basis.prod_offset[ip] + c] = blk[c * nc + c];
+  }
+  std::vector<std::vector<Real>> Lcols;
+  std::vector<std::pair<int, int>> pivots;
+  while (true) {
+    int jglob = -1;
+    Real dmax = opt.tau;
+    for (int i = 0; i < nprod; ++i)
+      if (D[i] > dmax) { dmax = D[i]; jglob = i; }
+    if (jglob < 0) break;
+    int jp = 0;
+    while (basis.prod_offset[jp + 1] <= jglob) ++jp;
+    const int ncj = pn(jp);
+    // (ab | jp,*) blocks for every pair ab, once for this pivot pair
+    std::vector<std::vector<Real>> colblk(npair);
+    for (int ip = 0; ip < npair; ++ip) {
+      colblk[ip].resize(static_cast<std::size_t>(pn(ip)) * ncj);
+      eri_quartet(pairs[ip], pairs[jp], grid, colblk[ip].data());
+    }
+    std::vector<int> order(ncj);
+    for (int c = 0; c < ncj; ++c) order[c] = c;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+      return D[basis.prod_offset[jp] + a] > D[basis.prod_offset[jp] + b];
+    });
+    for (int jc : order) {
+      const int j = basis.prod_offset[jp] + jc;
+      if (D[j] <= opt.tau) continue;
+      std::vector<Real> col(nprod);
+      for (int ip = 0; ip < npair; ++ip) {
+        const int nci = pn(ip);
+        for (int c = 0; c < nci; ++c) col[basis.prod_offset[ip] + c] = colblk[ip][c * ncj + jc];
+      }
+      for (const auto &Lk : Lcols) {
+        const Real ljk = Lk[j];
+        for (int i = 0; i < nprod; ++i) col[i] -= Lk[i] * ljk;
+      }
+      const Real diag = col[j];
+      if (diag <= opt.tau) { D[j] = 0; continue; }
+      const Real inv = Real(1) / sqrt_(diag);
+      for (int i = 0; i < nprod; ++i) col[i] *= inv;
+      for (int i = 0; i < nprod; ++i) {
+        D[i] -= col[i] * col[i];
+        if (D[i] < Real(0)) D[i] = 0;
+      }
+      pivots.push_back({jp, jc});
+      Lcols.push_back(std::move(col));
+    }
+  }
+  basis.pivots = pivots;
+  basis.naux = static_cast<int>(pivots.size());
+  basis.L = Kokkos::View<Real **, Kokkos::LayoutLeft, Kokkos::HostSpace>("intti::chol::Lserial",
+                                                                         nprod, basis.naux);
+  for (int J = 0; J < basis.naux; ++J)
+    for (int i = 0; i < nprod; ++i) basis.L(i, J) = Lcols[J][i];
+  return basis;
+}
+} // namespace detail
+
+/// Precision-generic pivoted Cholesky over a shell-pair list: dispatches to the
+/// batched path for kokkos scalars (float/double/long double) and to the serial
+/// eri_quartet path otherwise (__float128 / MPFR). Single entry, all precisions.
+template <class Real>
+CholeskyBasis<Real> pivoted_cholesky(const std::vector<ShellPair<Real>> &pairs,
+                                     const TGrid<real_t<Real>> &grid,
+                                     const CholeskyOptions<Real> &opt = {}) {
+  if constexpr (kokkos_scalar_v<Real>) {
+    auto tab = make_pair_table(pairs);
+    QuartetWorkspace<Real> ws;
+    return pivoted_cholesky(tab, grid, ws, opt);
+  } else {
+    return detail::pivoted_cholesky_serial(pairs, grid, opt);
+  }
+}
+
 } // namespace intti
