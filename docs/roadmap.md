@@ -407,6 +407,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      ncomb x nf times nf x nt -> ncomb x nt) and the assembly is a t-weighted
      contraction of G_x G_y G_z. Replaces the hand-written loops in
      quartet.hpp/batch.hpp; drives peak vendor BLAS on any hardware.
+     Validated (`prototype/gemm_factorization.cpp`): the GEMM path matches
+     eri_quartet to 2.3e-16 across s/p/d/mixed. Benchmarked
+     (`prototype/gemm_bench.cpp`, per-quartet single GEMMs, nt=64, this CPU box):
+     GEMM LOSES at low L (ss 0.58x, ps 0.80x -- dgemm overhead on tiny matrices)
+     and WINS 1.4-2.9x for l_tot >= 2 (ncomb >= 4), rising to 2.9x for ff --
+     exactly SHARK's low-L caveat. So the integration is a HYBRID: hand loops for
+     l_tot <= 1 (ncomb <= 2), GEMM for l_tot >= 2. Batching quartets into larger
+     GEMMs would push the crossover lower still. NOTE: BLAS is a host call, so on
+     GPU backends this needs a batched device GEMM (cuBLAS/rocBLAS/KokkosKernels);
+     CPU (OpenMP/Serial) backends call BLAS on the host-resident Views directly.
   2. **Loop/Kernel/Consumer (LKC) architecture** (SHARK Sec 3.10) -- one
      IntegralLoop, pluggable Kernels (operators) x Consumers (tasks: J, K,
      gradient, transformation), to consolidate the builder sprawl
