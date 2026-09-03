@@ -348,9 +348,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   form ((nabla^2)^k V_B = -4 pi (nabla^2)^{k-1} rho_B, and (nabla^2)^j e^{-kr} =
   (k^{2j} - 2j k^{2j-1}/r) e^{-kr}). Validated: R=0 exact, and two-centre order 2
   is ~1e4x tighter than order 0 (t_c=6: 1.8e-4 -> 1.4e-8), each order removing a
-  1/t_c^2 factor. Remaining for a production matrix J: the l>0 pair densities and
-  the matrix assembly ((ab|cd) = pair-pair Coulomb scattered into J, with Schwarz
-  screening still the exact cost control meanwhile). An STO is the exact
+  1/t_c^2 factor. The l>0 pair-density tail's key enabler is done -- arbitrary
+  Cartesian derivatives of the Slater potential (`detail::radial_cart_deriv` +
+  `slater_pot_radial_derivs`), validated to 1e-12 vs a SymPy oracle -- so an l>0
+  pair density's multipole tail interacting with a 1s density is
+  sum_p W_ab^{(p)} d^{dP+2p} V_cd(A), reusing sto_tail_weight_comp_p. Remaining for
+  a production matrix J: assemble that cross term (p-type-density Coulomb
+  reference via the ghost/centre-differentiated ss Coulomb) and the l>0 x l>0 case
+  (non-spherical V_ab), then the matrix assembly ((ab|cd) = pair-pair Coulomb
+  scattered into J, with Schwarz screening still the exact cost control
+  meanwhile). An STO is the exact
   integral transform of a Gaussian,
   `e^{-ζr} = (ζ/2√π) ∫₀^∞ s^{-3/2} e^{-ζ²/4s} e^{-s r²} ds`,
   i.e. a **quadrature-contracted GTO** over an auxiliary radial variable s.

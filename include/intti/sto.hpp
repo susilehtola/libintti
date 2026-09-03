@@ -541,6 +541,81 @@ template <class Real> Real sto_coulomb_1c(Real zA, Real zB) {
   const Real s = zA + zB;
   return zA - zA * zA * zA / (s * s) - zA * zA * zA * zB / (s * s * s);
 }
+
+/// Radial derivatives f_k = (1/R d/dR)^k V(R) of the 1s Slater potential
+/// V(R) = 1/R - (1/R + zeta) e^{-2 zeta R}, k = 0..K into out. Coefficient
+/// recurrence on the form a_n R^{-n} + (b_n R^{-n}) e^{-2 zeta R}, where
+/// (1/R d/dR) sends R^{-n} -> -n R^{-n-2} and R^{-n} e^{-2zR} ->
+/// (-n R^{-n-2} - 2z R^{-n-1}) e^{-2zR}. These f_k feed radial_cart_deriv to give
+/// arbitrary Cartesian derivatives of V(|r-C|), the l>0 pair-density tail needs.
+template <class Real>
+void slater_pot_radial_derivs(Real zeta, Real R, int K, Real *out) {
+  std::vector<Real> a(2 * K + 4, Real(0)), b(2 * K + 4, Real(0));
+  a[1] = 1;
+  b[1] = -1;
+  b[0] = -zeta;
+  const Real e = std::exp(-2 * zeta * R);
+  auto eval = [&](const std::vector<Real> &aa, const std::vector<Real> &bb) {
+    Real v = 0, ve = 0;
+    for (int n = 0; n < static_cast<int>(aa.size()); ++n)
+      if (aa[n] != Real(0)) v += aa[n] * std::pow(R, -n);
+    for (int n = 0; n < static_cast<int>(bb.size()); ++n)
+      if (bb[n] != Real(0)) ve += bb[n] * std::pow(R, -n);
+    return v + ve * e;
+  };
+  out[0] = eval(a, b);
+  for (int k = 1; k <= K; ++k) {
+    std::vector<Real> na(a.size() + 2, Real(0)), nb(b.size() + 2, Real(0));
+    for (int n = 0; n < static_cast<int>(a.size()); ++n)
+      if (a[n] != Real(0)) na[n + 2] += -n * a[n];
+    for (int n = 0; n < static_cast<int>(b.size()); ++n)
+      if (b[n] != Real(0)) {
+        nb[n + 2] += -n * b[n];
+        nb[n + 1] += -2 * zeta * b[n];
+      }
+    a.swap(na);
+    b.swap(nb);
+    out[k] = eval(a, b);
+  }
+}
+
+/// Arbitrary Cartesian derivative d_x^{m0} d_y^{m1} d_z^{m2} of a radial function
+/// f(|r-C|) at offset u = r-C, given fk[k] = (1/R d/dR)^k f (from
+/// slater_pot_radial_derivs). Recurrence per applied d_d on terms (coeff, k,
+/// alpha): d_d[f_k u^alpha] = f_{k+1} u^{alpha+e_d} + alpha_d f_k u^{alpha-e_d}.
+template <class Real>
+Real radial_cart_deriv(const Real *fk, const Real u[3], const int m[3]) {
+  struct Term {
+    Real c;
+    int k, a[3];
+  };
+  std::vector<Term> terms = {{Real(1), 0, {0, 0, 0}}};
+  for (int d = 0; d < 3; ++d)
+    for (int rep = 0; rep < m[d]; ++rep) {
+      std::vector<Term> nt;
+      for (const auto &t : terms) {
+        Term t1 = t;
+        t1.k += 1;
+        t1.a[d] += 1;
+        nt.push_back(t1);
+        if (t.a[d] >= 1) {
+          Term t2 = t;
+          t2.c *= t.a[d];
+          t2.a[d] -= 1;
+          nt.push_back(t2);
+        }
+      }
+      terms.swap(nt);
+    }
+  Real val = 0;
+  for (const auto &t : terms) {
+    Real um = 1;
+    for (int d = 0; d < 3; ++d)
+      for (int j = 0; j < t.a[d]; ++j) um *= u[d];
+    val += t.c * fk[t.k] * um;
+  }
+  return val;
+}
 } // namespace detail
 
 /// Symmetric two-electron delta-tail (rho_A|rho_B) of two 1s Slater densities

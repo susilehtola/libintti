@@ -75,6 +75,30 @@ check("1-centre 2-density Coulomb  zA - zA^3/s^2 - zA^3 zB/s^3", J1c, J1c_form)
 check("... symmetric in A,B", J1c_form, J1c_form.subs({zA: zB, zB: zA}, simultaneous=True))
 check("... equal exponents = 5z/8", J1c_form.subs(zB, zA), 5 * zA / 8)
 
+# Cartesian derivatives of the 1s Slater potential V(|r-C|) -- oracle for
+# detail::radial_cart_deriv (tests/test_sto.cpp), the l>0 pair-density tail. Also
+# checks Poisson nabla^2 V = -4 pi rho (the identity the (nabla^2)^k V terms use).
+xx, yy, zz = sp.symbols("x y z", real=True)
+zc = sp.Rational(11, 10)
+Cc = (sp.Rational(3, 10), sp.Rational(-1, 5), sp.Rational(2, 5))
+Ap = (sp.Rational(1, 2), sp.Rational(1, 10), sp.Rational(-3, 10))
+sub = {xx: Ap[0], yy: Ap[1], zz: Ap[2]}
+Rc = sp.sqrt((xx - Cc[0])**2 + (yy - Cc[1])**2 + (zz - Cc[2])**2)
+Vc = 1 / Rc - (1 / Rc + zc) * sp.exp(-2 * zc * Rc)  # sto_slater_potential(zc, Rc)
+rhoc = zc**3 / pi * sp.exp(-2 * zc * Rc)             # normalized 1s Slater density
+lapV = (sp.diff(Vc, xx, 2) + sp.diff(Vc, yy, 2) + sp.diff(Vc, zz, 2)).subs(sub)
+check("Poisson  nabla^2 V = -4 pi rho (at A)", lapV, -4 * pi * rhoc.subs(sub))
+print("  Slater potential Cartesian derivatives at A (oracle for radial_cart_deriv):")
+for m in [(0, 0, 0), (1, 0, 0), (2, 0, 0), (1, 1, 0), (2, 1, 1), (0, 0, 3), (2, 2, 0)]:
+    d = Vc
+    for _ in range(m[0]):
+        d = sp.diff(d, xx)
+    for _ in range(m[1]):
+        d = sp.diff(d, yy)
+    for _ in range(m[2]):
+        d = sp.diff(d, zz)
+    print(f"    m={m}: {sp.N(d.subs(sub), 17)}")
+
 # two-centre 1s Slater Coulomb (equal exponents), the Roothaan formula. Derived
 # as J(R) = int rho_A(r) V_B(|r-B|) d^3r via the shell-averaged potential; check
 # the closed form and its R->0 (self-repulsion) and R->oo (1/R) limits.

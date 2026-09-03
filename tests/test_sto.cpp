@@ -260,6 +260,29 @@ TEST(STO, SymmetricDeltaTailBothTruncated) {
   EXPECT_LT(e2, e0 * 1e-3) << "higher order not tighter: e0=" << e0 << " e2=" << e2;
 }
 
+TEST(STO, SlaterPotentialCartesianDerivs) {
+  // detail::radial_cart_deriv gives arbitrary Cartesian derivatives of the 1s
+  // Slater potential V(|r-C|) -- the enabler for the l>0 pair-density delta tail.
+  // Oracle from references/sympy_slater.py (zeta=1.1, C=(0.3,-0.2,0.4),
+  // A=(0.5,0.1,-0.3)).
+  const double z = 1.1, C[3] = {0.3, -0.2, 0.4}, A[3] = {0.5, 0.1, -0.3};
+  double u[3];
+  for (int d = 0; d < 3; ++d) u[d] = A[d] - C[d];
+  const double R = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+  double fk[16];
+  intti::detail::slater_pot_radial_derivs(z, R, 10, fk);
+  struct {
+    int m[3];
+    double v;
+  } cases[] = {{{0, 0, 0}, 0.85079460269638692},  {{1, 0, 0}, -0.10296094902686939},
+               {{2, 0, 0}, -0.47592066626826802}, {{1, 1, 0}, 0.058326118299118367},
+               {{2, 1, 1}, 0.57118778651081968},  {{0, 0, 3}, -0.80807097385556554},
+               {{2, 2, 0}, 0.58347709911076700}};
+  for (auto &c : cases)
+    EXPECT_NEAR(intti::detail::radial_cart_deriv(fk, u, c.m), c.v, 1e-12)
+        << "m=(" << c.m[0] << "," << c.m[1] << "," << c.m[2] << ")";
+}
+
 TEST(STO, JKBuildSingleSelfERI) {
   // single 1s STO, D = [[1]] (unnormalized AO e^{-zeta r}): J[0][0] = K[0][0]
   // = (00|00) = 5 pi^2 / (8 zeta^5) (the normalized 5 zeta/8 scaled by
