@@ -150,7 +150,9 @@ template <class Real> struct QuartetWorkspace {
   int chunk{256}; ///< quartets processed per kernel sweep
   Kokkos::View<Real ***, Kokkos::LayoutLeft> f; ///< (nf, ncomb, 3*chunk)
   Kokkos::View<Real ***, Kokkos::LayoutLeft> g; ///< (nt, ncomb, 3*chunk)
-  Kokkos::View<Real **, Kokkos::LayoutLeft> s1; ///< (ncomb, 3*chunk)
+  /// tail 1D derivative-overlaps, (ncomb, 3*chunk, TAIL_KMAX+1): last index is
+  /// the Laplacian order m (D^{(2m)}); only order 0 is used for the leading tail
+  Kokkos::View<Real ***, Kokkos::LayoutLeft> s1;
 
   void ensure(int nf, int ncomb, int nt) {
     if (static_cast<int>(f.extent(0)) < nf || static_cast<int>(f.extent(1)) < ncomb ||
@@ -160,7 +162,8 @@ template <class Real> struct QuartetWorkspace {
         static_cast<int>(g.extent(2)) < 3 * chunk)
       g = Kokkos::View<Real ***, Kokkos::LayoutLeft>("intti::ws::g", nt, ncomb, 3 * chunk);
     if (static_cast<int>(s1.extent(0)) < ncomb || static_cast<int>(s1.extent(1)) < 3 * chunk)
-      s1 = Kokkos::View<Real **, Kokkos::LayoutLeft>("intti::ws::s1", ncomb, 3 * chunk);
+      s1 = Kokkos::View<Real ***, Kokkos::LayoutLeft>("intti::ws::s1", ncomb, 3 * chunk,
+                                                      TAIL_KMAX + 1);
   }
 };
 
@@ -179,6 +182,8 @@ void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &b
   const int nt = grid.n();
   const Real pi = pi_v<Real>();
   const Real tail_coeff = grid.tail_coeff;
+  const int Ktail = tail_coeff != Real(0) ? grid.tail_order : 0;
+  const Real tc = grid.t_c;
   auto tv = grid.t_dev;
   auto wv = grid.w_dev;
   auto qv = batch.quartets;
@@ -238,20 +243,23 @@ void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &b
                     }
                   }
                 }
-          // tail 1D overlaps (theta -> rho limit); cheap, do here
+          // tail 1D derivative-overlaps D^{(2m)} = spref sum_n f_n B_{n+2m}
+          // (theta -> rho limit); a ket spatial derivative only raises the
+          // Hermite index. Cheap, do here.
           if (tail_coeff != Real(0)) {
-            Real B[4 * LMAX + 1];
+            Real B[4 * LMAX + 2 * TAIL_KMAX + 1];
             const Real p = pv(ib), q = pv(ik);
             const Real rho = p * q / (p + q);
             const Real X = Pv(ib, d) - Pv(ik, d);
-            hermite_b(nf - 1, rho, X, B);
+            hermite_b(nf - 1 + 2 * Ktail, rho, X, B);
             const Real spref = sqrt_(pi / (p + q));
-            for (int combo = 0; combo < ncomb; ++combo) {
-              Real s{};
-              for (int n = 0; n < nf; ++n)
-                s += f(n, combo, col) * B[n];
-              s1(combo, col) = spref * s;
-            }
+            for (int combo = 0; combo < ncomb; ++combo)
+              for (int m = 0; m <= Ktail; ++m) {
+                Real s{};
+                for (int n = 0; n < nf; ++n)
+                  s += f(n, combo, col) * B[n + 2 * m];
+                s1(combo, col, m) = spref * s;
+              }
           }
         });
 
@@ -307,9 +315,26 @@ void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &b
             for (int i = 0; i < nt; ++i)
               val += wv(i) * g(i, cmb[0], 3 * jq) * g(i, cmb[1], 3 * jq + 1) *
                      g(i, cmb[2], 3 * jq + 2);
-            if (tail_coeff != Real(0))
-              val += tail_coeff * s1(cmb[0], 3 * jq) * s1(cmb[1], 3 * jq + 1) *
-                     s1(cmb[2], 3 * jq + 2);
+            if (tail_coeff != Real(0)) {
+              // tail = sum_{a+b+c<=K} b_{a+b+c}/(a!b!c!) D^{2a}_x D^{2b}_y D^{2c}_z,
+              // b_k = pi/(4^k (k+1) t_c^{2k+2}); b_0/D^0^3 is the leading delta term
+              Real bcoef[TAIL_KMAX + 1], invf[TAIL_KMAX + 1];
+              const Real tc2 = tc * tc;
+              Real p4 = 1, tcp = tc2, fact = 1;
+              for (int kk = 0; kk <= Ktail; ++kk) {
+                bcoef[kk] = pi / (p4 * (kk + 1) * tcp);
+                if (kk > 0) fact *= kk;
+                invf[kk] = Real(1) / fact;
+                p4 *= 4;
+                tcp *= tc2;
+              }
+              for (int ta = 0; ta <= Ktail; ++ta)
+                for (int tb = 0; tb <= Ktail - ta; ++tb)
+                  for (int tcc = 0; tcc <= Ktail - ta - tb; ++tcc)
+                    val += bcoef[ta + tb + tcc] * invf[ta] * invf[tb] * invf[tcc] *
+                           s1(cmb[0], 3 * jq, ta) * s1(cmb[1], 3 * jq + 1, tb) *
+                           s1(cmb[2], 3 * jq + 2, tcc);
+            }
           }
           if constexpr (Accumulate)
             Kokkos::atomic_add(&out(segment(q0 + jq) + k), coeff(q0 + jq) * val);

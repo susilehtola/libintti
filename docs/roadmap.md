@@ -358,20 +358,39 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   real GPU elsewhere. Also: minimax/Beylkin–Monzón t-grid and STO weight
   optimization via the arbitrary-precision core.
 
-- **M-QUAD — optimal Losilla tuning** (elevated priority; the grid/local-hybrid
-  and STO regimes both need it): use as small a truncation t_c as possible so
-  the explicit t-quadrature covers only the expensive dense small-t region,
-  pushing the cheap tail into analytic corrections. The delta term
-  (pi*S/t_c^2, S the four-orbital overlap) is only the leading tail and gives
-  1/t_c^4. Verified (prototype): adding the next moment,
-  pi*L/(8 t_c^4) with L = int rho_ab lap(rho_cd), gives 1/t_c^6 (a 4x smaller
-  t_c for the same accuracy). The tail is a series
-  pi*S/t_c^2 + pi*L/(8 t_c^4) + ..., each order a cheap Laplacian-overlap
-  moment off e_coeffs. The same series corrects the STO s-quadrature's
-  tight-Gaussian (delta-like) tail, so this tooling serves STOs, local
-  hybrids, and FEM/grid densities at once. Pair with minimax t-node placement
-  for the explicit [0, t_c] range. Prototypes: prototype/sto_validation.py
-  (STO = quadrature-contracted GTO, 5*zeta/8 to 7e-12) and the t_c study.
+- **M-QUAD — optimal Losilla tuning** (higher-order delta tail done; minimax
+  node placement open). Use as small a truncation t_c as possible so the
+  explicit t-quadrature covers only the expensive dense small-t region, pushing
+  the cheap tail into analytic corrections. The **higher-order delta tail** is
+  done (`tgrid.hpp`, `quartet.hpp`, `batch.hpp`): the truncated-quadrature tail
+  is the full series
+
+    R(t_c) = pi * sum_{k>=0} M_k / (4^k k! (k+1) t_c^{2k+2}),
+    M_k = int rho_ab (nabla^2)^k rho_cd   (Laplacian-overlap moments),
+
+  derived by expanding the ket density under the large-t Gaussian smoothing
+  kernel e^{-t^2 r12^2} (references/sympy_tail.py verifies the coefficients and
+  the M_k symbolically). k=0 is Losilla's leading delta pi*S/t_c^2 (the previous
+  default, residual 1/t_c^4); each added order removes one 1/t_c^2 factor, so
+  retaining orders 0..K leaves a residual O(1/t_c^{2K+4}). The moments cost
+  almost nothing: a ket spatial derivative only raises the Hermite-integral
+  index, so the per-axis order-m "derivative overlap" is D^{(2m)} = spref *
+  sum_n fh_n B_{n+2m} -- the SAME fh coefficients the leading tail already
+  builds, with B computed a few orders higher; M_k assembles from products of
+  these per axis (multinomial over nabla^2 = sum_d d_d^2). Opt-in via
+  `TGridSpec/TGrid::tail_order` (default 0 = unchanged; capped at TAIL_KMAX=4),
+  precision-generic (serial __float128 and the Kokkos float/double/long double
+  batch path give identical results). Validated (`tests/test_tail.cpp`): vs the
+  exact (ss|ss) oracle the residual scales as 1/t_c^{2K+4} (doubling t_c drops
+  the error by ~4^{K+2}: 16/64/256/1024 for K=0/1/2/3), and at a hard t_c=6 the
+  order-3 tail reaches ~7e-12 where the leading tail is ~3e-5 -- a 4x smaller
+  t_c (much cheaper explicit grid) for the same accuracy, exactly the goal.
+  Remaining: wire tail_order into the J/K/PSC consumers (`jbuild.hpp`,
+  `kbuild.hpp`, `product.hpp` still use the leading term only), the STO
+  s-quadrature tail (same series corrects the tight-Gaussian delta-like tail),
+  and minimax t-node placement for the explicit [0, t_c] range. Prototypes:
+  prototype/sto_validation.py (STO = quadrature-contracted GTO, 5*zeta/8 to
+  7e-12).
 
 ## Standing items
 

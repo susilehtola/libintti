@@ -12,7 +12,24 @@ Run them directly:
 ```sh
 python references/sympy_slater.py
 python references/sympy_three_electron.py
+python references/sympy_tail.py
 ```
+
+## `sympy_tail.py` — higher-order delta-tail references (`tests/test_tail.cpp`)
+
+The truncated Coulomb t-quadrature (cut at `t_c`) has a tail
+
+    R(t_c) = pi * sum_{k>=0} M_k / (4^k k! (k+1) t_c^{2k+2}),  M_k = int rho_ab (nabla^2)^k rho_cd,
+
+derived from the large-`t` Gaussian-smoothing expansion of the ket density.
+
+| Derived quantity | Closed form | Test |
+| --- | --- | --- |
+| tail coefficient `a_k` | `pi/(4^k k! (k+1) t_c^{2k+2})` (`a_0=pi/t_c^2`, `a_1=pi/8t_c^4`, `a_2=pi/96t_c^6`) | residual scaling |
+| moment `M_0 = S` | `(pi/(p+q))^{3/2} e^{-rho R^2}` | leading tail |
+| moment `M_1 = L` | `S (pq/(p+q))(4 rho R^2 - 6)` | order-1 tail |
+| `G(t)` series match | `[t^{-2k}]` of `G(t)/(sqrt(pi)/t)^3` equals `M_k/(4^k k!)` | (derivation) |
+| exact (ss|ss) oracle | `2 pi^{5/2}/(pq sqrt(p+q)) F_0(rho R^2)` = `19.30487...` | convergence |
 
 ## `sympy_slater.py` — Slater / STO references (`tests/test_sto.cpp`)
 

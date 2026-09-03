@@ -107,20 +107,37 @@ void eri_quartet(const ShellPair<Scalar> &bra, const ShellPair<Scalar> &ket,
       }
     }
 
-    // delta-function tail: per-direction 1D overlaps at the t -> infinity
-    // limit (theta -> rho, prefactor -> sqrt(pi/(p+q))); combo + ncomb*d
-    std::vector<Scalar> s1d(static_cast<std::size_t>(ncomb) * 3, Scalar(0));
+    // delta-function tail: Losilla's leading term plus higher orders. Per axis
+    // and per Laplacian order m, the 1D "derivative overlap" is the t->infinity
+    // overlap with the ket differentiated 2m times, which only raises the
+    // Hermite-integral index: D^{(2m)} = spref * sum_n fh_n B_{n+2m}. Layout
+    // s1d[m*sstride + combo + ncomb*d]. (theta -> rho, prefactor sqrt(pi/(p+q)).)
+    const int K = grid.tail_coeff != Real(0) ? grid.tail_order : 0;
+    const std::size_t sstride = static_cast<std::size_t>(ncomb) * 3;
+    std::vector<Scalar> s1d((K + 1) * sstride, Scalar(0));
+    Real bcoef[TAIL_KMAX + 1] = {}, invf[TAIL_KMAX + 1] = {};
     if (grid.tail_coeff != Real(0)) {
-      std::vector<Scalar> B(nf);
+      std::vector<Scalar> B(nf + 2 * K);
       const Real spref = sqrt_(pi / (p + q));
       for (int d = 0; d < 3; ++d) {
-        hermite_b(Ltot, rho, X[d], B.data());
-        for (int combo = 0; combo < ncomb; ++combo) {
-          Scalar s{};
-          for (int n = 0; n < nf; ++n)
-            s += fh[n + nf * (combo + ncomb * d)] * B[n];
-          s1d[combo + ncomb * d] = spref * s;
-        }
+        hermite_b(Ltot + 2 * K, rho, X[d], B.data());
+        for (int combo = 0; combo < ncomb; ++combo)
+          for (int m = 0; m <= K; ++m) {
+            Scalar s{};
+            for (int n = 0; n < nf; ++n)
+              s += fh[n + nf * (combo + ncomb * d)] * B[n + 2 * m];
+            s1d[m * sstride + combo + ncomb * d] = spref * s;
+          }
+      }
+      // combination coefficients: b_k = pi/(4^k (k+1) t_c^{2k+2}), 1/m!
+      const Real tc2 = grid.t_c * grid.t_c;
+      Real p4 = 1, tcp = tc2, fact = 1;
+      for (int kk = 0; kk <= K; ++kk) {
+        bcoef[kk] = pi / (p4 * (kk + 1) * tcp);
+        if (kk > 0) fact *= kk;
+        invf[kk] = Real(1) / fact;
+        p4 *= 4;
+        tcp *= tc2;
       }
     }
 
@@ -147,7 +164,16 @@ void eri_quartet(const ShellPair<Scalar> &bra, const ShellPair<Scalar> &ket,
       for (int i = 0; i < nt; ++i)
         val += grid.w[i] * g[i + nt * cx] * g[i + nt * (cy + ncomb)] *
                g[i + nt * (cz + 2 * ncomb)];
-      val += grid.tail_coeff * s1d[cx] * s1d[cy + ncomb] * s1d[cz + 2 * ncomb];
+      if (grid.tail_coeff != Real(0)) {
+        Scalar vt{};
+        for (int a = 0; a <= K; ++a)
+          for (int b = 0; b <= K - a; ++b)
+            for (int c = 0; c <= K - a - b; ++c)
+              vt += bcoef[a + b + c] * invf[a] * invf[b] * invf[c] *
+                    s1d[a * sstride + cx] * s1d[b * sstride + cy + ncomb] *
+                    s1d[c * sstride + cz + 2 * ncomb];
+        val += vt;
+      }
       out[k] = val;
     }
   }

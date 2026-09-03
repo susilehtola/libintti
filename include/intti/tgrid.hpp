@@ -65,6 +65,7 @@ template <class Real = double> struct TGridSpec {
   int n_lin{50}; ///< nodes on the linear panel
   int n_log{80}; ///< nodes on the logarithmic panel
   Real t_c{60};  ///< truncation point of infinite-range kernels
+  int tail_order{0}; ///< Losilla delta-tail order (see TGrid::tail_order)
   // ExpSum (Beylkin-Monzon / sinc) parameters
   Real es_tmin{Real(1e-2)}; ///< smallest quadrature node t
   Real es_tmax{Real(1e4)};  ///< largest quadrature node t
@@ -78,11 +79,23 @@ template <class Real = double> struct TGridSpec {
 /// Quadrature grid in t. The weights include the overall 2/sqrt(pi) factor
 /// and the kernel t-weight (e.g. exp(-kappa^2/(4t^2)) for Yukawa), so
 ///   kernel(r) ~= sum_i w_i exp(-t_i^2 r^2)  (+ delta-function tail).
+/// Highest supported Losilla tail order k (compile-time bound on stack arrays;
+/// order k removes the 1/t_c^{2k+2} residual term -- see tail_order below).
+inline constexpr int TAIL_KMAX = 4;
+
 template <class Real = double> struct TGrid {
   std::vector<Real> t; ///< quadrature nodes (host)
   std::vector<Real> w; ///< quadrature weights (host, see above)
   Real t_c{0};         ///< truncation point (0 for untruncated mappings)
   Real tail_coeff{0};  ///< pi/t_c^2 for truncated infinite-range kernels, else 0
+  /// Highest Losilla delta-tail order retained: the truncated-quadrature tail is
+  /// R(t_c) = pi * sum_{k=0}^{tail_order} M_k / (4^k k! (k+1) t_c^{2k+2}), with
+  /// M_k = int rho_ab (nabla^2)^k rho_cd the Laplacian-overlap moments. k=0 is
+  /// Losilla's leading delta term (the historical default); each extra order
+  /// removes one 1/t_c^2 factor from the residual, so a harder truncation (small
+  /// t_c, cheaper explicit grid) reaches the same accuracy. Ignored when
+  /// tail_coeff == 0. Capped at TAIL_KMAX.
+  int tail_order{0};
   /// device copies, populated for builtin floating-point Real
   Kokkos::View<Real *> t_dev, w_dev;
 
@@ -348,6 +361,7 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
     }
     grid.t_c = t1;
     grid.tail_coeff = tail ? pi / (t1 * t1) : Real(0);
+    grid.tail_order = tail ? std::min(spec.tail_order, TAIL_KMAX) : 0;
   }
 
   // overall 2/sqrt(pi) and the kernel t-weight

@@ -13,6 +13,7 @@ endif()
 add_executable(intti_tests
   test_main.cpp
   test_tgrid.cpp
+  test_tail.cpp
   test_boys.cpp
   test_hermite1d.cpp
   test_quartet.cpp
