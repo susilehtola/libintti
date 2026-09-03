@@ -412,11 +412,23 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      (`prototype/gemm_bench.cpp`, per-quartet single GEMMs, nt=64, this CPU box):
      GEMM LOSES at low L (ss 0.58x, ps 0.80x -- dgemm overhead on tiny matrices)
      and WINS 1.4-2.9x for l_tot >= 2 (ncomb >= 4), rising to 2.9x for ff --
-     exactly SHARK's low-L caveat. So the integration is a HYBRID: hand loops for
-     l_tot <= 1 (ncomb <= 2), GEMM for l_tot >= 2. Batching quartets into larger
-     GEMMs would push the crossover lower still. NOTE: BLAS is a host call, so on
-     GPU backends this needs a batched device GEMM (cuBLAS/rocBLAS/KokkosKernels);
-     CPU (OpenMP/Serial) backends call BLAS on the host-resident Views directly.
+     BUT that single-quartet micro-benchmark is misleading. The BATCH benchmark
+     (`prototype/gemm_bench.cpp` batchbench, 1024 quartets, 6 threads) is the
+     decisive one: the CURRENT phase-G threads over quartets with OpenMP, and a
+     serial loop of per-quartet GEMMs is 4-8x SLOWER (hand/gemm 0.12-0.24x). The
+     root cause is structural: in the t-quadrature theta_i = t^2 p q/D is
+     QUARTET-SPECIFIC (via p,q), so B_d differs per quartet and the quartets do
+     NOT merge into one large GEMM the way SHARK's shared-primitive structure
+     does. A naive per-quartet GEMM drop-in therefore REGRESSES 4-8x on CPU by
+     forfeiting the thread parallelism the hand loops already exploit.
+     Conclusion / re-scope: the GEMM win requires a BATCHED GEMM (N independent
+     small GEMMs run across all threads/SMs) -- KokkosKernels batched GEMM, MKL
+     dgemm_batch, or cuBLAS/rocBLAS batched -- NOT a reference-BLAS drop-in. It is
+     primarily a GPU lever (each small GEMM a device kernel; blocked on hardware
+     here) and a win on MKL CPUs; with reference BLAS + OpenMP the current
+     hand-loops are near-optimal and must not be replaced. So #1 is gated on
+     batched-GEMM infrastructure; the hand loops stay the CPU default. This does
+     not change #2/#3 (architecture and digestion), which are the near-term wins.
   2. **Loop/Kernel/Consumer (LKC) architecture** (SHARK Sec 3.10) -- one
      IntegralLoop, pluggable Kernels (operators) x Consumers (tasks: J, K,
      gradient, transformation), to consolidate the builder sprawl
