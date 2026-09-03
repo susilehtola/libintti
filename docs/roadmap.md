@@ -182,7 +182,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (s with Dc!=Db, and p). The three-electron / F12 matrix-level program is now
   complete: integrals (r^-1, f, f^2, f/r, arbitrary l, many-centre), moments
   (r12^2, r12.r13), and every contraction -- energy, Fock, RI-folded energy/Fock,
-  and the effective two-body J and K -- all independently validated.
+  and the effective two-body J and K -- all independently validated. The RI
+  folding no longer needs an external auxiliary: `cholesky_product_aux` /
+  `three_electron_energy_cd` generate it in-library from the two-step Cholesky
+  decomposition of the ERI over the orbital pair space -- the CD selects the
+  significant shell pairs (threshold tau), each materialised as product-shell
+  Gaussians (l = 0..l_i+l_j at the product centre, exponent alpha_i+alpha_j) that
+  span the pair block exactly, so the set spans rho_D to the CD threshold with
+  O(rank) auxiliaries. Validated exact (tight tau) vs the direct sum, s and p.
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

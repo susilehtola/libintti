@@ -137,6 +137,32 @@ TEST(ThreeElRI, FockMatchesDirectWhenAuxSpansProducts) {
   }
 }
 
+TEST(ThreeElRI, CholeskyAuxEnergyMatchesExact) {
+  // The in-library Cholesky auxiliary (product shells over the CD-selected
+  // pairs) spans rho_D at a tight threshold, so the folded energy matches the
+  // direct sextet sum -- no external auxiliary basis supplied.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  intti::CholeskyOptions<double> opt;
+  opt.tau = 1e-12;
+  {
+    auto orb = intti::make_basis<double>({{1.0, {0.0, 0.0, 0.0}, 0},
+                                          {0.8, {0.5, 0.0, 0.0}, 0},
+                                          {1.3, {0.0, 0.4, 0.0}, 0}});
+    const std::vector<double> D = {1.0, 0.3, 0.1, 0.3, 0.7, 0.2, 0.1, 0.2, 0.9};
+    const double Ecd = intti::three_electron_energy_cd(orb, D, grid, opt);
+    const double Eex = exact_e3(intti::detail::shellbasis_to_cartgauss(orb), D, 3, grid);
+    EXPECT_NEAR(Ecd, Eex, 1e-6 * std::abs(Eex)) << "s CD-aux energy != exact";
+  }
+  {
+    const double a = 0.9;
+    auto orb = intti::make_basis<double>({{a, {0.1, 0.2, 0.3}, 1}});
+    const std::vector<double> D = {0.7, 0.2, -0.1, 0.2, 0.5, 0.15, -0.1, 0.15, 0.9};
+    const double Ecd = intti::three_electron_energy_cd(orb, D, grid, opt);
+    const double Eex = exact_e3(intti::detail::shellbasis_to_cartgauss(orb), D, 3, grid);
+    EXPECT_NEAR(Ecd, Eex, 1e-6 * std::abs(Eex)) << "p CD-aux energy != exact";
+  }
+}
+
 // Direct effective two-body Coulomb: J_mu nu = sum_{la si, c f} Db_la si Dc_c f
 // G_{mu la c, nu si f}, electron 2 contracted by Db and electron 3 by Dc.
 std::vector<double> direct_eff_coulomb(const std::vector<CartGauss<double>> &g,
