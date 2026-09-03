@@ -295,6 +295,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   times the parity-order (a_d mod 2) derivatives of the other orbital's low-s
   part at the partner centre; the diagonal block comes from a dense
   single-centre grid. Mixed s/p reproduces the full grid to 1e-4.
+  Higher-order (radial) delta tail done for 1s (`sto_overlap_delta` radial_order,
+  `detail::sto_tail_weight_radial` + `lap_orders_1s`): the tight tail Gaussians
+  sample not just phi_partner(centre) but its Laplacians, tail = sum_k W_k
+  (nabla^2)^k phi_partner(centre), W_k = (8 pi/(k! zeta^{3+2k})) gamma(k+2, u_c)
+  (references/sympy_slater.py; k=0 is the leading weight). Each order removes a
+  1/s_c power, so a much harder truncation reaches the same accuracy -- at s_c=6
+  the order-2 tail is ~100x tighter than the leading term (1.5e-5 -> 1.3e-7),
+  i.e. s_c=6 buys what s_c~20 needs at order 0. l>0 keeps the leading radial term
+  (composing the angular parity-derivatives with the radial Laplacians is future
+  work).
   Two-electron delta-tail done for the two-centre density Coulomb repulsion
   (`sto_coulomb_2c_delta`): rho_A's s-grid is truncated at t_c and its tight
   tail charge Q_tail contributes Q_tail * V_B(A), the tail sitting at A and
@@ -424,10 +434,25 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (references/sympy_tail.py [4]) to 1e-11, and a GTO x point-cloud interaction
   converges to the exact sum_j w_j V_GTO(r_j) far faster at order 2 than order 0.
   cloud x cloud / coaxial PSC stay order-0 (their overlap is only estimated from
-  the kernel value at t_c). Remaining: the STO s-quadrature tail (same series
-  corrects the tight-Gaussian delta-like tail) and minimax t-node placement for
-  the explicit [0, t_c] range. Prototypes: prototype/sto_validation.py (STO =
-  quadrature-contracted GTO, 5*zeta/8 to 7e-12).
+  the kernel value at t_c).
+
+  Minimax [0, t_c] node placement was investigated and DEFERRED. The explicit
+  part reproduces erf(t_c r)/r. Prototyped: (a) tanh-sinh on [0, t_c] needs MORE
+  nodes than LinLog (Gauss-Legendre panels already match erf(t_c r)/r well);
+  (b) least-squares-optimised weights on log-spaced nodes give ~2x fewer nodes
+  at better accuracy (n=60 -> 9e-9 vs LinLog n=113 -> 1e-7) BUT the normal-
+  equations solve is treacherously ill-conditioned -- a float128 Cholesky fails
+  (non-positive pivot) as the node range widens, and Tikhonov regularisation
+  caps accuracy at ~2e-6. A library-grade version needs a TSVD/regularised solve
+  (e.g. jacobi_eigh at float128 with eigenvalue truncation) plus a LinLog
+  fallback, for a bounded ~2x gain on nodes the tail has already made few. Given
+  the tail already delivers the dominant savings and LinLog is at the optimal
+  ~log(t_c)log(1/eps) rate, the value/effort is poor; deferred.
+
+  The STO s-quadrature higher-order tail is done for 1s (see M-STO). Remaining
+  there: composing the l>0 angular parity-derivatives with the radial Laplacians.
+  Prototypes: prototype/sto_validation.py (STO = quadrature-contracted GTO,
+  5*zeta/8 to 7e-12).
 
 ## Standing items
 

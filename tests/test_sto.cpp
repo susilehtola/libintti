@@ -123,6 +123,35 @@ TEST(STO, DeltaTailOverlapBuilderMatchesFullGrid) {
   EXPECT_LT(worst, 1e-5 * scale) << "delta-tail overlap != full-grid overlap";
 }
 
+TEST(STO, HigherOrderRadialTail) {
+  // The higher-order (Gaussian-smoothing) delta-tail terms let an aggressive
+  // truncation reach the accuracy of a much larger s_c: at s_c=6 the order-2
+  // radial tail is ~100x tighter than the leading delta term alone.
+  std::vector<intti::StoShell<double>> shells = {
+      {1.2, {0.0, 0.0, 0.0}, 0, 0, 0}, {1.0, {1.6, 0.0, 0.0}, 0, 0, 0},
+      {1.4, {0.3, 1.5, -0.4}, 0, 0, 0}};
+  const int na = static_cast<int>(shells.size());
+  auto ref_shells = shells;
+  for (auto &s : ref_shells) {
+    s.ns = 200;
+    s.smax = 1e6;
+  }
+  auto exref = intti::expand_sto(ref_shells);
+  auto Sref = intti::contract_to_sto(intti::overlap_matrix(exref.prim), exref);
+  auto worst = [&](int K) {
+    auto S = intti::sto_overlap_delta(shells, 6.0, 32, 128, K);
+    double w = 0, scale = 0;
+    for (int i = 0; i < na * na; ++i) {
+      w = std::max(w, std::abs(S[i] - Sref[i]));
+      scale = std::max(scale, std::abs(Sref[i]));
+    }
+    return w / scale;
+  };
+  const double e0 = worst(0), e2 = worst(2);
+  EXPECT_LT(e2, e0 * 0.05) << "order-2 radial tail not tighter: e0=" << e0 << " e2=" << e2;
+  EXPECT_LT(e2, 1e-6);
+}
+
 TEST(STO, DeltaTailOverlapLGreaterZero) {
   // mixed s and p minimal STOs on three centres: the l>0 tail acts as
   // derivatives of delta, so the builder must still match the full grid.

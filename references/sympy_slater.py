@@ -56,6 +56,15 @@ uu = zeta**2 / (4 * sc)
 check("delta-tail weight  8pi/z^3[1-(1+u)e^-u]", W,
       8 * pi / zeta**3 * (1 - (1 + uu) * sp.exp(-uu)))
 
+# higher-order radial delta-tail weights (Gaussian-smoothing orders): the tight
+# tail Gaussians sample not just V(centre) but its Laplacians, tail = sum_k
+# W_k (nabla^2)^k V(centre), W_k = (1/(4^k k!)) int_{s_c}^inf g(s)(pi/s)^{3/2}
+# s^{-k} ds = (8 pi / (k! zeta^{3+2k})) gamma(k+2, u_c), u_c = zeta^2/(4 s_c).
+for kk in range(1, 4):
+    Wk = sp.integrate(g * (pi / s)**sp.Rational(3, 2) / s**kk, (s, sc, sp.oo)) / (4**kk * sp.factorial(kk))
+    want = 8 * pi / (sp.factorial(kk) * zeta**(3 + 2 * kk)) * sp.lowergamma(kk + 2, uu)
+    check(f"radial tail weight W_{kk}", Wk, want)
+
 # two-centre 1s Slater Coulomb (equal exponents), the Roothaan formula. Derived
 # as J(R) = int rho_A(r) V_B(|r-B|) d^3r via the shell-averaged potential; check
 # the closed form and its R->0 (self-repulsion) and R->oo (1/R) limits.
