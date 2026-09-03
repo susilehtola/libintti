@@ -11,6 +11,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include "device.hpp"
 #include "kernel.hpp"
 #include "math.hpp"
 
@@ -419,16 +420,8 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
 
   // device copies for builtin floating-point types
   if constexpr (kokkos_scalar_v<Real>) {
-    grid.t_dev = Kokkos::View<Real *>("intti::tgrid::t", grid.t.size());
-    grid.w_dev = Kokkos::View<Real *>("intti::tgrid::w", grid.w.size());
-    auto th = Kokkos::create_mirror_view(grid.t_dev);
-    auto wh = Kokkos::create_mirror_view(grid.w_dev);
-    for (std::size_t i = 0; i < grid.t.size(); ++i) {
-      th(i) = grid.t[i];
-      wh(i) = grid.w[i];
-    }
-    Kokkos::deep_copy(grid.t_dev, th);
-    Kokkos::deep_copy(grid.w_dev, wh);
+    grid.t_dev = detail::to_device(grid.t, "intti::tgrid::t");
+    grid.w_dev = detail::to_device(grid.w, "intti::tgrid::w");
   }
   return grid;
 }

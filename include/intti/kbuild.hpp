@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "batch.hpp"
+#include "device.hpp"
 #include "gto.hpp"
 #include "hermite1d.hpp"
 #include "tgrid.hpp"
@@ -81,33 +82,14 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
     }
 
   // stage everything on device
-  Kokkos::View<Real *> Dv("intti::k::D", static_cast<std::size_t>(nao) * nao);
+  auto Dv = detail::to_device(D, static_cast<std::size_t>(nao) * nao, "intti::k::D");
+  auto Qv = detail::to_device(Qex, "intti::k::Q");
+  auto mDv = detail::to_device(maxD, "intti::k::maxD");
+  auto aov = detail::to_device(ao_off, "intti::k::ao");
+  std::vector<int> ls(ns);
+  for (int i = 0; i < ns; ++i) ls[i] = shells[i].l;
+  auto lv = detail::to_device(ls, "intti::k::l");
   Kokkos::View<Real *> Kv("intti::k::K", static_cast<std::size_t>(nao) * nao);
-  Kokkos::View<Real *> Qv("intti::k::Q", Qex.size());
-  Kokkos::View<Real *> mDv("intti::k::maxD", maxD.size());
-  Kokkos::View<int *> aov("intti::k::ao", ns + 1), lv("intti::k::l", ns);
-  {
-    auto hD = Kokkos::create_mirror_view(Dv);
-    auto hQ = Kokkos::create_mirror_view(Qv);
-    auto hm = Kokkos::create_mirror_view(mDv);
-    auto ha = Kokkos::create_mirror_view(aov);
-    auto hl = Kokkos::create_mirror_view(lv);
-    for (std::size_t i = 0; i < static_cast<std::size_t>(nao) * nao; ++i)
-      hD(i) = D[i];
-    for (std::size_t i = 0; i < Qex.size(); ++i)
-      hQ(i) = Qex[i];
-    for (std::size_t i = 0; i < maxD.size(); ++i)
-      hm(i) = maxD[i];
-    for (int i = 0; i <= ns; ++i)
-      ha(i) = ao_off[i];
-    for (int i = 0; i < ns; ++i)
-      hl(i) = shells[i].l;
-    Kokkos::deep_copy(Dv, hD);
-    Kokkos::deep_copy(Qv, hQ);
-    Kokkos::deep_copy(mDv, hm);
-    Kokkos::deep_copy(aov, ha);
-    Kokkos::deep_copy(lv, hl);
-  }
   Kokkos::deep_copy(Kv, Real(0));
   auto pv = tab.p;
   auto Pv = tab.P;

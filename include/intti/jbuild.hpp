@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "batch.hpp"
+#include "device.hpp"
 #include "gto.hpp"
 #include "hermite1d.hpp"
 #include "tgrid.hpp"
@@ -68,36 +69,15 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
   }
   const int nprod = h_prod[npair], nherm = h_hoff[npair];
 
-  Kokkos::View<int *> prodv("intti::j::prod", npair + 1), hoffv("intti::j::hoff", npair + 1);
-  Kokkos::View<Real *> Dv("intti::j::D", nprod);
+  auto prodv = detail::to_device(h_prod, "intti::j::prod");
+  auto hoffv = detail::to_device(h_hoff, "intti::j::hoff");
+  auto Dv = detail::to_device(D, static_cast<std::size_t>(nprod), "intti::j::D");
   Kokkos::View<Real *> dq("intti::j::dq", nherm), jp("intti::j::jp", nherm);
   Kokkos::View<Real *> Jv("intti::j::J", nprod);
-  {
-    auto hp = Kokkos::create_mirror_view(prodv);
-    auto hh = Kokkos::create_mirror_view(hoffv);
-    auto hD = Kokkos::create_mirror_view(Dv);
-    for (int ip = 0; ip <= npair; ++ip) {
-      hp(ip) = h_prod[ip];
-      hh(ip) = h_hoff[ip];
-    }
-    for (int i = 0; i < nprod; ++i)
-      hD(i) = D[i];
-    Kokkos::deep_copy(prodv, hp);
-    Kokkos::deep_copy(hoffv, hh);
-    Kokkos::deep_copy(Dv, hD);
-  }
-  Kokkos::View<Real *> Qv("intti::j::Q", screen ? npair : 1);
-  Kokkos::View<Real *> bv("intti::j::bound", screen ? npair : 1);
-  if (screen) {
-    auto hQ = Kokkos::create_mirror_view(Qv);
-    auto hb = Kokkos::create_mirror_view(bv);
-    for (int ip = 0; ip < npair; ++ip) {
-      hQ(ip) = Q[ip];
-      hb(ip) = bound[ip];
-    }
-    Kokkos::deep_copy(Qv, hQ);
-    Kokkos::deep_copy(bv, hb);
-  }
+  auto Qv = screen ? detail::to_device(Q, static_cast<std::size_t>(npair), "intti::j::Q")
+                   : Kokkos::View<Real *>("intti::j::Q", 1);
+  auto bv = screen ? detail::to_device(bound, static_cast<std::size_t>(npair), "intti::j::bound")
+                   : Kokkos::View<Real *>("intti::j::bound", 1);
   auto lav = pairs.la;
   auto lbv = pairs.lb;
   auto pv = pairs.p;
