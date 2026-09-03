@@ -391,11 +391,32 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   shifts 2a/2b/2c on the same contraction (the leading tail is the single
   (0,0,0) node, unchanged at tail_order=0). Validated (`tests/test_tail.cpp`):
   J and K over an s/p basis converge to the untruncated reference far faster at
-  order 2 than order 0. Remaining: the PSC/grid consumer (`product.hpp` still
-  uses the leading term only), the STO s-quadrature tail (same series corrects
-  the tight-Gaussian delta-like tail), and minimax t-node placement for the
-  explicit [0, t_c] range. Prototypes: prototype/sto_validation.py (STO =
-  quadrature-contracted GTO, 5*zeta/8 to 7e-12).
+  order 2 than order 0.
+
+  Optimal order/truncation selection is done (`adaptive_linlog_tail_spec`, and
+  the `ShellBasis` overload in `fock.hpp`). The series term_k ~ (-1)^k k^{-1/2}
+  (rho/t_c^2)^k with rho = p q/(p+q) <= alpha_max, so it CONVERGES only for
+  t_c^2 > rho: a hard floor t_c > sqrt(alpha_max) (the tightest pair), below
+  which higher orders DIVERGE. The spec holds t_c a margin above the floor,
+  models the order-K worst-pair residual as (rho/t_c^2)^{K+1}, and picks the
+  (t_c, tail_order) that minimises total node count -- explicit LinLog nodes
+  (which grow ~log t_c) plus the C(K+3,3) tail pseudo-nodes (cubic in K) -- to
+  reach a target eps. So the cost trade (each order costs ~K^2/2 more
+  pseudo-nodes but buys a smaller t_c) is resolved automatically, and the
+  divergence floor is enforced (guards a real footgun: a small t_c + high order
+  on a tight basis silently corrupts the tightest pairs). Validated
+  (`tests/test_tail.cpp`): the worst-case tightest quartet (rho = alpha_max)
+  meets eps = 1e-6 and 1e-10 across alpha_max in [1.5, 40] with t_c above the
+  floor (the model is deliberately conservative -- ~2-3 orders of margin). The
+  selector currently reuses `linlog_for` panel sizing, which is calibrated for
+  the tested exponent regime; very tight all-electron cores (alpha_max ~ 1e6,
+  floor t_c ~ 1e3) want separate validation of the explicit-grid resolution.
+
+  Remaining: the PSC/grid consumer (`product.hpp` still uses the leading term
+  only), the STO s-quadrature tail (same series corrects the tight-Gaussian
+  delta-like tail), and minimax t-node placement for the explicit [0, t_c]
+  range. Prototypes: prototype/sto_validation.py (STO = quadrature-contracted
+  GTO, 5*zeta/8 to 7e-12).
 
 ## Standing items
 

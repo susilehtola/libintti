@@ -172,6 +172,36 @@ TEST(Tail, CoulombExchangeBuildHigherOrder) {
   EXPECT_LT(ke2, ke0 * 1e-2) << "K: order-2 not better than order-0";
 }
 
+TEST(Tail, AdaptiveSpecMeetsTargetAtFloor) {
+  // adaptive_linlog_tail_spec picks (t_c, tail_order) to hit eps for the
+  // tightest pair, whose reduced exponent rho = p q/(p+q) = alpha_max sets the
+  // convergence floor t_c > sqrt(alpha_max). Worst-case quartet: all four
+  // exponents = alpha_max (p = q = 2 alpha_max, so rho = alpha_max).
+  intti::TGridSpec<double> ms;
+  ms.mapping = intti::TMapping::Mobius;
+  ms.n = 400;
+  const auto ref = intti::make_tgrid(intti::coulomb(), ms);
+  for (double amax : {1.5, 8.0, 40.0}) {
+    for (double eps : {1e-6, 1e-10}) {
+      auto sp = intti::adaptive_linlog_tail_spec<double>(0.1, amax, eps);
+      EXPECT_GT(sp.t_c, std::sqrt(amax)) << "t_c below convergence floor";
+      const auto g = intti::make_tgrid(intti::coulomb(), sp);
+      double worst = 0;
+      for (double R : {0.0, 0.4, 1.2, 2.5}) {
+        intti::PrimitiveShell<double> a{amax, {0, 0, 0}, 0};
+        intti::PrimitiveShell<double> c{amax, {R, 0, 0}, 0};
+        double v, r;
+        intti::eri_quartet(intti::make_pair(a, a), intti::make_pair(c, c), g, &v);
+        intti::eri_quartet(intti::make_pair(a, a), intti::make_pair(c, c), ref, &r);
+        worst = std::max(worst, std::abs((v - r) / r));
+      }
+      EXPECT_LT(worst, eps) << "amax=" << amax << " eps=" << eps
+                            << " t_c=" << sp.t_c << " K=" << sp.tail_order
+                            << " worst=" << worst;
+    }
+  }
+}
+
 #ifdef INTTI_HAVE_QUADMATH
 TEST(Tail, QuadPrecisionDeepAccuracy) {
   // In quad the tail residual is visible far below the double floor: at a hard

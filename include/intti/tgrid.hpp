@@ -157,6 +157,48 @@ TGridSpec<Real> linlog_for(Real t_c, Real target_eps = Real(1e-10)) {
   return spec;
 }
 
+/// LinLog spec with an auto-selected truncation t_c AND higher-order delta-tail
+/// order that minimise the total node count -- explicit LinLog nodes plus the
+/// C(K+3,3) tail pseudo-nodes the J/K builders fold in -- for a target accuracy
+/// eps over a basis exponent span [alpha_min, alpha_max].
+///
+/// The tail is the series R(t_c) = pi sum_k M_k/(4^k k!(k+1) t_c^{2k+2}); its
+/// term_k ~ (-1)^k k^{-1/2} (rho/t_c^2)^k with rho = p q/(p+q) the reduced
+/// exponent of the two charge distributions, so it CONVERGES only for
+/// t_c^2 > rho. The tightest pair has rho <= alpha_max, giving a hard floor
+/// t_c > sqrt(alpha_max) -- below it, higher orders DIVERGE. t_c is kept a
+/// margin above that floor. For order K the worst-pair residual ~ (rho/t_c^2)^
+/// {K+1}, so the smallest t_c reaching eps is t_c = sqrt(alpha_max) *
+/// (1/eps)^{1/(2(K+1))} (clamped to the floor). Sweeping K in [0, TAIL_KMAX] and
+/// costing each choice with linlog_for's node count picks the cheapest.
+template <class Real = double>
+TGridSpec<Real> adaptive_linlog_tail_spec(Real alpha_min, Real alpha_max,
+                                          Real eps = Real(1e-10)) {
+  (void)alpha_min;
+  const double amax = static_cast<double>(alpha_max);
+  const double e = static_cast<double>(eps) > 0 ? static_cast<double>(eps) : 1e-10;
+  const double rho_max = amax;                  // worst-case p q/(p+q)
+  const double floor = std::sqrt(rho_max);
+  const double margin = 1.3;                    // stay above the convergence floor
+  int bestK = 0;
+  double best_cost = 1e300, best_tc = floor * margin;
+  for (int K = 0; K <= TAIL_KMAX; ++K) {
+    double tc = floor * std::pow(1.0 / e, 1.0 / (2.0 * (K + 1)));
+    if (tc < floor * margin) tc = floor * margin;
+    const auto sp = linlog_for<double>(tc, static_cast<double>(eps));
+    const double ncombo = (K + 1.0) * (K + 2.0) * (K + 3.0) / 6.0;
+    const double cost = sp.n_lin + sp.n_log + ncombo;
+    if (cost < best_cost) {
+      best_cost = cost;
+      bestK = K;
+      best_tc = tc;
+    }
+  }
+  auto spec = linlog_for<Real>(static_cast<Real>(best_tc), eps);
+  spec.tail_order = bestK;
+  return spec;
+}
+
 /// Mobius TGridSpec sized to a basis's Gaussian exponent span, so one shared
 /// grid resolves every pair. Anchored to the calibrated default (n=64, s=2
 /// covers exponents [1e-2, 1e6], i.e. 8 decades): the node count grows ~8 per

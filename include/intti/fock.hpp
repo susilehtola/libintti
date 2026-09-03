@@ -48,6 +48,22 @@ TGridSpec<Real> adaptive_mobius_spec(const ShellBasis<Real> &b) {
   return mobius_spec_for_range(amin, amax);
 }
 
+/// Truncated LinLog spec with an auto-selected t_c and higher-order delta-tail
+/// order that minimise the total node count for a target accuracy over a basis's
+/// exponent span (see tgrid.hpp::adaptive_linlog_tail_spec). The tail's
+/// convergence floor t_c > sqrt(alpha_max) is enforced. Opt-in.
+template <class Real>
+TGridSpec<Real> adaptive_linlog_tail_spec(const ShellBasis<Real> &b,
+                                          Real eps = Real(1e-10)) {
+  if (b.shells.empty()) return {};
+  Real amin = b.shells[0].alpha, amax = amin;
+  for (const auto &s : b.shells) {
+    amin = std::min(amin, s.alpha);
+    amax = std::max(amax, s.alpha);
+  }
+  return adaptive_linlog_tail_spec(amin, amax, eps);
+}
+
 /// Triangular shell-pair list of a basis, plus the (i, j) shell indices of
 /// each pair (the row bookkeeping shared by the AO-level builders and the
 /// Cholesky unpacking).
