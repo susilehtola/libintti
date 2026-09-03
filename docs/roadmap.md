@@ -195,6 +195,50 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (`detail::jacobi_eigh`) in place of LAPACK, so `three_electron_energy_cd` runs
   at long double and __float128 -- validated against the direct sum at both.
 
+- **M-TC — transcorrelated (and F12) integrals** (builds on M-3EL). The TC method
+  similarity-transforms H by a Jastrow J = sum_{i<j} u(r_i,r_j):
+  H_TC = e^{-J} H e^{J} = H - sum_{i<j} K(r_i,r_j) - sum_{i<j<k} L(r_i,r_j,r_k),
+    K(r_i,r_j) = 1/2[nabla_i^2 u + nabla_j^2 u + (nabla_i u)^2 + (nabla_j u)^2]
+                 + (nabla_i u . nabla_i + nabla_j u . nabla_j),
+    L(r_i,r_j,r_k) = nabla_i u_ij . nabla_i u_ik + nabla_j u_ji . nabla_j u_jk
+                     + nabla_k u_ki . nabla_k u_kj.
+  (Haupt PhD thesis 2024, Eq 2.29-2.31; F12 uses the SAME family additively --
+  r^-1, f, f^2, f/r, (grad f)^2, and the 3-electron B-matrix term.) Almost the
+  whole integral list is ALREADY in threeel.hpp as operator node lists:
+  - V = <pq|r12^-1|rs>: Coulomb (coulomb_nodes). done.
+  - K's multiplicative pieces: 1/2 nabla^2 u and 1/2 (nabla u)^2 are geminal /
+    moment node lists -- (nabla f)^2 is exactly three_electron_moment12; nabla^2 u
+    of a Gaussian geminal is another geminal (4 g^2 r^2 - 6 g) node list. done.
+  - L (three-body): each cross-gradient term (grad_i u_ij).(grad_i u_ik) is the
+    cross moment three_electron_moment (moment=2); L is the sum of its three
+    electron-pair permutations. done and independently validated.
+  - The ONE genuinely new integral: K's NON-HERMITIAN term nabla_i u_ij . nabla_i
+    -- a 2-electron integral pairing the geminal-gradient operator (a (x1-x2)-
+    weighted geminal, moment-type) with a derivative on a ket orbital (deriv.hpp
+    center-shift). Both ingredients exist; needs a dedicated matrix-level routine.
+  So the milestone is: (1) the non-Hermitian nabla_u.nabla 2-body operator;
+  (2) a matrix-level TC-Hamiltonian assembler producing the effective
+  (non-Hermitian) 1e/2e integrals + the 3-body L contributions a TC-FCIQMC /
+  TC-CC host consumes (density/orbitals in, integrals out -- never per-quartet).
+  Jastrow representation: u as a Gaussian-geminal sum (standard STG-nG), or --
+  better -- Slater-type u via the integral transform + delta tail we use for STOs
+  (M-STO), which is MORE exact than a plain Gaussian fit (exact in the node limit
+  plus the analytic tail) and handles the coalescence cusp analytically.
+  Why our approach wins over the reference (Haupt/PyTCHInt, tchint): they evaluate
+  EVERY TC matrix element -- the 3-electron L and the K terms -- by
+  Treutler-Ahlrichs atom-centred numerical grids (Becke multicenter scheme), with
+  real grid error they extrapolate away (lgrid 1-5 -> 1/n_grid->0). Ours is
+  analytic: the Gaussian transform reduces the two operators to a smooth 2D (t,s)
+  quadrature and does the 9D electron integral analytically (Gaussian moments /
+  Isserlis), exponentially convergent (Mobius grid + higher-order delta tail) at
+  arbitrary precision -- no spatial grid, no cusp-convergence problem, controlled
+  error. The multiplicative TC ansatz caps at 3-electron integrals (vs F12's
+  additive higher-body), which is exactly what the t-quadrature does natively.
+  Oracle: the 3-electron cross moment is already validated independently; the new
+  non-Hermitian term vs a closed-form / independent-quadrature reference and vs
+  PyTCHInt's grid values (grid-converged); a small TC-SCF or xTC energy vs a
+  published TC reference as the capstone.
+
 - **Precision-generic Cholesky** (`cholesky.hpp`): the one-step pivoted Cholesky
   (ab|cd) ~= sum_J L_ab^J L_cd^J is LAPACK-free (pivoted recurrence + sqrt), so
   `pivoted_cholesky` runs at float/double/long double (the batched-integral
