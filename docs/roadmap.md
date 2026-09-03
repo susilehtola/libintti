@@ -250,6 +250,76 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   PyTCHInt's grid values (grid-converged); a small TC-SCF or xTC energy vs a
   published TC reference as the capstone.
 
+- **M-MP -- multipole (far-field) integral evaluation** (`include/intti/multipole.hpp`).
+  For well-separated bra/ket product-charge distributions (|P-Q| large vs their
+  extents) the quartet collapses to a bilinear multipole contraction
+      (ab|cd) ~= sum_{lm,l'm'} q^{ab}_{lm} T^{lm}_{l'm'}(R_PQ) q^{cd}_{l'm'},
+  the FMM far-field. The moments q^{ab}_{lm} are exactly the solid-harmonic
+  moment matrices moment.hpp already builds (M10), so the distant-pair ERI /
+  nuclear term is a cheap O(L^4) contraction of existing moment vectors with an
+  interaction tensor T(R) -- no primitive quartet. Highest-value target: the
+  local-hybrid grid x pair nuclear-attraction over huge grid x pair sets
+  (M11/M14), where distant grid points get the multipole shortcut and near ones
+  the exact t-quadrature (Schwarz + distance decides near/far, screening already
+  present). Design: (1) a well-separatedness criterion; (2) pair multipole
+  moments (have); (3) the interaction-tensor contraction, matrix-level.
+  Note -- unifies with M-HK: the SAME machinery is the Helmholtz far-field with
+  T(R) swapped from the Coulomb tensor 1/R^{l+l'+1} to the modified spherical
+  Bessel tensor I-hat_{l+1/2}, K-hat_{l+1/2} (Park 2017 Eq 6-7, 13-16). Do M-MP
+  first: it stands alone and is the on-ramp to M-HK. Oracle: exact quartet in the
+  far regime; a full FMM-accelerated J / nuclear build vs the dense reference.
+
+- **M-HK -- Helmholtz-kernel (Green's-function) SCF route** (`include/intti/helmholtz.hpp`).
+  An alternative to diagonalizing the Fock matrix: the bound-state orbital update
+  is a Green's-function fixed point (Park 2017, JCTC 13, 654; Eq 2-5),
+      psi_i^{(n+1)} = -2 (-nabla^2 + kappa_i^2)^{-1} V psi_i^{(n)}
+                    = -2 int e^{-kappa_i|r-r'|}/(4 pi|r-r'|) V(r') psi_i^{(n)}(r') dr',
+      kappa_i = sqrt(-2 eps_i).
+  The Green's function is the bound-state Helmholtz kernel = a Yukawa (screened
+  Coulomb) kernel, WHICH WE ALREADY CARRY: the ExpSum t-grid covers Yukawa
+  (its e^{-kappa^2/4t^2} factor kills the slow small-t tail; validated to 1e-9,
+  see the Adaptive t-grid note). The apply-then-project integrals
+  <chi_mu|G_kappa V|chi_nu> are Yukawa-kernel (x) Coulomb (nuclear / J) products
+  -- multi-t Gaussian integrals, the same machinery as the 3-electron / geminal
+  integrals (threeel.hpp); the core primitive is the Yukawa potential of a GTO
+  product (analytic).
+  THE PER-ORBITAL SCALING CONCERN AND ITS RESOLUTION. Each occupied orbital has
+  its own kappa_i, so naively the kernel is applied N_occ times -- a loop that
+  could kill the method (and is only rescued in fully numerical codes by the
+  finite kernel range 1/kappa ~ 1 bohr for valence plus localized orbitals ->
+  each apply O(1) local, loop O(N)). The t-quadrature dodges it structurally:
+  kappa enters ONLY as a scalar Gaussian weight e^{-kappa^2/4t^2} on the shared
+  t-nodes, and V is orbital-independent, so
+      M(kappa)_{mu nu} = <chi_mu|G_kappa V|chi_nu>
+                       = sum_t w_t e^{-kappa^2/4t^2} K_{mu nu}(t)
+  is built from ONE t-resolved tensor K_{mu nu}(t) common to every orbital;
+  each M(kappa_i) is a cheap N_t-term (~20-40) re-weighting. So the cost is one
+  Fock-like build + N_occ cheap re-weight-and-matvec updates -- comparable to a
+  normal Fock build MINUS the diagonalization, not N_occ x anything expensive.
+  This is BETTER than the grid convolution: those put the source inside the
+  convolution (g = 2 V psi_i) and so redo the expensive integral per orbital,
+  rescued only by locality; our matrix form pulls the source out (linearity:
+  G_kappa V is a shared operator tensor), amortizing across orbitals -- and we
+  STILL inherit the locality, because e^{-kappa^2/4t^2} truncating the small-t
+  nodes is exactly a t-grid truncation (the LRSH primitive, M14). We get both
+  escapes; the grid gets one. Residual cost: N_occ matvecs M(kappa_i)c_i (O(N^3)
+  dense, O(N) with locality) -- the cost of forming the density anyway.
+  Honest caveats on value. In a SMALL GTO basis the eigensolve is cheap, so the
+  win is not avoiding diagonalization; the genuine advantages are (a) G_kappa
+  inverts -nabla^2 exactly and we only project the RESULT -- the kinetic operator
+  is never projected, so better-conditioned and potentially better cusp-region
+  energies than Galerkin in the SAME basis; (b) all screened convolutions /
+  contractions, no dense eigensolve -- a fit for the GPU-saturating matrix-level
+  design; (c) FMM far-field (M-MP) + kappa-screening -> linear scaling. Payoff is
+  in large / mixed GTO-STO / fully-numerical-adjacent bases, not def2-SVP water.
+  Plan: (1) the Yukawa-potential-of-GTO primitive vs a closed form; (2) the
+  M(kappa) t-tensor build reusing the ExpSum Yukawa grid; (3) a Helmholtz-SCF
+  proof-of-concept on H / He / H2 confirming the fixed point converges to the
+  in-basis Galerkin/diagonalization energy, then measuring whether kinetic-
+  exactness buys accuracy per basis function. Oracle: closed-form Yukawa
+  integrals; the converged HK energy vs a standard diagonalizing SCF in the same
+  basis (must agree in-basis), and vs the basis-set-limit reference.
+
 - **Precision-generic Cholesky** (`cholesky.hpp`): the one-step pivoted Cholesky
   (ab|cd) ~= sum_J L_ab^J L_cd^J is LAPACK-free (pivoted recurrence + sqrt), so
   `pivoted_cholesky` runs at float/double/long double (the batched-integral
