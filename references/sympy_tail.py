@@ -129,4 +129,22 @@ for nm, v in [("S = M_0", M[0]), ("L = M_1", M[1]), ("Q = M_2", M[2]),
               ("exact (ss|ss)", eri)]:
     print(f"    {nm:16s} = {sp.N(v, 17)}")
 
+# ---------------------------------------------------------------------------
+# 4. (nabla^2)^k of a GTO product component at a point -- oracle for the
+#    GTO x cloud higher-order tail (detail::pair_component_laplacians). The
+#    product p_x(A) * s(B): rho(r) = (x-Ax) exp(-aa|r-A|^2 - ab|r-B|^2).
+# ---------------------------------------------------------------------------
+print("\n[4] (nabla^2)^k of GTO product p_x(A)*s(B) at a point (pair_component_laplacians)")
+aa, ab = sp.Rational(9, 10), sp.Rational(13, 10)
+A = (sp.Rational(1, 10), sp.Rational(-1, 5), sp.Rational(3, 10))
+Bc = (sp.Rational(1, 2), sp.Rational(2, 5), sp.Rational(-1, 10))
+rpt = (sp.Rational(1, 5), sp.Rational(3, 20), sp.Rational(1, 4))
+rho_g = (x - A[0]) * sp.exp(-aa * ((x - A[0])**2 + (y - A[1])**2 + (z - A[2])**2)
+                            - ab * ((x - Bc[0])**2 + (y - Bc[1])**2 + (z - Bc[2])**2))
+cur = rho_g
+for kk in range(3):
+    v = cur.subs({x: rpt[0], y: rpt[1], z: rpt[2]})
+    print(f"    (nabla^2)^{kk} rho = {sp.N(v, 17)}")
+    cur = sp.expand(sp.diff(cur, x, 2) + sp.diff(cur, y, 2) + sp.diff(cur, z, 2))
+
 print("\nAll higher-order delta-tail references verified.")

@@ -328,13 +328,73 @@ void cloud_cloud_sums(const Cloud<Real> &a, const Cloud<Real> &b,
   }
 }
 
+/// [(nabla^2)^k of the (ka,kb) pair-product component] evaluated at point r, for
+/// k = 0..K (out has K+1 entries; out[0] == pair_component_value). The product
+/// factorizes per axis, so (nabla^2)^k = sum_{a+b+c=k} k!/(a!b!c!) d_x^{2a}
+/// d_y^{2b} d_z^{2c}; the 2m-th derivative of an axis factor K_d (x-A)^a (x-B)^b
+/// e^{-p(x-P)^2} is obtained by iterating the coefficient map
+/// Poly(y) -> Poly'(y) - 2 p y Poly(y), y = x-P, on (y+P-A)^a (y+P-B)^b. Used to
+/// carry the higher-order delta tail through the analytic GTO x cloud path:
+/// M_k = int rho_GTO (nabla^2)^k rho_cloud = sum_j w_j (nabla^2)^k rho_GTO(r_j).
+template <class Real>
+void pair_component_laplacians(const ShellPair<Real> &sp, int ka, int kb,
+                               const Real *r, int K, Real *out) {
+  int a3[3], b3[3];
+  cart_comp(sp.la, ka, a3[0], a3[1], a3[2]);
+  cart_comp(sp.lb, kb, b3[0], b3[1], b3[2]);
+  const Real p = sp.p;
+  Real D[3][TAIL_KMAX + 1]; // D[d][m] = d_x^{2m} f_d(r_d)
+  for (int d = 0; d < 3; ++d) {
+    const Real yr = r[d] - sp.P[d];
+    const Real dPA = sp.P[d] - sp.A[d], dPB = sp.P[d] - sp.B[d];
+    std::vector<Real> c(1, Real(1)); // base polynomial (y+dPA)^a3 (y+dPB)^b3
+    auto mul_lin = [&](Real s) {
+      std::vector<Real> nc(c.size() + 1, Real(0));
+      for (int n = 0; n < static_cast<int>(c.size()); ++n) {
+        nc[n + 1] += c[n];
+        nc[n] += s * c[n];
+      }
+      c.swap(nc);
+    };
+    for (int j = 0; j < a3[d]; ++j) mul_lin(dPA);
+    for (int j = 0; j < b3[d]; ++j) mul_lin(dPB);
+    const Real gauss = sp.K[d] * exp_(Real(-p * yr * yr));
+    std::vector<Real> cur = c;
+    int deriv = 0;
+    for (int m = 0; m <= K; ++m) {
+      while (deriv < 2 * m) { // cur -> cur' - 2 p y cur
+        std::vector<Real> nx(cur.size() + 1, Real(0));
+        for (int n = 0; n < static_cast<int>(cur.size()); ++n) {
+          if (n >= 1) nx[n - 1] += Real(n) * cur[n];
+          nx[n + 1] += Real(-2 * p) * cur[n];
+        }
+        cur.swap(nx);
+        ++deriv;
+      }
+      Real v = 0; // Horner eval of cur at yr
+      for (int n = static_cast<int>(cur.size()) - 1; n >= 0; --n) v = v * yr + cur[n];
+      D[d][m] = gauss * v;
+    }
+  }
+  Real fact[TAIL_KMAX + 1];
+  fact[0] = 1;
+  for (int i = 1; i <= K; ++i) fact[i] = fact[i - 1] * i;
+  for (int k = 0; k <= K; ++k) out[k] = 0;
+  for (int a = 0; a <= K; ++a)
+    for (int b = 0; b <= K - a; ++b)
+      for (int cc = 0; cc <= K - a - b; ++cc) {
+        const int k = a + b + cc;
+        out[k] += fact[k] / (fact[a] * fact[b] * fact[cc]) * D[0][a] * D[1][b] * D[2][cc];
+      }
+}
+
 /// analytic GTO product x cloud: per t and cloud point the bra integral is
 /// prod_d sqrt(pi/(p+t^2)) sum_n E_n^d B_n(theta, P_d - r_d),
-/// theta = p t^2/(p + t^2); the quadrature sum and the exact overlap
-/// (pair value on the cloud) come out together.
+/// theta = p t^2/(p + t^2); the quadrature sum and the Laplacian-overlap moments
+/// M_k (for the higher-order delta tail) come out together.
 template <class Real>
 void gto_cloud_sums(const GTOProduct<Real> &f, const Cloud<Real> &b,
-                    const TGrid<Real> &grid, Real &quad, Real &overlap) {
+                    const TGrid<Real> &grid, Real &quad, std::vector<Real> &moments) {
   const auto &sp = f.pair;
   int a3[3], b3[3];
   cart_comp(sp.la, f.comp_a, a3[0], a3[1], a3[2]);
@@ -357,10 +417,14 @@ void gto_cloud_sums(const GTOProduct<Real> &f, const Cloud<Real> &b,
   const int nt = grid.n();
   const Real p = sp.p;
   const Real pi = pi_v<Real>();
+  // delta-tail moments M_k = sum_j w_j (nabla^2)^k rho_GTO(r_j), k=0..K
+  // (M_0 is the exact GTO x cloud overlap); order 0 recovers the leading tail.
+  const int K = grid.tail_coeff != Real(0) ? grid.tail_order : 0;
   quad = 0;
-  overlap = 0;
+  moments.assign(K + 1, Real(0));
   // serial host loop; FP parallelization of this path lands with M4 batching
   std::vector<Real> B(nrow[0] + nrow[1] + nrow[2]);
+  Real vlap[TAIL_KMAX + 1];
   for (std::size_t j = 0; j < nb; ++j) {
     const Real r[3] = {b.pts[3 * j], b.pts[3 * j + 1], b.pts[3 * j + 2]};
     Real s = 0;
@@ -380,7 +444,9 @@ void gto_cloud_sums(const GTOProduct<Real> &f, const Cloud<Real> &b,
       s += grid.w[it] * val;
     }
     quad += b.gw[j] * s;
-    overlap += b.gw[j] * pair_component_value(sp, f.comp_a, f.comp_b, r);
+    pair_component_laplacians(sp, f.comp_a, f.comp_b, r, K, vlap);
+    for (int k = 0; k <= K; ++k)
+      moments[k] += b.gw[j] * vlap[k];
   }
 }
 
@@ -631,9 +697,18 @@ Real interaction(const ProductFunction<Real> &f, const ProductFunction<Real> &g,
     Cloud<Real> c = std::holds_alternative<PSCProduct<Real>>(other)
                         ? detail::cloud_of(std::get<PSCProduct<Real>>(other))
                         : detail::cloud_of(std::get<TensorGridProduct<Real>>(other));
-    Real quad, overlap;
-    detail::gto_cloud_sums(gp, c, grid, quad, overlap);
-    return quad + grid.tail_coeff * overlap;
+    Real quad;
+    std::vector<Real> moments;
+    detail::gto_cloud_sums(gp, c, grid, quad, moments);
+    // tail = sum_k a_k M_k, a_k = pi/(4^k k! (k+1) t_c^{2k+2}) (a_0 = tail_coeff)
+    Real tail = 0, pw4 = 1, kfact = 1, tcp = tc * tc;
+    for (int k = 0; k < static_cast<int>(moments.size()); ++k) {
+      tail += pi / (pw4 * kfact * (k + 1) * tcp) * moments[k];
+      pw4 *= 4;
+      kfact *= (k + 1);
+      tcp *= tc * tc;
+    }
+    return quad + tail;
   }
   // cloud x cloud
   auto cloud = [](const ProductFunction<Real> &pf) {

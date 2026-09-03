@@ -414,16 +414,20 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
 
   The PSC/grid consumer (`product.hpp::interaction`) is audited: GTO x GTO
   routes through eri_quartet and so inherits the FULL higher-order tail
-  automatically (tested); the grid-represented paths keep the leading (order-0)
-  delta term -- higher orders there need M_k = int rho_f (nabla^2)^k rho_g,
-  feasible for GTO x cloud (the Laplacian lands on the analytic GTO, evaluated at
-  the cloud points -- a future extension) but not for cloud x cloud / coaxial
-  PSC, where even the overlap S is only estimated from the kernel value at t_c.
-  Remaining: the STO s-quadrature tail (same series corrects the tight-Gaussian
-  delta-like tail), the optional GTO x cloud higher-order, and minimax t-node
-  placement for the explicit [0, t_c] range. Prototypes:
-  prototype/sto_validation.py (STO = quadrature-contracted GTO, 5*zeta/8 to
-  7e-12).
+  automatically (tested); the grid-represented paths need the moments M_k = int
+  rho_f (nabla^2)^k rho_g. GTO x cloud is now done
+  (`detail::pair_component_laplacians`): M_k = sum_j w_j (nabla^2)^k rho_GTO(r_j),
+  the Laplacian moved onto the analytic GTO and evaluated at the cloud points via
+  the per-axis coefficient map Poly(y) -> Poly'(y) - 2 p y Poly(y); gto_cloud_sums
+  returns the moment vector and interaction() folds sum_k a_k M_k. Validated
+  (`tests/test_tail.cpp`): pair_component_laplacians vs a SymPy oracle
+  (references/sympy_tail.py [4]) to 1e-11, and a GTO x point-cloud interaction
+  converges to the exact sum_j w_j V_GTO(r_j) far faster at order 2 than order 0.
+  cloud x cloud / coaxial PSC stay order-0 (their overlap is only estimated from
+  the kernel value at t_c). Remaining: the STO s-quadrature tail (same series
+  corrects the tight-Gaussian delta-like tail) and minimax t-node placement for
+  the explicit [0, t_c] range. Prototypes: prototype/sto_validation.py (STO =
+  quadrature-contracted GTO, 5*zeta/8 to 7e-12).
 
 ## Standing items
 

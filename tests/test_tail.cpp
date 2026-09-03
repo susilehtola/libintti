@@ -229,6 +229,63 @@ TEST(Tail, InteractionGtoInheritsHigherOrder) {
   EXPECT_LT(e2, 1e-9);
 }
 
+TEST(Tail, PairComponentLaplaciansVsSympy) {
+  // detail::pair_component_laplacians vs references/sympy_tail.py section [4]:
+  // (nabla^2)^k of the GTO product p_x(A) * s(B) at a point.
+  PrimitiveShell<double> a{0.9, {0.1, -0.2, 0.3}, 1};
+  PrimitiveShell<double> b{1.3, {0.5, 0.4, -0.1}, 0};
+  const auto sp = intti::make_pair(a, b);
+  const double r[3] = {0.2, 0.15, 0.25};
+  double out[3];
+  intti::detail::pair_component_laplacians(sp, 0, 0, r, 2, out); // comp 0 = p_x
+  EXPECT_NEAR(out[0], 0.061940248469279925, 1e-13);
+  EXPECT_NEAR(out[1], -0.010356409544063603, 1e-13);
+  EXPECT_NEAR(out[2], -15.930370642116578, 1e-11);
+}
+
+TEST(Tail, GtoCloudHigherOrderConverges) {
+  // GTO x point-cloud interaction: for an s-s GTO the exact value is
+  // sum_j gw_j V_GTO(r_j), V_GTO(C) = K_tot (2 pi/p) F0(p |P-C|^2). The
+  // higher-order delta tail converges to it far faster than the leading term.
+  using GTO = intti::GTOProduct<double>;
+  using PF = intti::ProductFunction<double>;
+  using TG = intti::TensorGridProduct<double>;
+  const auto bra = intti::make_pair(PrimitiveShell<double>{0.8, {0, 0, 0}, 0},
+                                    PrimitiveShell<double>{1.1, {0.4, 0, 0}, 0});
+  // point cloud (values = 1 -> a weighted set of delta points), near the product
+  TG cloud;
+  cloud.x = {-0.1, 0.25, 0.6};
+  cloud.y = {-0.3, 0.0, 0.3};
+  cloud.z = {-0.3, 0.0, 0.3};
+  cloud.wx = {0.4, 0.5, 0.4};
+  cloud.wy = {0.4, 0.5, 0.4};
+  cloud.wz = {0.4, 0.5, 0.4};
+  cloud.values.assign(cloud.x.size() * cloud.y.size() * cloud.z.size(), 1.0);
+  const double p = bra.p, Ktot = bra.K[0] * bra.K[1] * bra.K[2];
+  auto F0 = [](double xx) {
+    return xx < 1e-13 ? 1.0 : 0.5 * std::sqrt(M_PI / xx) * std::erf(std::sqrt(xx));
+  };
+  double exact = 0;
+  for (std::size_t i = 0; i < cloud.x.size(); ++i)
+    for (std::size_t j = 0; j < cloud.y.size(); ++j)
+      for (std::size_t k = 0; k < cloud.z.size(); ++k) {
+        const double dx = bra.P[0] - cloud.x[i], dy = bra.P[1] - cloud.y[j],
+                     dz = bra.P[2] - cloud.z[k];
+        const double R2 = dx * dx + dy * dy + dz * dz;
+        exact += cloud.wx[i] * cloud.wy[j] * cloud.wz[k] * Ktot * (2 * M_PI / p) * F0(p * R2);
+      }
+  auto err = [&](int K) {
+    auto sp = intti::linlog_for<double>(6.0, 1e-15);
+    sp.tail_order = K;
+    const double v = intti::interaction<double>(PF{GTO{bra, 0, 0}}, PF{cloud},
+                                                intti::make_tgrid(intti::coulomb(), sp));
+    return std::abs((v - exact) / exact);
+  };
+  const double e0 = err(0), e2 = err(2);
+  EXPECT_LT(e2, e0 * 1e-2) << "e0=" << e0 << " e2=" << e2;
+  EXPECT_LT(e2, 1e-6);
+}
+
 #ifdef INTTI_HAVE_QUADMATH
 TEST(Tail, QuadPrecisionDeepAccuracy) {
   // In quad the tail residual is visible far below the double floor: at a hard
