@@ -39,7 +39,9 @@ namespace intti {
 /// integrand converges exponentially and is near-optimal for 1/r over a finite
 /// range -- log-spaced nodes t_k = e^{s_k} with weight (2/sqrt pi) h t_k. Node
 /// count grows only ~log(range)*log(1/eps), unlike the Mobius map's superlinear
-/// tail growth. Coulomb kernel only.
+/// tail growth. For [0, inf) kernels with tail decay -- Coulomb and Yukawa (whose
+/// e^{-kappa^2/4t^2} factor even kills the slow small-t tail). erf/erfc have a
+/// hard boundary at omega (only O(h^2) for the sinc rule) -- use Mobius there.
 enum class TMapping { Mobius, LinLog, ExpSum };
 
 template <class Real = double> struct TGridSpec {
@@ -203,19 +205,31 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
     // untruncated (or exactly finite): no tail correction
     grid.t_c = Real(0);
     grid.tail_coeff = Real(0);
-  } else if (spec.mapping == TMapping::ExpSum) { // Beylkin-Monzon / sinc, Coulomb only
-    if (kernel.type != KernelType::Coulomb)
-      throw std::invalid_argument("ExpSum mapping is implemented for the Coulomb kernel only");
+  } else if (spec.mapping == TMapping::ExpSum) { // Beylkin-Monzon / sinc
+    // The trapezoidal (sinc) rule is exponentially convergent only when the
+    // integrand decays to zero at both ends. Coulomb and Yukawa are [0, inf)
+    // with tail decay (Yukawa's e^{-kappa^2/4t^2} factor even kills the slow
+    // small-t tail); erf ([0, omega]) and erfc ([omega, inf)) have a hard
+    // boundary at omega where the integrand is nonzero, so the sinc rule is
+    // only O(h^2) there -- use the Mobius mapping (Gauss-Legendre) for those.
+    if (kernel.type != KernelType::Coulomb && kernel.type != KernelType::Yukawa)
+      throw std::invalid_argument("ExpSum supports Coulomb and Yukawa; use Mobius for erf/erfc");
+    if (kernel.type == KernelType::Yukawa && kernel.kappa <= Real(0))
+      throw std::invalid_argument("Yukawa kernel needs kappa > 0");
     if (spec.es_tmin <= Real(0) || spec.es_tmax <= spec.es_tmin || spec.es_h <= Real(0))
       throw std::invalid_argument("ExpSum needs 0 < es_tmin < es_tmax and es_h > 0");
-    const Real smin = log_(spec.es_tmin), smax = log_(spec.es_tmax);
-    const int nn = static_cast<int>((smax - smin) / spec.es_h) + 1;
-    grid.t.reserve(nn);
-    grid.w.reserve(nn);
-    for (int k = 0; k < nn; ++k) {
-      const Real t = exp_(smin + Real(k) * spec.es_h);
+    const Real slo = log_(spec.es_tmin), shi = log_(spec.es_tmax);
+    int nn = static_cast<int>((shi - slo) / spec.es_h + Real(0.5));
+    if (nn < 1) nn = 1;
+    const Real hh = (shi - slo) / Real(nn); // land the endpoints exactly on nodes
+    grid.t.reserve(nn + 1);
+    grid.w.reserve(nn + 1);
+    for (int k = 0; k <= nn; ++k) {
+      const Real t = exp_(slo + Real(k) * hh);
       grid.t.push_back(t);
-      grid.w.push_back(spec.es_h * t); // trapezoidal step times the jacobian dt = t ds
+      Real wk = hh * t;                     // trapezoidal step times dt = t ds
+      if (k == 0 || k == nn) wk *= Real(0.5); // trapezoidal endpoints
+      grid.w.push_back(wk);
     }
     grid.t_c = Real(0);
     grid.tail_coeff = Real(0);

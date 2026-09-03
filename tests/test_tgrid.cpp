@@ -179,4 +179,29 @@ TEST(TGrid, BeylkinMonzonFewerNodesThanMobius) {
   EXPECT_LT(bm.n(), mob.n()) << "BM should need fewer nodes: bm=" << bm.n() << " mob=" << mob.n();
 }
 
+TEST(TGrid, ExpSumYukawaPointwise) {
+  // Yukawa is the natural range-separated fit for the sinc grid: the
+  // e^{-kappa^2/4t^2} factor kills the small-t tail, so both ends decay and the
+  // trapezoidal rule is exponentially convergent.
+  const double kappa = 1.3;
+  intti::TGridSpec<double> spec;
+  spec.mapping = intti::TMapping::ExpSum;
+  spec.es_tmin = 0.05;
+  spec.es_tmax = 1e2;
+  spec.es_h = 0.2;
+  auto grid = intti::make_tgrid(intti::yukawa(kappa), spec);
+  for (double r : {0.1, 0.3, 1.0, 2.0, 3.0})
+    EXPECT_NEAR(kernel_quad(grid, r), std::exp(-kappa * r) / r, 1e-9)
+        << "r=" << r << " n=" << grid.n();
+}
+
+TEST(TGrid, ExpSumRejectsRangeSeparated) {
+  // erf/erfc have a hard boundary at omega (only O(h^2) for the sinc rule), so
+  // the ExpSum mapping refuses them -- Mobius (Gauss-Legendre) is the tool there.
+  intti::TGridSpec<double> spec;
+  spec.mapping = intti::TMapping::ExpSum;
+  EXPECT_THROW(intti::make_tgrid(intti::erf_rs(0.7), spec), std::invalid_argument);
+  EXPECT_THROW(intti::make_tgrid(intti::erfc_rs(0.7), spec), std::invalid_argument);
+}
+
 } // namespace

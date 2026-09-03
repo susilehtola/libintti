@@ -234,7 +234,13 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   over [1e-5, 1e9] (14 decades) it matches accuracy (6.6e-9) at 161 nodes vs the
   Mobius 208, and the gap widens with the range. The small-t (large-r) side has a
   slow e^s tail needing a wide low-t margin (the large-t side cuts off
-  super-exponentially). Coulomb kernel only. Validated vs analytic (ss|ss).
+  super-exponentially). Validated vs analytic (ss|ss). The range-separated
+  extension is done: ExpSum also covers the Yukawa (screened Coulomb) kernel,
+  whose e^{-kappa^2/4t^2} factor kills the slow small-t tail, so both ends decay
+  and the sinc rule is cleanly exponential (validated: Yukawa kernel reproduced
+  to 1e-9). erf/erfc have a hard boundary at omega where the integrand is nonzero
+  -- the trapezoidal rule is only O(h^2) there -- so ExpSum refuses them; Mobius
+  (Gauss-Legendre, spectral on the finite/shifted range) is the tool for those.
 
 - **M15 — NAO support: OUT OF SCOPE (dropped).** libintti does everything
   natively in GTOs; the STO path earns its place because it is the *integral
