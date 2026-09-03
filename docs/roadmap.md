@@ -385,12 +385,17 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   the error by ~4^{K+2}: 16/64/256/1024 for K=0/1/2/3), and at a hard t_c=6 the
   order-3 tail reaches ~7e-12 where the leading tail is ~3e-5 -- a 4x smaller
   t_c (much cheaper explicit grid) for the same accuracy, exactly the goal.
-  Remaining: wire tail_order into the J/K/PSC consumers (`jbuild.hpp`,
-  `kbuild.hpp`, `product.hpp` still use the leading term only), the STO
-  s-quadrature tail (same series corrects the tight-Gaussian delta-like tail),
-  and minimax t-node placement for the explicit [0, t_c] range. Prototypes:
-  prototype/sto_validation.py (STO = quadrature-contracted GTO, 5*zeta/8 to
-  7e-12).
+  The matrix-level J and K builders carry it through: `jbuild.hpp`/`kbuild.hpp`
+  fold the tail as one pseudo-node per Laplacian-order combination (a,b,c),
+  a+b+c <= Ktail, each with weight b_{a+b+c}/(a!b!c!) and per-axis Hermite-index
+  shifts 2a/2b/2c on the same contraction (the leading tail is the single
+  (0,0,0) node, unchanged at tail_order=0). Validated (`tests/test_tail.cpp`):
+  J and K over an s/p basis converge to the untruncated reference far faster at
+  order 2 than order 0. Remaining: the PSC/grid consumer (`product.hpp` still
+  uses the leading term only), the STO s-quadrature tail (same series corrects
+  the tight-Gaussian delta-like tail), and minimax t-node placement for the
+  explicit [0, t_c] range. Prototypes: prototype/sto_validation.py (STO =
+  quadrature-contracted GTO, 5*zeta/8 to 7e-12).
 
 ## Standing items
 

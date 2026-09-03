@@ -6,6 +6,7 @@
 // so a harder (cheaper) truncation reaches the same accuracy. Oracle values are
 // derived in references/sympy_tail.py.
 #include <cmath>
+#include <random>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -13,6 +14,7 @@
 #include <quadmath.h>
 #endif
 
+#include "intti/fock.hpp"
 #include "intti/quartet.hpp"
 
 namespace {
@@ -117,6 +119,57 @@ TEST(Tail, OrderClampedToKMax) {
   spec.tail_order = 100;
   auto grid = intti::make_tgrid(intti::coulomb(), spec);
   EXPECT_EQ(grid.tail_order, intti::TAIL_KMAX);
+}
+
+TEST(Tail, CoulombExchangeBuildHigherOrder) {
+  // The higher-order tail flows through the matrix-level J and K builders:
+  // both converge to the untruncated reference far faster than order 0.
+  auto b = intti::make_basis<double>({{1.2, {0, 0, 0}, 0},
+                                      {0.35, {0, 0, 0}, 0},
+                                      {0.8, {0, 0, 0}, 1},
+                                      {1.5, {0, 0, 1.3}, 0},
+                                      {0.5, {0, 0, 1.3}, 1}});
+  const int nao = b.nao, n2 = nao * nao;
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<double> u(-1, 1);
+  std::vector<double> D(n2);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j <= i; ++j)
+      D[i * nao + j] = D[j * nao + i] = u(rng);
+
+  intti::TGridSpec<double> ms;
+  ms.mapping = intti::TMapping::Mobius;
+  ms.n = 200;
+  const auto ref = intti::make_tgrid(intti::coulomb(), ms);
+  std::vector<double> Jref(n2), Kref(n2);
+  intti::coulomb_build(b, D.data(), ref, Jref.data());
+  intti::exchange_build(b, D.data(), ref, Kref.data(), 0.0, 0, 1);
+
+  auto build = [&](int K, std::vector<double> &J, std::vector<double> &Kk) {
+    auto sp = intti::linlog_for<double>(10.0, 1e-15);
+    sp.tail_order = K;
+    const auto g = intti::make_tgrid(intti::coulomb(), sp);
+    J.assign(n2, 0.0);
+    Kk.assign(n2, 0.0);
+    intti::coulomb_build(b, D.data(), g, J.data());
+    intti::exchange_build(b, D.data(), g, Kk.data(), 0.0, 0, 1);
+  };
+  std::vector<double> J0, K0, J2, K2;
+  build(0, J0, K0);
+  build(2, J2, K2);
+  double jr = 0, je0 = 0, je2 = 0, kr = 0, ke0 = 0, ke2 = 0;
+  for (int i = 0; i < n2; ++i) {
+    jr = std::max(jr, std::abs(Jref[i]));
+    je0 = std::max(je0, std::abs(J0[i] - Jref[i]));
+    je2 = std::max(je2, std::abs(J2[i] - Jref[i]));
+    kr = std::max(kr, std::abs(Kref[i]));
+    ke0 = std::max(ke0, std::abs(K0[i] - Kref[i]));
+    ke2 = std::max(ke2, std::abs(K2[i] - Kref[i]));
+  }
+  EXPECT_LT(je2 / jr, 1e-7) << "J order-2 rel err " << je2 / jr;
+  EXPECT_LT(ke2 / kr, 1e-7) << "K order-2 rel err " << ke2 / kr;
+  EXPECT_LT(je2, je0 * 1e-2) << "J: order-2 not better than order-0";
+  EXPECT_LT(ke2, ke0 * 1e-2) << "K: order-2 not better than order-0";
 }
 
 #ifdef INTTI_HAVE_QUADMATH

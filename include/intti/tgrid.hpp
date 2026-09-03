@@ -82,6 +82,10 @@ template <class Real = double> struct TGridSpec {
 /// Highest supported Losilla tail order k (compile-time bound on stack arrays;
 /// order k removes the 1/t_c^{2k+2} residual term -- see tail_order below).
 inline constexpr int TAIL_KMAX = 4;
+/// Number of (a,b,c) Laplacian-order combinations with a+b+c <= TAIL_KMAX,
+/// C(TAIL_KMAX+3, 3): the J/K builders fold the tail as this many pseudo-nodes.
+inline constexpr int TAIL_NCOMBO =
+    (TAIL_KMAX + 1) * (TAIL_KMAX + 2) * (TAIL_KMAX + 3) / 6;
 
 template <class Real = double> struct TGrid {
   std::vector<Real> t; ///< quadrature nodes (host)

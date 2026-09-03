@@ -53,6 +53,8 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
   const int nt = grid.n();
   const Real pi = pi_v<Real>();
   const Real tail_coeff = grid.tail_coeff;
+  const int Ktail = tail_coeff != Real(0) ? grid.tail_order : 0;
+  const Real tc = grid.t_c;
 
   // per-pair offsets: products (D/J indexing) and Hermite tensors (L+1)^3
   std::vector<int> h_prod(npair + 1, 0), h_hoff(npair + 1, 0);
@@ -141,6 +143,33 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
           jp(joff + i) = 0;
         if (nranks > 1 && p % nranks != rank) return;
         const Real pp = pv(p);
+        // higher-order delta tail folded as pseudo-nodes: one per Laplacian-order
+        // combination (a,b,c), a+b+c <= Ktail, with the pair-independent weight
+        // b_{a+b+c}/(a!b!c!), b_k = pi/(4^k (k+1) t_c^{2k+2}), and per-axis
+        // Hermite-index shifts 2a/2b/2c (a ket derivative raises the index).
+        int tsa[TAIL_NCOMBO], tsb[TAIL_NCOMBO], tsc[TAIL_NCOMBO], ntail = 0;
+        Real twf[TAIL_NCOMBO];
+        if (tail_coeff != Real(0)) {
+          Real bcoef[TAIL_KMAX + 1], invf[TAIL_KMAX + 1];
+          const Real tc2 = tc * tc;
+          Real p4 = 1, tcp = tc2, fact = 1;
+          for (int kk = 0; kk <= Ktail; ++kk) {
+            bcoef[kk] = pi / (p4 * (kk + 1) * tcp);
+            if (kk > 0) fact *= kk;
+            invf[kk] = Real(1) / fact;
+            p4 *= 4;
+            tcp *= tc2;
+          }
+          for (int a = 0; a <= Ktail; ++a)
+            for (int b = 0; b <= Ktail - a; ++b)
+              for (int c = 0; c <= Ktail - a - b; ++c) {
+                tsa[ntail] = a;
+                tsb[ntail] = b;
+                tsc[ntail] = c;
+                twf[ntail] = bcoef[a + b + c] * invf[a] * invf[b] * invf[c];
+                ntail++;
+              }
+        }
         for (int q = 0; q < npair; ++q) {
           if (screen && Qv(p) * bv(q) < tau) continue;
           const int Lq = lav(q) + lbv(q), nq1 = Lq + 1;
@@ -150,13 +179,15 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
           for (int d = 0; d < 3; ++d)
             X[d] = Pv(p, d) - Pv(q, d);
           const int nB = Lp + Lq + 1;
-          Real Bx[2 * JLMAX + 1], By[2 * JLMAX + 1], Bz[2 * JLMAX + 1];
+          Real Bx[2 * JLMAX + 2 * TAIL_KMAX + 1], By[2 * JLMAX + 2 * TAIL_KMAX + 1],
+              Bz[2 * JLMAX + 2 * TAIL_KMAX + 1];
           Real t1[(JLMAX + 1) * (JLMAX + 1) * (JLMAX + 1)];
           Real t2[(JLMAX + 1) * (JLMAX + 1) * (JLMAX + 1)];
-          // t nodes plus, for truncated grids, the delta-tail pseudo-node
-          const int nsweep = tail_coeff != Real(0) ? nt + 1 : nt;
+          // t nodes plus, for truncated grids, the delta-tail pseudo-nodes
+          const int nsweep = nt + ntail;
           for (int it = 0; it < nsweep; ++it) {
             Real theta, wpref;
+            int sa = 0, sb = 0, sc = 0; // per-axis Hermite-index shifts (2*order)
             if (it < nt) {
               const Real t = tv(it);
               const Real Dden = pp * pq + t * t * (pp + pq);
@@ -164,20 +195,24 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
               const Real pr = pi / sqrt_(Dden);
               wpref = wv(it) * pr * pr * pr;
             } else {
+              const int j = it - nt;
+              sa = 2 * tsa[j];
+              sb = 2 * tsb[j];
+              sc = 2 * tsc[j];
               theta = pp * pq / (pp + pq); // rho_pq
               const Real pr = sqrt_(pi / (pp + pq));
-              wpref = tail_coeff * pr * pr * pr;
+              wpref = twf[j] * pr * pr * pr;
             }
-            hermite_b(nB - 1, theta, X[0], Bx);
-            hermite_b(nB - 1, theta, X[1], By);
-            hermite_b(nB - 1, theta, X[2], Bz);
+            hermite_b(nB - 1 + sa, theta, X[0], Bx);
+            hermite_b(nB - 1 + sb, theta, X[1], By);
+            hermite_b(nB - 1 + sc, theta, X[2], Bz);
             // mode contractions with the (-1)^tau ket signs
             for (int t = 0; t < np1; ++t)
               for (int nu = 0; nu < nq1; ++nu)
                 for (int ph = 0; ph < nq1; ++ph) {
                   Real s = 0;
                   for (int tau = 0; tau < nq1; ++tau) {
-                    const Real term = dq(doff + (tau * nq1 + nu) * nq1 + ph) * Bx[t + tau];
+                    const Real term = dq(doff + (tau * nq1 + nu) * nq1 + ph) * Bx[t + tau + sa];
                     s += tau % 2 ? -term : term;
                   }
                   t1[(t * nq1 + nu) * nq1 + ph] = s;
@@ -187,7 +222,7 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
                 for (int ph = 0; ph < nq1; ++ph) {
                   Real s = 0;
                   for (int nu = 0; nu < nq1; ++nu) {
-                    const Real term = t1[(t * nq1 + nu) * nq1 + ph] * By[u + nu];
+                    const Real term = t1[(t * nq1 + nu) * nq1 + ph] * By[u + nu + sb];
                     s += nu % 2 ? -term : term;
                   }
                   t2[(t * np1 + u) * nq1 + ph] = s;
@@ -197,7 +232,7 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
                 for (int v = 0; v < np1; ++v) {
                   Real s = 0;
                   for (int ph = 0; ph < nq1; ++ph) {
-                    const Real term = t2[(t * np1 + u) * nq1 + ph] * Bz[v + ph];
+                    const Real term = t2[(t * np1 + u) * nq1 + ph] * Bz[v + ph + sc];
                     s += ph % 2 ? -term : term;
                   }
                   jp(joff + (t * np1 + u) * np1 + v) += wpref * s;

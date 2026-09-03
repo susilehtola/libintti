@@ -59,6 +59,8 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
   const int nt = grid.n();
   const Real pi = pi_v<Real>();
   const Real tail_coeff = grid.tail_coeff;
+  const int Ktail = tail_coeff != Real(0) ? grid.tail_order : 0;
+  const Real tc = grid.t_c;
 
   for (const auto &sh : shells)
     if (sh.l > KLMAX)
@@ -131,6 +133,31 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
           cart_comp(la, k, a3s[k][0], a3s[k][1], a3s[k][2]);
         for (int k = 0; k < ncb; ++k)
           cart_comp(lb, k, b3s[k][0], b3s[k][1], b3s[k][2]);
+        // higher-order delta-tail pseudo-nodes: one per Laplacian order (a,b,c),
+        // a+b+c <= Ktail, weight b_{a+b+c}/(a!b!c!) and per-axis index shift 2*.
+        int tsa[TAIL_NCOMBO], tsb[TAIL_NCOMBO], tsc[TAIL_NCOMBO], ntail = 0;
+        Real twf[TAIL_NCOMBO];
+        if (tail_coeff != Real(0)) {
+          Real bcoef[TAIL_KMAX + 1], invf[TAIL_KMAX + 1];
+          const Real tc2 = tc * tc;
+          Real p4 = 1, tcp = tc2, fact = 1;
+          for (int kk = 0; kk <= Ktail; ++kk) {
+            bcoef[kk] = pi / (p4 * (kk + 1) * tcp);
+            if (kk > 0) fact *= kk;
+            invf[kk] = Real(1) / fact;
+            p4 *= 4;
+            tcp *= tc2;
+          }
+          for (int ta = 0; ta <= Ktail; ++ta)
+            for (int tb = 0; tb <= Ktail - ta; ++tb)
+              for (int tcc = 0; tcc <= Ktail - ta - tb; ++tcc) {
+                tsa[ntail] = ta;
+                tsb[ntail] = tb;
+                tsc[ntail] = tcc;
+                twf[ntail] = bcoef[ta + tb + tcc] * invf[ta] * invf[tb] * invf[tcc];
+                ntail++;
+              }
+        }
         for (int c = 0; c < ns; ++c) {
           const int lc = lv(c), ncc = ncart(lc);
           const int p = a * ns + c;
@@ -152,9 +179,10 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
             const int eszp = (la + 1) * (lc + 1) * np_e;
             const int eszq = (lb + 1) * (ld + 1) * nq_e;
             const int nB = np_e + nq_e - 1;
-            const int nsweep = tail_coeff != Real(0) ? nt + 1 : nt;
+            const int nsweep = nt + ntail;
             for (int it = 0; it < nsweep; ++it) {
               Real theta, wt, prefd;
+              int sh[3] = {0, 0, 0}; // per-axis Hermite-index shift (2*order)
               if (it < nt) {
                 const Real t = tv(it);
                 const Real Dden = pp * pq + t * t * (pp + pq);
@@ -162,15 +190,19 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
                 prefd = pi / sqrt_(Dden);
                 wt = wv(it);
               } else {
+                const int j = it - nt;
+                sh[0] = 2 * tsa[j];
+                sh[1] = 2 * tsb[j];
+                sh[2] = 2 * tsc[j];
                 theta = pp * pq / (pp + pq);
                 prefd = sqrt_(pi / (pp + pq));
-                wt = tail_coeff;
+                wt = twf[j];
               }
               // per-direction pair-pair 1D integrals over all component combos
               Real g[3][KC1 * KC1 * KC1 * KC1];
-              Real B[4 * KLMAX + 1];
+              Real B[4 * KLMAX + 2 * TAIL_KMAX + 1];
               for (int dd = 0; dd < 3; ++dd) {
-                hermite_b(nB - 1, theta, X[dd], B);
+                hermite_b(nB - 1 + sh[dd], theta, X[dd], B);
                 const Real *Ep = &Ev(eoffv(p) + dd * eszp);
                 const Real *Eq = &Ev(eoffv(q) + dd * eszq);
                 for (int ia = 0; ia <= la; ++ia)
@@ -182,7 +214,7 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
                           const Real ep = Ep[(ia * (lc + 1) + ic) * np_e + t];
                           for (int u = 0; u <= ib + id; ++u) {
                             const Real term = ep * Eq[(ib * (ld + 1) + id) * nq_e + u] *
-                                              B[t + u];
+                                              B[t + u + sh[dd]];
                             s += u % 2 ? -term : term;
                           }
                         }
