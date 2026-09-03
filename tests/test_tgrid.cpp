@@ -222,4 +222,46 @@ TEST(TGrid, ExpSumRejectsRangeSeparated) {
   EXPECT_THROW(intti::make_tgrid(intti::erfc_rs(0.7), spec), std::invalid_argument);
 }
 
+// M-TC: a Gaussian-geminal 2e integral <ab|sum_k c_k e^{-g_k r12^2}|cd> built
+// from gaussian_geminal + eri_quartet must equal the closed-form ss geminal
+// integral K_ab K_cd pi^3/D^{3/2} exp(-g pq/D R^2), D = pq + g(p+q). This is
+// the F12/transcorrelated building block: the same grid drives the geminal J/K
+// matrix builds via coulomb_build/exchange_build.
+TEST(TGrid, GaussianGeminalMatchesAnalytic) {
+  const intti::PrimitiveShell<double> a{0.8, {0, 0, 0}, 0};
+  const intti::PrimitiveShell<double> b{1.3, {0.2, -0.1, 0.3}, 0};
+  const intti::PrimitiveShell<double> c{2.1, {1.0, 0.8, 0.0}, 0};
+  const intti::PrimitiveShell<double> d{0.35, {0.9, 1.1, -0.2}, 0};
+  const auto bra = intti::make_pair(a, b);
+  const auto ket = intti::make_pair(c, d);
+  const double p = bra.p, q = ket.p;
+  double R2 = 0;
+  for (int i = 0; i < 3; ++i) {
+    const double dd = bra.P[i] - ket.P[i];
+    R2 += dd * dd;
+  }
+  const double Kab = bra.K[0] * bra.K[1] * bra.K[2];
+  const double Kcd = ket.K[0] * ket.K[1] * ket.K[2];
+  auto ss_gem = [&](double g) {
+    const double D = p * q + g * (p + q);
+    return Kab * Kcd * std::pow(M_PI, 3) / std::pow(D, 1.5) *
+           std::exp(-g * p * q / D * R2);
+  };
+  // single geminal
+  for (double g : {0.3, 1.0, 3.0}) {
+    auto grid = intti::gaussian_geminal<double>({g}, {1.0});
+    double v = 0;
+    intti::eri_quartet(bra, ket, grid, &v);
+    EXPECT_NEAR(v, ss_gem(g), 1e-12 * std::abs(ss_gem(g)));
+  }
+  // STG-nG style geminal sum
+  const std::vector<double> gs = {0.2, 0.8, 3.0}, cs = {0.5, 0.3, 0.2};
+  auto grid = intti::gaussian_geminal(gs, cs);
+  double v = 0;
+  intti::eri_quartet(bra, ket, grid, &v);
+  double ref = 0;
+  for (std::size_t k = 0; k < gs.size(); ++k) ref += cs[k] * ss_gem(gs[k]);
+  EXPECT_NEAR(v, ref, 1e-12 * std::abs(ref));
+}
+
 } // namespace

@@ -212,10 +212,21 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   - L (three-body): each cross-gradient term (grad_i u_ij).(grad_i u_ik) is the
     cross moment three_electron_moment (moment=2); L is the sum of its three
     electron-pair permutations. done and independently validated.
-  - The ONE genuinely new integral: K's NON-HERMITIAN term nabla_i u_ij . nabla_i
-    -- a 2-electron integral pairing the geminal-gradient operator (a (x1-x2)-
-    weighted geminal, moment-type) with a derivative on a ket orbital (deriv.hpp
-    center-shift). Both ingredients exist; needs a dedicated matrix-level routine.
+  - The ONE genuinely new integral: K's NON-HERMITIAN term nabla_i u_ij . nabla_i.
+    Integrating by parts moves the geminal gradient (x1-x2) off the operator onto
+    the electron-1 orbitals, collapsing the (x1-x2)-weighted "moment" geminal to
+    PLAIN geminal integrals with derivative-shifted orbitals -- no moment code:
+      <pq| grad_1 u.grad_1 |rs>
+        = - sum_k c_k sum_d [ G_k(d_d p, q; d_d r, s) + G_k(p, q; d_d^2 r, s) ]
+    where G_k(..) = <..|e^{-g_k r12^2}|..> is the plain Gaussian-geminal 2e
+    integral and d_d/d_d^2 are orbital derivatives (deriv.hpp center-shifts).
+    Both ingredients now exist as first-class pieces: the geminal 2e integral is a
+    `gaussian_geminal(g,c)` TGrid (tgrid.hpp) fed to eri_quartet / coulomb_build /
+    exchange_build -- VALIDATED to 1e-16 vs the closed-form ss geminal integral
+    (test_tgrid GaussianGeminalMatchesAnalytic). The same grid gives the geminal
+    J/K matrices, so K's Hermitian pieces (1/2 nabla^2 u, 1/2 (nabla u)^2) are just
+    geminal J/K builds. Remaining: assemble the non-Hermitian term from
+    derivative-shifted shells (erigrad-style) over the geminal grid, matrix-level.
   So the milestone is: (1) the non-Hermitian nabla_u.nabla 2-body operator;
   (2) a matrix-level TC-Hamiltonian assembler producing the effective
   (non-Hermitian) 1e/2e integrals + the 3-body L contributions a TC-FCIQMC /

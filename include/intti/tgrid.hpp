@@ -426,4 +426,27 @@ TGrid<Real> make_tgrid(const Kernel<Real> &kernel, const TGridSpec<Real> &spec =
   return grid;
 }
 
+/// TGrid representing a Gaussian-geminal operator sum_k c_k exp(-g_k r12^2) as a
+/// fixed node list: t_k = sqrt(g_k), w_k = c_k (NO 2/sqrt(pi) Coulomb prefactor,
+/// no truncation tail). Fed to eri_quartet / coulomb_build / exchange_build it
+/// yields the geminal two-electron integrals / J / K -- the F12 & transcorrelated
+/// building block (M-TC): the operator f, f^2, (nabla f)^2 and nabla^2 f are all
+/// Gaussian-geminal sums, so each is one such grid. (Tests validate vs the
+/// closed-form ss geminal integral K_ab K_cd pi^3/D^{3/2} exp(-g pq/D R^2).)
+template <class Real = double>
+TGrid<Real> gaussian_geminal(const std::vector<Real> &g, const std::vector<Real> &c) {
+  TGrid<Real> grid;
+  grid.t.reserve(g.size());
+  grid.w.reserve(g.size());
+  for (std::size_t k = 0; k < g.size(); ++k) {
+    grid.t.push_back(sqrt_(g[k]));
+    grid.w.push_back(c[k]);
+  }
+  if constexpr (kokkos_scalar_v<Real>) {
+    grid.t_dev = detail::to_device(grid.t, "intti::geminal::t");
+    grid.w_dev = detail::to_device(grid.w, "intti::geminal::w");
+  }
+  return grid;
+}
+
 } // namespace intti
