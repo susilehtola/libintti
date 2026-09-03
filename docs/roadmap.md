@@ -399,9 +399,16 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   DO NOT apply** to our t-quadrature J-engine (both optimize SHARK's
   explicit-integral MD architecture; ours is already integral-free -- see the
   per-item notes). #1 is at best a future GPU item gated on batched-GEMM infra.
-  The applicable, realizable items are **#2** (LKC -- maintainability), **#4**
-  (Helgaker-Taylor derivatives -- a real algorithmic win), and **#5** (general
-  contraction -- needed for def2/ANO). Recommended order now: 2 -> 4 -> 5.
+  **#4** (Helgaker-Taylor derivatives) genuinely APPLIES but is a MODERATE win on
+  the derivative surface (not the SCF hot path) for a substantial implementation
+  (~1.8x on 2e gradients, more on Hessians -- see the #4 note). So the clear
+  realizable win is **#2** (LKC -- maintainability, no perf risk); **#5** (general
+  contraction) is needed for def2/ANO basis sets; **#4** is worth it only if
+  frequency/geometry-opt throughput becomes a priority. Recommended order: 2, 5,
+  then 4 if warranted. Meta-conclusion: SHARK's performance techniques target its
+  explicit-integral MD architecture; our t-quadrature J-engine is already
+  integral-free and efficient, so the transferable value is chiefly architectural
+  (#2) rather than the headline speedups.
 
   1. **BLAS-3 (GEMM) factorization of the contraction** (SHARK Eq 21, 25-26) --
      the headline performance item, = the M18 "batched-GEMM." Recast the
@@ -456,11 +463,24 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      t-quadrature J-engine is already integral-free, past the regime they
      optimize. (Where #3 could ever apply -- the explicit-integral consumers
      schwarz/cholesky via eri_quartets -- those are not the Fock hot path.)
-  4. **Helgaker-Taylor D,P derivative reformulation** (SHARK Eq 55-60): shift to
-     (D = R_A - R_B, P) so a derivative increments the Hermite order with no
-     incremented sums (dOmega/dP = sum E^t Lambda_{t+1}), then map back to A,B.
-     A cleaner/faster recursion than the center-shift in deriv.hpp/geoderiv.hpp
-     (efficiency, not a correctness gap).
+  4. **Helgaker-Taylor D,P derivative reformulation** (SHARK Eq 55-60) --
+     ASSESSED: genuinely APPLIES (unlike #1/#3), a moderate win on the DERIVATIVE
+     surface, substantial to implement. Shift to (D=R_A-R_B, P) so dOmega/dP just
+     shifts the Hermite index (Lambda_t -> Lambda_{t+1}) and dOmega/dD uses a
+     same-length E'-recursion; then dA = a/p dP + dD, dB = b/p dP - dD (no
+     incremented sums, no promoted integrals). The 1e derivatives are ALREADY
+     efficient (deriv.hpp computes the 1D overlap table once at the extended bra,
+     then a cheap per-axis shift bra_shift -- essentially the same idea), so ~no
+     win there. The 2e derivatives are the target: erigrad/erihess recompute FULL
+     quartets at l+1 (and l-1) per shell position via eri_block4. Measured
+     (`prototype/deriv_promote_bench.cpp`): an l+1 quartet costs 1.0-1.6x the base,
+     so the gradient's ~4 positions x (promote+demote) is ~8x base per quartet;
+     D,P would get all 3 components per position at ~base cost -> ~1.8x on the 2e
+     gradient, and more on Hessians (l+2 promotes). BUT the derivative surface is
+     per-geometry-step, not the per-SCF-iteration Fock hot path, so the practical
+     payoff of a substantial E'-recursion + P-shift quartet-derivative
+     implementation is moderate -- worth it mainly if frequency /
+     geometry-optimisation throughput becomes a priority.
   5. **General & partial-general contraction** (SHARK Sec 3.3-3.4): "giant"
      E-matrices per atom+angular-momentum GEMM-contracted; PGC via
      decontract -> recontract. Needed for efficiency on real def2/ANO basis sets
