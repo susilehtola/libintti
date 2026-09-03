@@ -152,6 +152,36 @@ TEST(STO, HigherOrderRadialTail) {
   EXPECT_LT(e2, 1e-6);
 }
 
+TEST(STO, HigherOrderRadialTailLGreaterZero) {
+  // The higher-order tail composes the l>0 angular parity-derivatives with the
+  // radial Laplacians (derivatives of order dB + 2p). On a mixed s/p overlap at
+  // an aggressive s_c=6, order 2 is >100x tighter than the leading term.
+  std::vector<intti::StoShell<double>> shells = {
+      {1.2, {0.0, 0.0, 0.0}, 0, 0, 0}, {1.0, {1.6, 0.0, 0.0}, 1, 0, 0},
+      {1.4, {0.3, 1.5, -0.4}, 1, 0, 0}};
+  int nao = 0;
+  for (auto &s : shells) nao += intti::ncart(s.l);
+  auto ref_shells = shells;
+  for (auto &s : ref_shells) {
+    s.ns = 200;
+    s.smax = 1e6;
+  }
+  auto exref = intti::expand_sto(ref_shells);
+  auto Sref = intti::contract_to_sto(intti::overlap_matrix(exref.prim), exref);
+  auto worst = [&](int K) {
+    auto S = intti::sto_overlap_delta(shells, 6.0, 32, 128, K);
+    double w = 0, scale = 0;
+    for (int i = 0; i < nao * nao; ++i) {
+      w = std::max(w, std::abs(S[i] - Sref[i]));
+      scale = std::max(scale, std::abs(Sref[i]));
+    }
+    return w / scale;
+  };
+  const double e0 = worst(0), e2 = worst(2);
+  EXPECT_LT(e2, e0 * 0.02) << "order-2 l>0 radial tail not tighter: e0=" << e0 << " e2=" << e2;
+  EXPECT_LT(e2, 5e-6);
+}
+
 TEST(STO, DeltaTailOverlapLGreaterZero) {
   // mixed s and p minimal STOs on three centres: the l>0 tail acts as
   // derivatives of delta, so the builder must still match the full grid.

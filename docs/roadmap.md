@@ -295,16 +295,21 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   times the parity-order (a_d mod 2) derivatives of the other orbital's low-s
   part at the partner centre; the diagonal block comes from a dense
   single-centre grid. Mixed s/p reproduces the full grid to 1e-4.
-  Higher-order (radial) delta tail done for 1s (`sto_overlap_delta` radial_order,
-  `detail::sto_tail_weight_radial` + `lap_orders_1s`): the tight tail Gaussians
-  sample not just phi_partner(centre) but its Laplacians, tail = sum_k W_k
-  (nabla^2)^k phi_partner(centre), W_k = (8 pi/(k! zeta^{3+2k})) gamma(k+2, u_c)
-  (references/sympy_slater.py; k=0 is the leading weight). Each order removes a
-  1/s_c power, so a much harder truncation reaches the same accuracy -- at s_c=6
-  the order-2 tail is ~100x tighter than the leading term (1.5e-5 -> 1.3e-7),
-  i.e. s_c=6 buys what s_c~20 needs at order 0. l>0 keeps the leading radial term
-  (composing the angular parity-derivatives with the radial Laplacians is future
-  work).
+  Higher-order (radial) delta tail done, any l (`sto_overlap_delta` radial_order,
+  `detail::sto_tail_weight_comp_p` + the generalised `g1d`): the tight tail
+  Gaussians sample not just phi_partner(centre) but its derivatives, so the tail
+  composes the l>0 angular parity-derivatives with the radial Laplacians --
+  sum_{1<=|p|<=K} W^{(p)} d^{dB+2p} phi_partner(centre), the partner
+  differentiated to order dB_d+2p_d per axis (dB = a%2 the leading parity),
+  W^{(p)} = [prod_d (2(N_d+p_d)-1)!!/(dB_d+2p_d)!] 8 pi 2^{N+k} gamma(N+k+2,u_c)/
+  zeta^{3+2(N+k)}, N_d=(a_d+a_d%2)/2, k=|p|, u_c=zeta^2/(4 s_c). p=0 recovers the
+  leading sto_tail_weight_comp; a=0 gives the pure 1s W_k (nabla^2)^k after the
+  multinomial over p (references/sympy_slater.py verifies W_1..W_3 of the radial
+  slice). Each order removes a 1/s_c power, so a much harder truncation reaches
+  the same accuracy -- at s_c=6 the order-2 tail is ~100x tighter than the leading
+  term for both 1s (1.5e-5 -> 1.3e-7) and mixed s/p (1.1e-4 -> 5.6e-7); s_c=6
+  buys what s_c~20 needs at order 0. g1d generalised from parity {0,1} to any
+  derivative order via the coefficient map Poly -> Poly' - 2 s u Poly.
   Two-electron delta-tail done for the two-centre density Coulomb repulsion
   (`sto_coulomb_2c_delta`): rho_A's s-grid is truncated at t_c and its tight
   tail charge Q_tail contributes Q_tail * V_B(A), the tail sitting at A and
@@ -449,10 +454,10 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   the tail already delivers the dominant savings and LinLog is at the optimal
   ~log(t_c)log(1/eps) rate, the value/effort is poor; deferred.
 
-  The STO s-quadrature higher-order tail is done for 1s (see M-STO). Remaining
-  there: composing the l>0 angular parity-derivatives with the radial Laplacians.
-  Prototypes: prototype/sto_validation.py (STO = quadrature-contracted GTO,
-  5*zeta/8 to 7e-12).
+  The STO s-quadrature higher-order tail is done for any l (see M-STO): the l>0
+  angular parity-derivatives compose with the radial Laplacians. Prototypes:
+  prototype/sto_validation.py (STO = quadrature-contracted GTO, 5*zeta/8 to
+  7e-12).
 
 ## Standing items
 

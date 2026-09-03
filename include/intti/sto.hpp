@@ -237,61 +237,57 @@ template <class Real> Real sto_tail_weight_comp(Real zeta, const int a[3], Real 
   return C * (pi * zeta / 2) * pw * lower_gamma_int(N + 2, u);
 }
 
-/// delta-th derivative (delta in {0,1}) of u^a e^{-s u^2}.
-template <class Real> Real g1d(int a, int delta, Real s, Real u) {
-  const Real ea = std::exp(-s * u * u);
-  if (delta == 0) return std::pow(u, a) * ea;
-  Real t = -2 * s * std::pow(u, a + 1);
-  if (a >= 1) t += a * std::pow(u, a - 1);
-  return t * ea;
+/// m-th derivative d_u^m [u^a e^{-s u^2}] at u, obtained by iterating the
+/// coefficient map Poly(u) -> Poly'(u) - 2 s u Poly(u) on Poly_0 = u^a. delta in
+/// {0,1} recovers the old parity-derivative g1d.
+template <class Real> Real g1d(int a, int m, Real s, Real u) {
+  std::vector<Real> c(a + 1, Real(0));
+  c[a] = 1;
+  for (int step = 0; step < m; ++step) {
+    std::vector<Real> nc(c.size() + 1, Real(0));
+    for (int n = 0; n < static_cast<int>(c.size()); ++n) {
+      if (n >= 1) nc[n - 1] += Real(n) * c[n];
+      nc[n + 1] += Real(-2 * s) * c[n];
+    }
+    c.swap(nc);
+  }
+  Real v = 0;
+  for (int n = static_cast<int>(c.size()) - 1; n >= 0; --n) v = v * u + c[n];
+  return v * std::exp(-s * u * u);
 }
 
-/// Higher-order (radial) delta-tail weight of the s-quadrature truncated at s_c:
-/// the tight tail Gaussians sample not just V(centre) but its Laplacians, so the
-/// tail is sum_k W_k (nabla^2)^k V(centre) with
-///   W_k = (1/(4^k k!)) int_{s_c}^inf g(s,zeta) (pi/s)^{3/2} s^{-k} ds
-///       = (8 pi / (k! zeta^{3+2k})) gamma(k+2, u_c),  u_c = zeta^2/(4 s_c).
-/// k = 0 recovers sto_delta_tail_weight. (references/sympy_slater.py.)
-template <class Real> Real sto_tail_weight_radial(Real zeta, Real s_c, int k) {
+/// Higher-order delta-tail weight for a Cartesian component with powers a[3] and
+/// per-axis extra Laplacian orders p[3]. The tail of the STO samples the
+/// partner's derivatives of order dB_d + 2 p_d (dB_d = a_d % 2 the leading
+/// parity), weighted by
+///   W^{(p)} = [prod_d (2(N_d+p_d)-1)!! / (dB_d+2p_d)!]
+///             * 8 pi * 2^{N+k} gamma(N+k+2, u_c) / zeta^{3+2(N+k)},
+/// N_d = (a_d + a_d%2)/2, N = sum N_d, k = sum p_d, u_c = zeta^2/(4 s_c). p = 0
+/// recovers sto_tail_weight_comp; a = 0 gives the 1s radial weight
+/// W_k (nabla^2)^k after the multinomial sum over p. (references/sympy_slater.py.)
+template <class Real>
+Real sto_tail_weight_comp_p(Real zeta, const int a[3], const int p[3], Real s_c) {
+  int N = 0, k = 0;
+  Real coef = 1;
+  for (int d = 0; d < 3; ++d) {
+    const int Nd = (a[d] + (a[d] & 1)) / 2;
+    const int nd = Nd + p[d];
+    N += Nd;
+    k += p[d];
+    Real df = 1; // (2 nd - 1)!!
+    for (int t = 2 * nd - 1; t > 0; t -= 2) df *= t;
+    Real mf = 1; // (dB_d + 2 p_d)!
+    for (int t = 2; t <= (a[d] & 1) + 2 * p[d]; ++t) mf *= t;
+    coef *= df / mf;
+  }
   const Real pi = pi_v<Real>();
   const Real u = zeta * zeta / (4 * s_c);
+  const int Nk = N + k;
+  Real two = 1;
+  for (int t = 0; t < Nk; ++t) two *= 2; // 2^{N+k}
   Real zpow = 1;
-  for (int i = 0; i < 3 + 2 * k; ++i) zpow *= zeta; // zeta^{3+2k}
-  Real kfact = 1;
-  for (int i = 2; i <= k; ++i) kfact *= i; // k!
-  return 8 * pi / (kfact * zpow) * lower_gamma_int(k + 2, u);
-}
-
-/// (nabla^2)^k of a spherical Gaussian e^{-s|xi|^2} at offset xi, k=0..K into out
-/// (out has K+1 entries). Per axis d_x^{2p} e^{-s x^2} = s^p H_{2p}(sqrt(s) x)
-/// e^{-s x^2} (physicist Hermite), and (nabla^2)^k = sum_{p+q+r=k} k!/(p!q!r!)
-/// d_x^{2p} d_y^{2q} d_z^{2r}.
-template <class Real> void lap_orders_1s(Real s, const Real xi[3], int K, Real *out) {
-  const Real rs = std::sqrt(s);
-  Real H[3][2 * TAIL_KMAX + 1];
-  Real xi2 = 0;
-  for (int d = 0; d < 3; ++d) {
-    const Real y = rs * xi[d];
-    xi2 += xi[d] * xi[d];
-    H[d][0] = 1;
-    if (2 * K >= 1) H[d][1] = 2 * y;
-    for (int m = 1; m < 2 * K; ++m) H[d][m + 1] = 2 * y * H[d][m] - 2 * m * H[d][m - 1];
-  }
-  const Real g = std::exp(-s * xi2);
-  Real fact[TAIL_KMAX + 1];
-  fact[0] = 1;
-  for (int i = 1; i <= K; ++i) fact[i] = fact[i - 1] * i;
-  Real sk = 1; // s^k
-  for (int k = 0; k <= K; ++k) {
-    Real acc = 0;
-    for (int p = 0; p <= k; ++p)
-      for (int q = 0; q <= k - p; ++q) {
-        const int r = k - p - q;
-        acc += fact[k] / (fact[p] * fact[q] * fact[r]) * H[0][2 * p] * H[1][2 * q] * H[2][2 * r];
-      }
-    out[k] = sk * g * acc;
-    sk *= s;
-  }
+  for (int t = 0; t < 3 + 2 * Nk; ++t) zpow *= zeta; // zeta^{3+2(N+k)}
+  return coef * 8 * pi * two * lower_gamma_int(Nk + 2, u) / zpow;
 }
 } // namespace detail
 
@@ -307,9 +303,11 @@ template <class Real> void lap_orders_1s(Real s, const Real xi[3], int K, Real *
 /// single-centre grid. Reproduces the full-grid overlap from a coarse,
 /// truncated s-grid.
 /// radial_order > 0 adds the higher-order (Gaussian-smoothing) delta-tail terms
-/// sum_{k>=1} W_k (nabla^2)^k phi_partner(centre) for 1s-1s blocks (l>0 keeps the
-/// leading term; its radial extension is future work), so a coarser truncated
-/// s-grid reaches the same accuracy. Capped at TAIL_KMAX.
+/// -- the tight tail Gaussians sample the partner's derivatives of order
+/// (parity + 2p) summed over p, sum_{1<=|p|<=radial_order} W^{(p)} d^{dB+2p}
+/// phi_partner(centre) -- for any angular momentum (1s reduces to the pure
+/// (nabla^2)^k radial series). A coarser truncated s-grid then reaches the same
+/// accuracy. Capped at TAIL_KMAX.
 template <class Real>
 std::vector<Real> sto_overlap_delta(const std::vector<StoShell<Real>> &shells, Real s_c,
                                     int ns_low, int ns_dense = 128, int radial_order = 0) {
@@ -378,25 +376,22 @@ std::vector<Real> sto_overlap_delta(const std::vector<StoShell<Real>> &shells, R
                dval(A, aA, dB, shells[B].center);
           v += detail::sto_tail_weight_comp(shells[A].zeta, aA, s_c) *
                dval(B, aB, dA, shells[A].center);
-          if (Krad > 0 && lA == 0 && lB == 0) {
-            // higher-order radial tail: sum_{k>=1} W_{P,k} (nabla^2)^k phi_Q(P.center)
-            const Real xi[3] = {shells[B].center[0] - shells[A].center[0],
-                                shells[B].center[1] - shells[A].center[1],
-                                shells[B].center[2] - shells[A].center[2]};
-            Real lapA[TAIL_KMAX + 1] = {}, lapB[TAIL_KMAX + 1] = {}, tmp[TAIL_KMAX + 1];
-            for (std::size_t k = 0; k < sk[A].size(); ++k) {
-              detail::lap_orders_1s(sk[A][k], xi, Krad, tmp);
-              for (int o = 1; o <= Krad; ++o) lapA[o] += ck[A][k] * tmp[o];
-            }
-            for (std::size_t k = 0; k < sk[B].size(); ++k) {
-              detail::lap_orders_1s(sk[B][k], xi, Krad, tmp);
-              for (int o = 1; o <= Krad; ++o) lapB[o] += ck[B][k] * tmp[o];
-            }
-            for (int o = 1; o <= Krad; ++o) {
-              v += detail::sto_tail_weight_radial(shells[B].zeta, s_c, o) * lapA[o];
-              v += detail::sto_tail_weight_radial(shells[A].zeta, s_c, o) * lapB[o];
-            }
-          }
+          // higher-order tail: the tight tail Gaussians sample the partner's
+          // derivatives of order dB + 2p (parity + radial pairs), summed over
+          // p with 1 <= |p| <= Krad (|p|=0 is the leading term above). Works for
+          // any l (1s -> the (nabla^2)^k series after the multinomial over p).
+          for (int px = 0; px <= Krad; ++px)
+            for (int py = 0; py <= Krad - px; ++py)
+              for (int pz = 0; pz <= Krad - px - py; ++pz) {
+                if (px + py + pz == 0) continue;
+                const int pp[3] = {px, py, pz};
+                const int mB[3] = {dB[0] + 2 * px, dB[1] + 2 * py, dB[2] + 2 * pz};
+                v += detail::sto_tail_weight_comp_p(shells[B].zeta, aB, pp, s_c) *
+                     dval(A, aA, mB, shells[B].center);
+                const int mA[3] = {dA[0] + 2 * px, dA[1] + 2 * py, dA[2] + 2 * pz};
+                v += detail::sto_tail_weight_comp_p(shells[A].zeta, aA, pp, s_c) *
+                     dval(B, aB, mA, shells[A].center);
+              }
           S[idx] = v;
         }
       }
