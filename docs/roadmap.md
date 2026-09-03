@@ -203,7 +203,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   PairTable, no LAPACK); `pivoted_cholesky` over a shell-pair list dispatches to
   the batched path for kokkos scalars and the serial path otherwise -- one entry,
   all precisions. Validated: the serial path matches the batched at double, and
-  reconstructs the ERI far below the double floor at __float128.
+  reconstructs the ERI far below the double floor at __float128. The consumer is
+  precision-generic too: `cholesky_jk`'s only BLAS use (the K-build matmuls) goes
+  through `detail::matmul_nn`, which is BLAS for float/double and a triple loop
+  otherwise, and a ShellBasis `pivoted_cholesky` sets the pair bookkeeping for
+  any precision. So CD -> J/K runs end-to-end at long double and __float128
+  (validated against the exact four-index J/K, below the double floor). The GPU
+  path stays Kokkos (only float/double/long double are device scalars); no
+  mplapack/Eigen -- extended precision is CPU-only by nature (no __float128 GPU).
 
 - **M15 — NAO unification via fitting** (`nao.hpp`): fit NAO products to the
   GTO auxiliary set in the Coulomb metric (grid/PSC path builds the fit

@@ -8,8 +8,46 @@
 #include <gtest/gtest.h>
 
 #include "intti/cdjk.hpp"
+#include "intti/quartet.hpp"
+
+#ifdef INTTI_HAVE_QUADMATH
+#include <quadmath.h>
+#endif
 
 namespace {
+
+// Exact J/K from four-index ERIs: J_mu nu = sum (mu nu|la si) D_la si,
+// K_mu la = sum (mu nu|la si) D_nu si. Templated -> any precision (serial
+// eri_quartet path for __float128).
+template <class Real>
+void exact_jk(const intti::ShellBasis<Real> &b, const std::vector<Real> &D,
+              const intti::TGrid<intti::real_t<Real>> &grid, std::vector<Real> &J,
+              std::vector<Real> &K) {
+  const int nao = b.nao;
+  J.assign(static_cast<std::size_t>(nao) * nao, Real(0));
+  K.assign(static_cast<std::size_t>(nao) * nao, Real(0));
+  const int ns = static_cast<int>(b.shells.size());
+  for (int si = 0; si < ns; ++si)
+    for (int sj = 0; sj < ns; ++sj)
+      for (int sk = 0; sk < ns; ++sk)
+        for (int sl = 0; sl < ns; ++sl) {
+          const int na = intti::ncart(b.shells[si].l), nb = intti::ncart(b.shells[sj].l);
+          const int nc = intti::ncart(b.shells[sk].l), nd = intti::ncart(b.shells[sl].l);
+          std::vector<Real> blk(static_cast<std::size_t>(na) * nb * nc * nd);
+          intti::eri_quartet(intti::make_pair(b.shells[si], b.shells[sj]),
+                             intti::make_pair(b.shells[sk], b.shells[sl]), grid, blk.data());
+          for (int a = 0; a < na; ++a)
+            for (int bb = 0; bb < nb; ++bb)
+              for (int c = 0; c < nc; ++c)
+                for (int d = 0; d < nd; ++d) {
+                  const Real v = blk[((a * nb + bb) * nc + c) * nd + d];
+                  const int mu = b.ao_off[si] + a, nu = b.ao_off[sj] + bb;
+                  const int la = b.ao_off[sk] + c, sg = b.ao_off[sl] + d;
+                  J[static_cast<std::size_t>(mu) * nao + nu] += v * D[static_cast<std::size_t>(la) * nao + sg];
+                  K[static_cast<std::size_t>(mu) * nao + la] += v * D[static_cast<std::size_t>(nu) * nao + sg];
+                }
+        }
+}
 
 using Shell = intti::PrimitiveShell<double>;
 
@@ -74,6 +112,67 @@ TEST(CDJK, ThresholdControlledAgainstExact) {
     prevK = eK;
   }
 }
+
+TEST(CDJK, PrecisionGenericLongDouble) {
+  // long double exercises cholesky_jk's LAPACK-free matmul path; the CD-J/K must
+  // match the exact four-index J/K to the Cholesky threshold.
+  using LD = long double;
+  const std::vector<intti::PrimitiveShell<LD>> sh = {
+      {1.2L, {0.0L, 0.0L, 0.0L}, 0}, {0.8L, {0.0L, 0.0L, 0.0L}, 1},
+      {0.5L, {0.0L, 0.0L, 1.4L}, 0}, {0.9L, {0.0L, 0.0L, 1.4L}, 1}};
+  auto b = intti::make_basis<LD>(sh);
+  const int nao = b.nao;
+  std::vector<LD> D(static_cast<std::size_t>(nao) * nao);
+  { auto Dd = random_symmetric(nao, 41); for (std::size_t i = 0; i < D.size(); ++i) D[i] = Dd[i]; }
+  auto grid = intti::make_tgrid(intti::coulomb<LD>());
+  std::vector<LD> Jx, Kx;
+  exact_jk(b, D, grid, Jx, Kx);
+  intti::CholeskyOptions<LD> opt;
+  opt.tau = 1e-12L;
+  auto cb = intti::pivoted_cholesky(b, grid, opt);
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  std::vector<LD> J(n2), K(n2);
+  intti::cholesky_jk(b, cb, D.data(), J.data(), K.data());
+  LD eJ = 0, eK = 0;
+  for (std::size_t i = 0; i < n2; ++i) {
+    eJ = std::max(eJ, std::abs(J[i] - Jx[i]));
+    eK = std::max(eK, std::abs(K[i] - Kx[i]));
+  }
+  EXPECT_LT(static_cast<double>(eJ), 1e-8) << "long double CD-J";
+  EXPECT_LT(static_cast<double>(eK), 1e-8) << "long double CD-K";
+}
+
+#ifdef INTTI_HAVE_QUADMATH
+TEST(CDJK, PrecisionGenericQuad) {
+  // End-to-end __float128 CD -> J/K: serial pivoted Cholesky + precision-generic
+  // cholesky_jk, matched to the exact quad J/K far below the double floor.
+  using Q = __float128;
+  auto q = [](const char *s) { return strtoflt128(s, nullptr); };
+  const std::vector<intti::PrimitiveShell<Q>> sh = {
+      {q("1.2"), {q("0"), q("0"), q("0")}, 0}, {q("0.8"), {q("0"), q("0"), q("0")}, 1},
+      {q("0.5"), {q("0"), q("0"), q("1.4")}, 0}, {q("0.9"), {q("0"), q("0"), q("1.4")}, 1}};
+  auto b = intti::make_basis<Q>(sh);
+  const int nao = b.nao;
+  std::vector<Q> D(static_cast<std::size_t>(nao) * nao);
+  { auto Dd = random_symmetric(nao, 41); for (std::size_t i = 0; i < D.size(); ++i) D[i] = static_cast<Q>(Dd[i]); }
+  auto grid = intti::make_tgrid(intti::coulomb<Q>());
+  std::vector<Q> Jx, Kx;
+  exact_jk(b, D, grid, Jx, Kx);
+  intti::CholeskyOptions<Q> opt;
+  opt.tau = q("1e-26");
+  auto cb = intti::pivoted_cholesky(b, grid, opt); // serial
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  std::vector<Q> J(n2), K(n2);
+  intti::cholesky_jk(b, cb, D.data(), J.data(), K.data());
+  Q eJ = 0, eK = 0;
+  for (std::size_t i = 0; i < n2; ++i) {
+    eJ = std::max(eJ, static_cast<Q>(fabsq(J[i] - Jx[i])));
+    eK = std::max(eK, static_cast<Q>(fabsq(K[i] - Kx[i])));
+  }
+  EXPECT_LT(static_cast<double>(eJ), 1e-20) << "quad CD-J below double floor";
+  EXPECT_LT(static_cast<double>(eK), 1e-20) << "quad CD-K below double floor";
+}
+#endif
 
 TEST(CDJK, NullOutputsAllowed) {
   auto b = test_basis();

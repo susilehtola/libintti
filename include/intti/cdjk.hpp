@@ -34,14 +34,29 @@ CholeskyBasis<Real> two_step_cholesky(const ShellBasis<Real> &basis,
   return cb;
 }
 
+/// ShellBasis-level pivoted Cholesky that records the pair -> shell bookkeeping
+/// cholesky_jk needs. Precision-generic: dispatches to the batched path for
+/// kokkos scalars and the serial eri_quartet path otherwise (__float128 / MPFR).
+template <class Real>
+CholeskyBasis<Real> pivoted_cholesky(const ShellBasis<Real> &basis,
+                                     const TGrid<real_t<Real>> &grid,
+                                     const CholeskyOptions<Real> &opt = {}) {
+  std::vector<ShellPair<Real>> plist;
+  std::vector<std::pair<int, int>> pshell;
+  make_shell_pairs(basis, plist, pshell);
+  auto cb = pivoted_cholesky(plist, grid, opt);
+  cb.pair_shells = pshell;
+  return cb;
+}
+
 /// J and/or K from Cholesky vectors; D must be symmetric (nao x nao,
 /// row-major); either output pointer may be null. J costs O(naux nao^2),
 /// K costs O(naux nao^3) via BLAS.
 template <class Real>
 void cholesky_jk(const ShellBasis<Real> &basis, const CholeskyBasis<Real> &cb,
                  const Real *D, Real *J, Real *K) {
-  static_assert(std::is_same_v<Real, double> || std::is_same_v<Real, float>,
-                "cholesky_jk requires float or double (BLAS)");
+  // Precision-generic: BLAS for float/double, a triple-loop matmul otherwise
+  // (long double / __float128 / MPFR), via detail::matmul_nn.
   if (cb.pair_shells.empty())
     throw std::invalid_argument(
         "cholesky_jk: CholeskyBasis lacks pair bookkeeping; use the "
@@ -82,13 +97,8 @@ void cholesky_jk(const ShellBasis<Real> &basis, const CholeskyBasis<Real> &cb,
     if (K) {
       // X = LJ * D, K += X * LJ; all matrices symmetric, so the row/column
       // major distinction cancels in the final product
-      detail::gemm_nn(nao, nao, nao, LJ.data(), nao, D, nao, X.data(), nao);
-      const Real one = 1;
-      const int n = nao;
-      if constexpr (std::is_same_v<Real, double>)
-        dgemm_("N", "N", &n, &n, &n, &one, X.data(), &n, LJ.data(), &n, &one, K, &n);
-      else
-        sgemm_("N", "N", &n, &n, &n, &one, X.data(), &n, LJ.data(), &n, &one, K, &n);
+      detail::matmul_nn(nao, LJ.data(), D, X.data(), Real(0));
+      detail::matmul_nn(nao, X.data(), LJ.data(), K, Real(1));
     }
   }
 }

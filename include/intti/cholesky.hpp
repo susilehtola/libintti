@@ -77,6 +77,29 @@ void gemm_nn(int m, int n, int k, const Real *A, int lda, const Real *B, int ldb
     sgemm_("N", "N", &m, &n, &k, &one, A, &lda, B, &ldb, &zero, C, &ldc);
 }
 
+/// Precision-generic square matrix multiply C(n,n) = A B + beta C (column-major,
+/// leading dimension n). Uses BLAS for float/double and a triple loop for
+/// extended-precision scalars (long double, __float128, MPFR) that have no BLAS.
+template <class Real>
+void matmul_nn(int n, const Real *A, const Real *B, Real *C, Real beta) {
+  if constexpr (std::is_same_v<Real, double> || std::is_same_v<Real, float>) {
+    const Real one = 1;
+    if constexpr (std::is_same_v<Real, double>)
+      dgemm_("N", "N", &n, &n, &n, &one, A, &n, B, &n, &beta, C, &n);
+    else
+      sgemm_("N", "N", &n, &n, &n, &one, A, &n, B, &n, &beta, C, &n);
+  } else {
+    for (int j = 0; j < n; ++j)
+      for (int i = 0; i < n; ++i) {
+        Real s = 0;
+        for (int l = 0; l < n; ++l)
+          s += A[i + static_cast<std::size_t>(l) * n] * B[l + static_cast<std::size_t>(j) * n];
+        Real &c = C[i + static_cast<std::size_t>(j) * n];
+        c = beta * c + s;
+      }
+  }
+}
+
 /// Run a quartet batch and return the host copy of the output.
 template <class Real>
 std::vector<Real> run_batch(const PairTable<Real> &pairs,
