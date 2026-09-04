@@ -16,8 +16,8 @@ transcorrelated) operators, three-electron integrals, RI 2-/3-center tensors,
 Slater-type orbitals via the integral transform, GIAO/magnetic and geometric
 derivatives up to Hessians, far-field multipole integrals, and more — all in one
 templated, arbitrary-precision, GPU-portable engine. The pun is deliberate:
-*intti* is Finnish for the army, so the Swiss-army-knife breadth is right there
-in the name.
+*intti* is Finnish slang for military service, so the Swiss-army-knife breadth is
+right there in the name.
 
 ## Design
 
