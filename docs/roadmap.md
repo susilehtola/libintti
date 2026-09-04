@@ -829,17 +829,22 @@ DONE under this milestone (all CI-green):
   response + S=M^-1 R + all H/G/coeff intermediates + RI-J), sto.hpp
   (sparsity-aware contract, bit-identical, O(na ns np)), cholesky.hpp
   (rank-update GEMV).
-- item 3 (partial): kbuild exchange 2x (upper-triangle + mirror); threeel_ri
-  P<->Q 2x on both O(naux^3) aux loops.
-- item 4 (partial): localhybrid occupied-index collapse (eps=-1/2 u^T V u).
+- item 3 (mostly done): kbuild exchange 2x (upper-triangle + mirror); threeel_ri
+  P<->Q 2x on both O(naux^3) aux loops; screening.hpp MBIE-1/QQR distance-
+  including estimate (min(Schwarz, monopole/R), validated valid-upper-bound +
+  tighter-than-Schwarz vs eri_quartet).
+- item 4 (mostly done): localhybrid occupied-index collapse (eps=-1/2 u^T V u);
+  oneel 2x symmetry across overlap/kinetic/multipole (symmetric) and angular
+  momentum (antisymmetric).
 - tc_gradu_grad_build rewritten from an O(N^4) quartet loop to a density-folded
   geminal J-build (host-parallel over bra pairs, Schwarz-style screening).
 - CI fix: device.hpp View(std::string label,...) for Kokkos 4.5.01.
 
-REMAINING (dedicated/careful): item 1 threeel O(n^6)->O(n^4) nested-J-build;
-item 3 erigrad/erihess/giao2e 8-fold quartet symmetry + Schwarz/density
-screening, and MBIE-via-multipole distance-including screening (the Ochsenfeld
-upgrade -- note short-range operators are already distance-included by the
-geminal e^{-theta R^2} decay); item 4 oneel bra/ket symmetry + prefactor screen,
-geohess 18x-per-charge (needs a nuclear_geoderiv elevated-l block variant),
-minor caching (c2s_matrix per l, batch tail bcoef).
+REMAINING (dedicated/careful -- the hard/subtle items): item 1 threeel
+O(n^6)->O(n^4) nested-J-build (a genuine re-derivation of te_core into the field
+form); item 3 erigrad/erihess/giao2e 8-fold quartet permutational symmetry +
+Schwarz/density screening on the O(ns^4) derivative quartet loops (subtle sign/
+index bookkeeping in hot routines; screening.hpp provides the estimate); item 4
+geohess nuclear_attraction_hessian 18x-per-charge (needs a nuclear_geoderiv
+elevated-l block variant returning all (e,f) components), minor caching
+(c2s_matrix per l, batch tail bcoef -- device-lambda hoist).
