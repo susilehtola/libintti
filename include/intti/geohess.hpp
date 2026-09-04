@@ -128,20 +128,31 @@ nuclear_attraction_hessian(const ShellBasis<Real> &basis,
     H[(3 * p + e) * static_cast<std::size_t>(dim) + 3 * q + f] += v;
   };
   const std::array<int, 3> zero = {0, 0, 0};
+  // request layout: index 2*(3e+f) is the bra-bra derivative (na=e+f, nb=0),
+  // index 2*(3e+f)+1 is the bra-ket derivative (na=e, nb=f), for e,f in 0..2.
+  std::vector<std::pair<std::array<int, 3>, std::array<int, 3>>> reqs;
+  reqs.reserve(18);
+  for (int e = 0; e < 3; ++e)
+    for (int f = 0; f < 3; ++f) {
+      std::array<int, 3> nbb = {0, 0, 0}, na = {0, 0, 0}, nb = {0, 0, 0};
+      nbb[e] += 1;
+      nbb[f] += 1;
+      na[e] += 1;
+      nb[f] += 1;
+      reqs.push_back({nbb, zero});
+      reqs.push_back({na, nb});
+    }
   for (std::size_t c = 0; c < charges.size(); ++c) {
     const int nc = charge_shell[c];
     std::vector<PointCharge<Real>> one{charges[c]};
+    // one elevated build per charge yields all 18 (e,f) derivative matrices
+    auto M = detail::nuclear_geoderiv_multi(basis, one, grid, reqs);
     for (int e = 0; e < 3; ++e)
       for (int f = 0; f < 3; ++f) {
-        std::array<int, 3> nbb = {0, 0, 0}, na = {0, 0, 0}, nb = {0, 0, 0};
-        nbb[e] += 1;
-        nbb[f] += 1;
-        na[e] += 1;
-        nb[f] += 1;
-        auto Mbb = nuclear_geoderiv(basis, one, grid, nbb, zero); // d^bra_e d^bra_f
-        auto Mbk = nuclear_geoderiv(basis, one, grid, na, nb);    // d^bra_e d^ket_f
-        auto at = [&](const std::vector<Real> &M, int i, int j) {
-          return M[static_cast<std::size_t>(i) * nao + j];
+        const auto &Mbb = M[2 * (3 * e + f)];     // d^bra_e d^bra_f
+        const auto &Mbk = M[2 * (3 * e + f) + 1]; // d^bra_e d^ket_f
+        auto at = [&](const std::vector<Real> &Mx, int i, int j) {
+          return Mx[static_cast<std::size_t>(i) * nao + j];
         };
         for (int mu = 0; mu < nao; ++mu) {
           const int a = ao2sh[mu];

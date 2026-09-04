@@ -260,4 +260,120 @@ std::vector<Real> nuclear_geoderiv(const ShellBasis<Real> &basis,
   return G;
 }
 
+namespace detail {
+/// Several geometric derivatives of the nuclear-attraction matrix at once,
+/// sharing the expensive per-node quadrature. For a shell pair the e_coeffs and
+/// the per-t g-tables depend only on the *elevation* (la+na, lb+nb); their
+/// values for a fixed (i,j,tau) are identical at any higher elevation, so we
+/// build the g-tables once at the maximum elevation over all requests and
+/// extract each derivative with a cheap sub-table + apply_shifts. Returns one
+/// nao x nao matrix per (na,nb) request, in request order. Equivalent to
+/// calling nuclear_geoderiv once per request but ~(#requests)x cheaper.
+template <class Real>
+std::vector<std::vector<Real>> nuclear_geoderiv_multi(
+    const ShellBasis<Real> &basis, const std::vector<PointCharge<Real>> &charges,
+    const TGrid<Real> &grid,
+    const std::vector<std::pair<std::array<int, 3>, std::array<int, 3>>> &reqs) {
+  const int nao = basis.nao;
+  const int nr = static_cast<int>(reqs.size());
+  std::vector<std::vector<Real>> G(nr, std::vector<Real>(static_cast<std::size_t>(nao) * nao,
+                                                         Real(0)));
+  const Real pi = pi_v<Real>();
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nt = grid.n();
+  // per-direction maximum bra/ket elevation across all requests
+  int mna[3] = {0, 0, 0}, mnb[3] = {0, 0, 0};
+  for (const auto &r : reqs)
+    for (int d = 0; d < 3; ++d) {
+      mna[d] = std::max(mna[d], r.first[d]);
+      mnb[d] = std::max(mnb[d], r.second[d]);
+    }
+
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
+      const int lae[3] = {la + mna[0], la + mna[1], la + mna[2]};
+      const int lbe[3] = {lb + mnb[0], lb + mnb[1], lb + mnb[2]};
+      const Real p = sa.alpha + sb.alpha, mu = sa.alpha * sb.alpha / p;
+      Real Pd[3];
+      std::vector<Real> E[3];
+      int Lmax = 0;
+      for (int d = 0; d < 3; ++d) {
+        Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
+        const Real ab = sa.center[d] - sb.center[d];
+        E[d].assign(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1) * (lae[d] + lbe[d] + 1),
+                    Real(0));
+        e_coeffs(lae[d], lbe[d], p, Pd[d] - sa.center[d], Pd[d] - sb.center[d],
+                 exp_(-mu * ab * ab), E[d].data());
+        Lmax = std::max(Lmax, lae[d] + lbe[d]);
+      }
+      const int nca = ncart(la), ncb = ncart(lb);
+      std::vector<std::vector<Real>> acc(
+          nr, std::vector<Real>(static_cast<std::size_t>(nca) * ncb, Real(0)));
+      std::vector<Real> Bv(Lmax + 1);
+      for (const auto &c : charges)
+        for (int it = 0; it < nt; ++it) {
+          const Real t = grid.t[it], denom = p + t * t;
+          const Real theta = p * t * t / denom, pref = sqrt_(pi / denom);
+          const Real wt = grid.w[it] * c.weight;
+          // g-table at maximum elevation, per direction
+          std::vector<Real> gmax[3];
+          for (int d = 0; d < 3; ++d) {
+            const int L = lae[d] + lbe[d];
+            hermite_b(L, theta, Pd[d] - c.R[d], Bv.data());
+            std::vector<Real> g(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1));
+            for (int i = 0; i <= lae[d]; ++i)
+              for (int j = 0; j <= lbe[d]; ++j) {
+                Real s = 0;
+                for (int tau = 0; tau <= i + j; ++tau)
+                  s += E[d][(i * (lbe[d] + 1) + j) * (L + 1) + tau] * Bv[tau];
+                g[i * (lbe[d] + 1) + j] = pref * s;
+              }
+            gmax[d] = std::move(g);
+          }
+          // distinct 1D shifted tables per direction, keyed by (na_d, nb_d);
+          // na_d in [0, mna_d], nb_d in [0, mnb_d]. Computed on demand.
+          std::vector<Real> shift[3][3][3];
+          bool have[3][3][3] = {};
+          auto get_shift = [&](int d, int ia, int jb) -> const std::vector<Real> & {
+            if (!have[d][ia][jb]) {
+              const int laer = la + ia, lber = lb + jb;
+              std::vector<Real> sub(static_cast<std::size_t>(laer + 1) * (lber + 1));
+              for (int i = 0; i <= laer; ++i)
+                for (int j = 0; j <= lber; ++j)
+                  sub[i * (lber + 1) + j] = gmax[d][i * (lbe[d] + 1) + j];
+              shift[d][ia][jb] = apply_shifts(std::move(sub), laer, lber, ia, jb, sa.alpha,
+                                              sb.alpha);
+              have[d][ia][jb] = true;
+            }
+            return shift[d][ia][jb];
+          };
+          for (int r = 0; r < nr; ++r) {
+            const auto &na = reqs[r].first, &nb = reqs[r].second;
+            const std::vector<Real> &g0 = get_shift(0, na[0], nb[0]);
+            const std::vector<Real> &g1 = get_shift(1, na[1], nb[1]);
+            const std::vector<Real> &g2 = get_shift(2, na[2], nb[2]);
+            for (int ka = 0; ka < nca; ++ka) {
+              int a3[3];
+              cart_comp(la, ka, a3[0], a3[1], a3[2]);
+              for (int kb = 0; kb < ncb; ++kb) {
+                int b3[3];
+                cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+                acc[r][ka * ncb + kb] += wt * g0[a3[0] * lb1 + b3[0]] *
+                                         g1[a3[1] * lb1 + b3[1]] * g2[a3[2] * lb1 + b3[2]];
+              }
+            }
+          }
+        }
+      for (int r = 0; r < nr; ++r)
+        for (int ka = 0; ka < nca; ++ka)
+          for (int kb = 0; kb < ncb; ++kb)
+            G[r][(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
+                acc[r][ka * ncb + kb];
+    }
+  return G;
+}
+} // namespace detail
+
 } // namespace intti

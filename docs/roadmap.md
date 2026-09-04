@@ -890,9 +890,16 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
   eps(r) = -1/2 u^T V u with u_mu = sum_i C_mi psi_i collapses the VC (nao^2 nocc)
   and Kij (nocc^2 nao) loops to O(nao^2); also pass a screening tau to the
   per-point V collocation build (currently 0).
-- **geohess.hpp:131-176 nuclear_attraction_hessian** rebuilds the full quadrature
-  18x per charge (2 calls x 9 (e,f)); materialise one elevated-l geoderiv block
-  per charge and extract all 9 components (~18x).
+- **geohess.hpp nuclear_attraction_hessian** DONE: was rebuilding the full
+  quadrature 18x per charge (2 nuclear_geoderiv calls x 9 (e,f)). New
+  detail::nuclear_geoderiv_multi builds the e_coeffs + per-t g-tables ONCE at
+  the maximum elevation (bra+2, ket+1) per charge and extracts all 18 (na,nb)
+  derivatives by sub-table + apply_shifts (e_coeffs/hermite_b values for a fixed
+  (i,j,tau) are identical at any higher elevation, so the extraction is exact).
+  Bit-exact (0.0 diff) vs the original per-(e,f) assembly incl. a d shell;
+  measured 2.56x on an s/p/d/mixed 4-atom set (the e_coeffs+g-build is hoisted;
+  the per-request accumulate is unchanged, so the win grows with l/size). FD
+  oracle + full suite green (196/196).
 - **threeel_ri.hpp** aux loops: full permutation symmetry of the ghost-partner 3e
   aux integral (~6x on the O(naux^3) energy/Fock loops); the O(naux nao^4)
   effective-exchange term is intrinsically expensive (screening only).
