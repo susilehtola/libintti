@@ -99,8 +99,9 @@ std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis) {
   const int nao = basis.nao;
   std::vector<Real> S(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
+  // S is symmetric: compute the upper triangle a <= b and mirror.
   for (int a = 0; a < ns; ++a)
-    for (int b = 0; b < ns; ++b) {
+    for (int b = a; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
       std::vector<Real> sx, sy, sz;
       int lbx;
@@ -116,6 +117,8 @@ std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis) {
           const Real v = sx[a3[0] * (lbx + 1) + b3[0]] * sy[a3[1] * (lbx + 1) + b3[1]] *
                          sz[a3[2] * (lbx + 1) + b3[2]];
           S[(basis.ao_off[a] + ka) * nao + basis.ao_off[b] + kb] = v;
+          if (a != b)
+            S[(basis.ao_off[b] + kb) * nao + basis.ao_off[a] + ka] = v; // mirror
         }
       }
     }
@@ -128,8 +131,9 @@ std::vector<Real> kinetic_matrix(const ShellBasis<Real> &basis) {
   const int nao = basis.nao;
   std::vector<Real> T(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
+  // T is symmetric: compute the upper triangle a <= b and mirror.
   for (int a = 0; a < ns; ++a)
-    for (int b = 0; b < ns; ++b) {
+    for (int b = a; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
       std::vector<Real> sx, sy, sz, tx, ty, tz;
       int lbx;
@@ -154,6 +158,8 @@ std::vector<Real> kinetic_matrix(const ShellBasis<Real> &basis) {
               Sx(a3[0], b3[0]) * ty[a3[1] * lb1 + b3[1]] * Sz(a3[2], b3[2]) +
               Sx(a3[0], b3[0]) * Sy(a3[1], b3[1]) * tz[a3[2] * lb1 + b3[2]];
           T[(basis.ao_off[a] + ka) * nao + basis.ao_off[b] + kb] = v;
+          if (a != b)
+            T[(basis.ao_off[b] + kb) * nao + basis.ao_off[a] + ka] = v; // mirror
         }
       }
     }
