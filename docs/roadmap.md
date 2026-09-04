@@ -773,11 +773,20 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
   <ad|e^{-s^2 r13^2}|cf> (O(n^4) per node, cf. coulomb_build) -- which are then
   contracted with electron 1's density through a 3-way Hermite overlap:
   O(n^6 nt^2) -> O(n^4 nt^2). NOTE the reduction is NOT a trivial factorisation:
-  the central moments cm(k1,k2,k3) couple all three electrons (Ai is dense even
-  though A[1][2]=0), so it is a genuine re-derivation into the nested-J-build
-  form, not a mechanical refactor -- dedicated work, oracle-gated (test_threeel).
-  The single highest-value change; also caches te_core's exponent-triple+node
-  quantities (te_inv3, central moments, prefac) shared across sextets.
+  though A[1][2]=0 (no op23), the INVERSE is dense -- Ai[1][2] = t^2 s^2 / det
+  != 0 (verified: the (1,2) cofactor of A is +t^2 s^2), so the per-direction
+  exponent carries a cross term proportional to (P_ad-P_be).(P_ad-P_cf) that
+  couples the electron-2 and electron-3 centres THROUGH electron 1. The be-sum
+  and cf-sum therefore do not separate by reordering; the O(n^4) form must expand
+  that cross-coupling in electron 1's Hermite basis (the v2_{ad,nu} =
+  sum_be D_be <Lambda_nu^ad|e^{-t^2 r^2}|be> field build, then a 3-Hermite
+  overlap contraction), and must reproduce te_core including the moment=1,2
+  (r12^2, r12.r13) cases. This is effectively a new 3-electron engine, oracle-
+  gated against test_threeel to machine precision -- a research-grade dedicated
+  pass (start with a standalone field-fold prototype vs three_electron_energy
+  before touching te_core), NOT a mechanical refactor. Highest-value item. A
+  cheaper safe partial: cache te_core's exponent-triple+node quantities
+  (te_inv3, central moments, prefac) shared across sextets (keeps O(n^6)).
 - **rigrad.hpp RI-K Hessian -- O(N^5) loops that are textbook GEMMs**
   (798-807 response H=R^T S; 787-795 S=M^-1 R; plus the H/G/c3/c2 intermediate
   families in RI-K gradient 535-573 and Hessian 650-710, and RI-J Hessian
