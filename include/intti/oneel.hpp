@@ -187,8 +187,9 @@ std::vector<std::vector<Real>> multipole_matrices(const ShellBasis<Real> &basis,
   std::vector<std::vector<Real>> out(comps.size(),
                                      std::vector<Real>(static_cast<std::size_t>(nao) * nao, Real(0)));
   const int ns = static_cast<int>(basis.shells.size());
+  // each multipole matrix is symmetric (multiplicative operator): a <= b + mirror.
   for (int a = 0; a < ns; ++a)
-    for (int b = 0; b < ns; ++b) {
+    for (int b = a; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
       std::vector<Real> s[3], m[3];
       int lbx;
@@ -212,6 +213,8 @@ std::vector<std::vector<Real>> multipole_matrices(const ShellBasis<Real> &basis,
             const Real v = M(0, e[0], a3[0], b3[0]) * M(1, e[1], a3[1], b3[1]) *
                            M(2, e[2], a3[2], b3[2]);
             out[ci][(basis.ao_off[a] + ka) * nao + basis.ao_off[b] + kb] = v;
+            if (a != b)
+              out[ci][(basis.ao_off[b] + kb) * nao + basis.ao_off[a] + ka] = v;
           }
         }
       }
