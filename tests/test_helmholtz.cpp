@@ -16,7 +16,9 @@
 
 #include <gtest/gtest.h>
 
+#include "intti/cholesky.hpp" // detail::jacobi_eigh (LAPACK-free generalized solve)
 #include "intti/helmholtz.hpp"
+#include "intti/oneel.hpp"
 
 namespace {
 
@@ -94,6 +96,69 @@ TEST(Helmholtz, NuclearMatrixWithYukawaGrid) {
   std::vector<intti::PointCharge<double>> ch{{1.0, {0, 0, 1.2}}};
   auto V = intti::nuclear_matrix(basis, ch, grid);
   EXPECT_NEAR(V[1], phi_oracle(p, kappa, 1.2), 1e-5 * std::abs(V[1]));
+}
+
+// M-HK step 2: the two-kernel M(kappa)=<mu|G_kappa V|nu> must satisfy the
+// Green's-function fixed point at the H_core ground state: M(kappa0) c0 =
+// -1/2 S c0, kappa0=sqrt(-2 eps0). The residual is basis-limited (the integral
+// form uses the exact kinetic, Galerkin projects it), so it shrinks toward 0
+// with basis completeness; a 12-function even-tempered s-basis reaches < 1e-4.
+TEST(Helmholtz, TwoKernelMkappaFixedPoint) {
+  std::vector<intti::PrimitiveShell<double>> sh;
+  for (int i = 0; i < 12; ++i) sh.push_back({0.04 * std::pow(2.6, i), {0, 0, 0}, 0});
+  auto basis = intti::make_basis(sh);
+  const int n = basis.nao;
+  auto S = intti::overlap_matrix(basis);
+  auto T = intti::kinetic_matrix(basis);
+  std::vector<intti::PointCharge<double>> ch{{-1.0, {0, 0, 0}}}; // -Z, Z=1
+  auto V = intti::nuclear_matrix(basis, ch, intti::make_tgrid(intti::coulomb()));
+  std::vector<double> H(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n * n; ++i) H[i] = T[i] + V[i];
+
+  // Lowdin S^{-1/2} = U diag(1/sqrt(s)) U^T (jacobi_eigh: evec column-major)
+  std::vector<double> sw, U;
+  intti::detail::jacobi_eigh(n, S, sw, U);
+  auto ev = [&](int i, int k) { return U[static_cast<std::size_t>(k) * n + i]; };
+  std::vector<double> Sinv(static_cast<std::size_t>(n) * n, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double s = 0;
+      for (int k = 0; k < n; ++k) s += ev(i, k) * (1.0 / std::sqrt(sw[k])) * ev(j, k);
+      Sinv[i * n + j] = s;
+    }
+  auto mul = [&](const std::vector<double> &A, const std::vector<double> &B) {
+    std::vector<double> C(static_cast<std::size_t>(n) * n, 0.0);
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) {
+        double s = 0;
+        for (int k = 0; k < n; ++k) s += A[i * n + k] * B[k * n + j];
+        C[i * n + j] = s;
+      }
+    return C;
+  };
+  auto Hp = mul(mul(Sinv, H), Sinv);
+  std::vector<double> hw, Uh;
+  intti::detail::jacobi_eigh(n, Hp, hw, Uh);
+  const double eps0 = hw[0]; // lowest
+  ASSERT_LT(eps0, 0.0);
+  EXPECT_NEAR(eps0, -0.5, 1e-3); // basis-limit H ground state
+  std::vector<double> c0(n, 0.0); // c0 = Sinv v0, v0 = column 0 of Uh
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) c0[i] += Sinv[i * n + j] * Uh[0 * n + j];
+
+  const double kappa0 = std::sqrt(-2 * eps0);
+  auto M = intti::helmholtz_nuclear_matrix(basis, ch, kappa0);
+  double num = 0, den = 0;
+  for (int i = 0; i < n; ++i) {
+    double Mc = 0, Sc = 0;
+    for (int k = 0; k < n; ++k) {
+      Mc += M[i * n + k] * c0[k];
+      Sc += S[i * n + k] * c0[k];
+    }
+    num += (Mc + 0.5 * Sc) * (Mc + 0.5 * Sc);
+    den += (0.5 * Sc) * (0.5 * Sc);
+  }
+  EXPECT_LT(std::sqrt(num / den), 1e-4); // fixed-point holds to the basis limit
 }
 
 } // namespace

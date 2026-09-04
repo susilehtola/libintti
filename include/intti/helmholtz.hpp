@@ -24,6 +24,7 @@
 #include "fock.hpp"
 #include "kernel.hpp"
 #include "nuclear.hpp"
+#include "quartet.hpp"
 #include "tgrid.hpp"
 
 namespace intti {
@@ -59,6 +60,56 @@ std::vector<Real> yukawa_attraction_matrix(
   std::vector<Real> V(static_cast<std::size_t>(basis.nao) * basis.nao, Real(0));
   detail::attraction_accumulate(basis, charges, grid, tau, V.data());
   return V;
+}
+
+/// Two-kernel matrix M(kappa)_{mu nu} = <chi_mu | G_kappa V | chi_nu>, the
+/// operator the Helmholtz orbital update applies (M-HK step 2): the bound-state
+/// Green's function G_kappa convolved with the point-charge potential
+/// V = sum_C w_C / |r - R_C|. Two kernels: Yukawa between r,r' (G_kappa =
+/// (1/4pi) e^{-kappa|r-r'|}/|r-r'|, a Yukawa grid) and Coulomb between r' and
+/// each charge (unfolded on a Coulomb t-grid as a Gaussian at R_C of exponent
+/// t^2). So
+///   M_{mu nu} = sum_C w_C (1/4pi) sum_t w_t
+///               <chi_mu . ghost_A | e^{-kappa r12}/r12 | chi_nu . G_{R_C}^t>,
+/// each factor an ordinary geminal-style quartet (ghost = zero-exponent unit-s
+/// on the bra so electron 1 carries only chi_mu). Validated by the fixed-point
+/// consistency M(kappa0) c0 = -1/2 S c0 at the H_core ground state
+/// (references/hk_poc.cpp). Only the Yukawa node weight carries kappa, so a
+/// t-resolved tensor amortises the per-orbital loop; this direct form builds one
+/// kappa. charges carry w_C (use -Z for attraction); host, real pairs.
+template <class Real>
+std::vector<Real> helmholtz_nuclear_matrix(
+    const ShellBasis<Real> &basis, const std::vector<PointCharge<Real>> &charges,
+    Real kappa, Real amin = Real(1e-2), Real amax = Real(1e3),
+    Real h = Real(0.15)) {
+  const int nao = basis.nao;
+  std::vector<Real> M(static_cast<std::size_t>(nao) * nao, Real(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  const Real pi = pi_v<Real>();
+  auto ygrid = yukawa_grid(kappa, amin, amax, h); // e^{-kappa r}/r = 4 pi G_kappa
+  auto cgrid = make_tgrid(coulomb<Real>());       // 1/r_C unfold
+  for (int mu = 0; mu < ns; ++mu)
+    for (int nu = 0; nu < ns; ++nu) {
+      const auto &sm = basis.shells[mu], &sn = basis.shells[nu];
+      const int ncm = ncart(sm.l), ncn = ncart(sn.l);
+      PrimitiveShell<Real> ghost{Real(0), {sm.center[0], sm.center[1], sm.center[2]}, 0};
+      std::vector<Real> acc(static_cast<std::size_t>(ncm) * ncn, Real(0));
+      std::vector<Real> blk(static_cast<std::size_t>(ncm) * ncn);
+      for (const auto &C : charges) {
+        const auto bra = make_pair(sm, ghost);
+        for (int j = 0; j < cgrid.n(); ++j) {
+          PrimitiveShell<Real> gC{cgrid.t[j] * cgrid.t[j], {C.R[0], C.R[1], C.R[2]}, 0};
+          eri_quartet(bra, make_pair(sn, gC), ygrid, blk.data());
+          const Real w = C.weight * cgrid.w[j] / (4 * pi);
+          for (int i = 0; i < ncm * ncn; ++i) acc[i] += w * blk[i];
+        }
+      }
+      for (int ka = 0; ka < ncm; ++ka)
+        for (int kb = 0; kb < ncn; ++kb)
+          M[static_cast<std::size_t>(basis.ao_off[mu] + ka) * nao + basis.ao_off[nu] + kb] =
+              acc[ka * ncn + kb];
+    }
+  return M;
 }
 
 } // namespace intti
