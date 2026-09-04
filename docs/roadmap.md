@@ -822,6 +822,24 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
   batch.hpp tail bcoef/invf recomputed per output component; jbuild far-field
   O(L^6) multipole contraction could factor per-axis to O(L^4).
 
-Done under this milestone: tc_gradu_grad_build rewritten from an O(N^4) quartet
-loop to a density-folded geminal J-build (host-parallel over bra pairs, Schwarz-
-style screening).
+DONE under this milestone (all CI-green):
+- blas.hpp: precision-generic transpose-capable row-major GEMM (BLAS for
+  float/double, triple-loop fallback for long double/__float128).
+- item 2 (RI/GEMM) COMPLETE: ri.hpp (J/K/fit), rigrad.hpp (O(N^5) RI-K Hessian
+  response + S=M^-1 R + all H/G/coeff intermediates + RI-J), sto.hpp
+  (sparsity-aware contract, bit-identical, O(na ns np)), cholesky.hpp
+  (rank-update GEMV).
+- item 3 (partial): kbuild exchange 2x (upper-triangle + mirror); threeel_ri
+  P<->Q 2x on both O(naux^3) aux loops.
+- item 4 (partial): localhybrid occupied-index collapse (eps=-1/2 u^T V u).
+- tc_gradu_grad_build rewritten from an O(N^4) quartet loop to a density-folded
+  geminal J-build (host-parallel over bra pairs, Schwarz-style screening).
+- CI fix: device.hpp View(std::string label,...) for Kokkos 4.5.01.
+
+REMAINING (dedicated/careful): item 1 threeel O(n^6)->O(n^4) nested-J-build;
+item 3 erigrad/erihess/giao2e 8-fold quartet symmetry + Schwarz/density
+screening, and MBIE-via-multipole distance-including screening (the Ochsenfeld
+upgrade -- note short-range operators are already distance-included by the
+geminal e^{-theta R^2} decay); item 4 oneel bra/ket symmetry + prefactor screen,
+geohess 18x-per-charge (needs a nuclear_geoderiv elevated-l block variant),
+minor caching (c2s_matrix per l, batch tail bcoef).
