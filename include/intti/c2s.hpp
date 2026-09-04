@@ -12,6 +12,7 @@
 // rescaling applied at the facade).
 
 #include <cmath>
+#include <map>
 #include <vector>
 
 #include "gto.hpp"
@@ -114,7 +115,13 @@ template <class Real = double> std::vector<Real> c2s_matrix(int l) {
 /// C(l) * in[ncart(l) x ncols]
 template <class Real>
 void apply_c2s(int l, int ncols, const Real *in, Real *out) {
-  auto C = c2s_matrix<Real>(l);
+  // c2s_matrix(l) depends only on l, so memoize it per angular momentum. The
+  // cache is thread_local (each thread keeps its own copy) so no locking is
+  // needed under Kokkos host-parallel callers; the matrices are tiny.
+  static thread_local std::map<int, std::vector<Real>> cache;
+  auto it = cache.find(l);
+  if (it == cache.end()) it = cache.emplace(l, c2s_matrix<Real>(l)).first;
+  const std::vector<Real> &C = it->second;
   const int nc = ncart(l), nm = 2 * l + 1;
   for (int m = 0; m < nm; ++m)
     for (int j = 0; j < ncols; ++j) {
