@@ -108,14 +108,17 @@ Real three_electron_energy_ri(const ShellBasis<Real> &orb, const std::vector<Rea
   const auto auxg = detail::shellbasis_to_cartgauss(aux);
   CartGauss<Real> ghost{Real(0), {Real(0), Real(0), Real(0)}, {0, 0, 0}};
   Real E = 0;
+  // T_{RPQ} is symmetric under P<->Q (electrons 2 and 3; op12==op13==Coulomb,
+  // electron 1 = R is central), so evaluate P<=Q and double the P<Q terms.
   for (int R = 0; R < naux; ++R) {
     if (d[R] == Real(0)) continue;
     for (int P = 0; P < naux; ++P) {
       if (d[P] == Real(0)) continue;
       const Real dRP = d[R] * d[P];
-      for (int Q = 0; Q < naux; ++Q) {
+      for (int Q = P; Q < naux; ++Q) {
         if (d[Q] == Real(0)) continue;
-        E += dRP * d[Q] *
+        const Real w = (P == Q) ? Real(1) : Real(2);
+        E += w * dRP * d[Q] *
              detail::three_electron_raw(auxg[R], auxg[P], auxg[Q], ghost, ghost, ghost, grid);
       }
     }
@@ -151,17 +154,20 @@ std::vector<Real> three_electron_fock_ri(const ShellBasis<Real> &orb, const std:
   const auto auxg = detail::shellbasis_to_cartgauss(aux);
   CartGauss<Real> ghost{Real(0), {Real(0), Real(0), Real(0)}, {0, 0, 0}};
   std::vector<Real> Gaux(naux, Real(0));
+  // T_{ijk} is symmetric under j<->k (electrons 2,3); the two orderings scatter
+  // identically, so evaluate k>=j and weight the k>j terms by 2.
   for (int i = 0; i < naux; ++i)
     for (int j = 0; j < naux; ++j)
-      for (int k = 0; k < naux; ++k) {
+      for (int k = j; k < naux; ++k) {
         // contributes only if at least two of d_i,d_j,d_k are nonzero
         const int nz = (d[i] != Real(0)) + (d[j] != Real(0)) + (d[k] != Real(0));
         if (nz < 2) continue;
         const Real T =
             detail::three_electron_raw(auxg[i], auxg[j], auxg[k], ghost, ghost, ghost, grid);
-        Gaux[i] += d[j] * d[k] * T;
-        Gaux[j] += d[i] * d[k] * T;
-        Gaux[k] += d[i] * d[j] * T;
+        const Real w = (j == k) ? Real(1) : Real(2);
+        Gaux[i] += w * d[j] * d[k] * T;
+        Gaux[j] += w * d[i] * d[k] * T;
+        Gaux[k] += w * d[i] * d[j] * T;
       }
   const auto z = detail::te_solve_metric(M, Gaux, naux, tau);
   // F_{mu nu} = sum_Q (mu nu|Q) z_Q
