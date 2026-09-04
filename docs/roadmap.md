@@ -319,11 +319,18 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (attraction_accumulate/nuclear_matrix -> Yukawa attraction, eri_quartet/
   coulomb_build/exchange_build -> Yukawa ERI/J/K). yukawa_attraction_matrix
   validated to ~1e-6 vs an independent real-space screened-Poisson radial oracle
-  (test_helmholtz); (2) the
-  M(kappa) t-tensor build reusing the ExpSum Yukawa grid; (3) a Helmholtz-SCF
+  (test_helmholtz); (2) the M(kappa) two-kernel build -- DONE
+  (helmholtz_nuclear_matrix): M_{mu nu}=<mu|G_kappa V|nu> as a Yukawa (x) Coulomb
+  double quadrature via eri_quartet + the ghost trick (Yukawa kernel = 4pi
+  G_kappa; the nuclear 1/r' unfolds on a Coulomb grid as a Gaussian at R_C).
+  VALIDATED by the Green's-function fixed point M(kappa0)c0 = -1/2 S c0 at the
+  H_core ground state -- residual basis-limited (1.9e-4 at 6 fns, 3.8e-5 at 12,
+  tracking eps0->-0.5; the integral form uses the exact kinetic while Galerkin
+  projects it). This de-risks the route. Remaining: fold the t-resolved tensor so
+  one build serves all kappa_i (the per-orbital amortisation); (3) a Helmholtz-SCF
   proof-of-concept on H / He / H2 confirming the fixed point converges to the
-  in-basis Galerkin/diagonalization energy, then measuring whether kinetic-
-  exactness buys accuracy per basis function. Oracle: closed-form Yukawa
+  in-basis Galerkin/diagonalization energy (add J/K to V for many-electron), then
+  measuring whether kinetic-exactness buys accuracy per basis function. Oracle: closed-form Yukawa
   integrals; the converged HK energy vs a standard diagonalizing SCF in the same
   basis (must agree in-basis), and vs the basis-set-limit reference.
 
