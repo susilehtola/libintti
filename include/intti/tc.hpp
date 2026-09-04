@@ -182,11 +182,14 @@ void tc_gradu_grad_quartet(const PrimitiveShell<Real> &p,
 /// Hermite basis; (phase 3) contract j^{pr} with the modified bra moments
 /// q~_{pr} = -sum_d M_d (x) S (x) S (per-axis: M_d combines the 1-D E-coeffs of
 /// (d_d p)(d_d r) and p(d_d^2 r); S is the plain 1-D E-coeff). Cost is that of a
-/// geminal J-build, O(npair^2 ng L^4), not O(N^4) materialised quartets.
+/// geminal J-build, O(npair^2 ng L^4), not O(N^4) materialised quartets. The bra
+/// pairs are independent (each writes a disjoint F block) so the outer loop runs
+/// in parallel on the host execution space. tau > 0 enables a Schwarz-style
+/// magnitude x geminal-decay screen on the (bra, ket) coupling (0 = exact).
 template <class Real>
 std::vector<Real> tc_gradu_grad_build(const ShellBasis<Real> &basis,
-                                      const Real *D,
-                                      const TGrid<Real> &geminal) {
+                                      const Real *D, const TGrid<Real> &geminal,
+                                      Real tau = Real(0)) {
   const int nao = basis.nao;
   std::vector<Real> F(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
@@ -197,6 +200,7 @@ std::vector<Real> tc_gradu_grad_build(const ShellBasis<Real> &basis,
   //      tensor d^{qs}_{tuv} = sum_{kq,ks} D_{qs} E^{qs} (tuv up to lq+ls). ----
   struct Ket {
     Real p, P[3];
+    Real mk; // ||d||_1, screening magnitude
     int Lq;
     std::vector<Real> d; // (Lq+1)^3
   };
@@ -237,12 +241,17 @@ std::vector<Real> tc_gradu_grad_build(const ShellBasis<Real> &basis,
                 k.d[(tx * n1 + ty) * n1 + tz] += Dv * Ex[tx] * Ey[ty] * Ez[tz];
         }
       }
+      k.mk = Real(0);
+      for (Real v : k.d) k.mk += v < 0 ? -v : v;
       kets.push_back(std::move(k));
     }
 
-  // ---- bra loop over ordered shell-pairs (sp,sr) ----
-  for (int sp = 0; sp < ns; ++sp)
-    for (int sr = 0; sr < ns; ++sr) {
+  // ---- bra loop over ordered shell-pairs (sp,sr): independent, parallel ----
+  Kokkos::parallel_for(
+      "intti::tc::gradu_grad",
+      Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, ns * ns),
+      [&](const int bpr) {
+      const int sp = bpr / ns, sr = bpr % ns;
       const auto &P = basis.shells[sp], &R = basis.shells[sr];
       const int lp = P.l, lr = R.l;
       const int lpm = lp + 1, lrm = lr + 2;       // raised for the derivatives
@@ -261,13 +270,39 @@ std::vector<Real> tc_gradu_grad_build(const ShellBasis<Real> &basis,
       auto E1 = [&](int d, int i, int j) {
         return Eb.data() + d * ebsz + (i * (lrm + 1) + j) * nbm;
       };
+      // bra magnitude bound for screening: ||q~||_1 <= ||Eb||_1 * (2 amax+Lb+1)^2
+      Real mb = Real(0);
+      if (tau > Real(0)) {
+        Real en = 0;
+        for (Real v : Eb) en += v < 0 ? -v : v;
+        const Real amax = P.alpha > R.alpha ? P.alpha : R.alpha;
+        const Real cf = 2 * amax + Real(Lb + 1);
+        mb = en * cf * cf;
+      }
 
       // phase 2: field j^{pr}_{tuv} from coupling to every ket pair
       std::vector<Real> jp(static_cast<std::size_t>(nb1) * nb1 * nb1, Real(0));
       std::vector<Real> Bx, By, Bz, t1, t2;
       for (const auto &k : kets) {
-        Real X[3];
-        for (int d = 0; d < 3; ++d) X[d] = Ppr[d] - k.P[d];
+        Real X[3], R2 = 0;
+        for (int d = 0; d < 3; ++d) {
+          X[d] = Ppr[d] - k.P[d];
+          R2 += X[d] * X[d];
+        }
+        // Schwarz-style screen: sum_g |w_g| (pi/sqrt D_g)^3 e^{-theta_g R^2}
+        // bounds the geminal coupling geometry; * mb * ||d||_1 the contribution.
+        if (tau > Real(0)) {
+          Real gsum = 0;
+          for (int it = 0; it < ng; ++it) {
+            const Real g = geminal.t[it] * geminal.t[it];
+            const Real Dden = ppr * k.p + g * (ppr + k.p);
+            const Real th = g * ppr * k.p / Dden;
+            const Real pr = pi / sqrt_(Dden);
+            const Real w = geminal.w[it] < 0 ? -geminal.w[it] : geminal.w[it];
+            gsum += w * pr * pr * pr * exp_(-th * R2);
+          }
+          if (mb * k.mk * gsum < tau) continue;
+        }
         const int Lq = k.Lq, nq1 = Lq + 1, nB = Lb + Lq + 1;
         Bx.resize(nB);
         By.resize(nB);
@@ -385,7 +420,8 @@ std::vector<Real> tc_gradu_grad_build(const ShellBasis<Real> &basis,
           F[static_cast<std::size_t>(op + kp) * nao + orr + kr] = -acc;
         }
       }
-    }
+      });
+  Kokkos::fence();
   return F;
 }
 

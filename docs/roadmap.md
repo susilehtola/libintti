@@ -755,3 +755,67 @@ so GIAO/complex/anisotropic/arbitrary-kernel come for free where the
 analytic-Boys engines need new special functions. gen1int is 15 years mature
 on 1e response — treat its operator list and N-ary-tree derivative
 organization as the design target, its numbers as an oracle.
+
+## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
+
+A project-wide audit for loops whose cost scales with system size and could be
+collapsed, factorized step-wise, or dispatched to BLAS. `detail::matmul_nn`
+(square) and `gemm_nn` (rectangular) in cholesky.hpp are precision-generic (BLAS
+for float/double, triple-loop fallback for long double / __float128 / MPFR), so
+GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
+
+- **threeel.hpp:511-583 -- O(nao^6) three-electron sextet loop** (three_electron_
+  energy / _fock). Builds and contracts every 3e integral individually, and
+  re-runs the entire (t,s) quadrature setup (te_inv3, central moments, prefactor
+  -- all functions of only the exponent triple and node) per angular/centre
+  combination. Same anti-pattern tc_gradu_grad_build was just rewritten out of:
+  fold the density into per-electron-pair moment tensors and couple once per
+  electron-1 pair (A[1][2]=0 gives a natural field structure). The single
+  highest-value change in the codebase.
+- **rigrad.hpp RI-K Hessian -- O(N^5) loops that are textbook GEMMs**
+  (798-807 response H=R^T S; 787-795 S=M^-1 R; plus the H/G/c3/c2 intermediate
+  families in RI-K gradient 535-573 and Hessian 650-710, and RI-J Hessian
+  446-463). Rectangular GEMMs over O(N^4) tensors. Needs the rectangular gemm_nn
+  wrapper; keep the triple-loop fallback for extended precision.
+- **ri.hpp RI J/K + fit as hand triple-loops** (ri_jk K-build O(naux nao^3)
+  100-119; ri_fit B=T Mhalf O(nao^2 naux^2) 66-72; Mhalf reconstruction 53-58;
+  ri_k_occ 137-153). All GEMMs; gather the strided B^P slice contiguous first.
+- **Naive O(ns^4) shell-quartet builds with no screening/symmetry**:
+  erihess.hpp:42-178 (two_electron_hessian), erigrad.hpp:64-149
+  (two_electron_gradient), giao2e.hpp:66-134 (giao_jk_dB). Add Schwarz + density
+  screening and 8-fold permutational symmetry (~8x + screened reduction; GIAO
+  needs sign care under the symmetry map; erihess also has a per-quartet std::map
+  cache to replace with a stack array).
+- **kbuild.hpp:104-229 exchange -- no permutational symmetry.** K_ab=K_ba gives a
+  free 2x (compute a<=b, mirror); full (ac|bd) 8-fold is ~8x but needs atomics
+  and a reworked MPI split. Hottest kernel, so even 2x matters.
+- **cholesky.hpp:256-260 rank update as scalar AXPYs** (O(naux^2 nprod)) -- really
+  a GEMV/GEMM against the accumulated L block; float/double dispatch, scalar
+  fallback for extended precision.
+- **cdjk.hpp:97-102 CD/RI exchange ignores density low rank.** Factor D=CC^T
+  (rank nocc) -> K build O(naux nao^3) -> O(naux nao^2 nocc); needs a PSD/low-rank
+  guard + fallback.
+- **sto.hpp:185-197/410-422 contract_to_sto / expand_density_to_prim** -- dense
+  C*M*C^T as triple loops in the STO J/K hot path; dispatch to gemm_nn AND exploit
+  that C has exactly ns nonzeros per row (O(na ns np) not O(na np^2)).
+- **localhybrid.hpp:106-122 local_exchange** carries a needless occupied index:
+  eps(r) = -1/2 u^T V u with u_mu = sum_i C_mi psi_i collapses the VC (nao^2 nocc)
+  and Kij (nocc^2 nao) loops to O(nao^2); also pass a screening tau to the
+  per-point V collocation build (currently 0).
+- **geohess.hpp:131-176 nuclear_attraction_hessian** rebuilds the full quadrature
+  18x per charge (2 calls x 9 (e,f)); materialise one elevated-l geoderiv block
+  per charge and extract all 9 components (~18x).
+- **threeel_ri.hpp** aux loops: full permutation symmetry of the ghost-partner 3e
+  aux integral (~6x on the O(naux^3) energy/Fock loops); the O(naux nao^4)
+  effective-exchange term is intrinsically expensive (screening only).
+- **oneel.hpp / multipole.hpp** ns^2 pair sweeps: exploit the Gaussian prefactor
+  K=exp(-mu R_AB^2) underflow screen (-> asymptotically linear) and S/T/multipole
+  bra-ket (anti)symmetry (~2x).
+- Minor: nuclear.hpp/localhybrid per-point E-coefficient rebuild (batch points
+  into one attraction call); c2s.hpp c2s_matrix rebuilt per apply (cache per l);
+  batch.hpp tail bcoef/invf recomputed per output component; jbuild far-field
+  O(L^6) multipole contraction could factor per-axis to O(L^4).
+
+Done under this milestone: tc_gradu_grad_build rewritten from an O(N^4) quartet
+loop to a density-folded geminal J-build (host-parallel over bra pairs, Schwarz-
+style screening).

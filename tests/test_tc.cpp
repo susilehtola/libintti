@@ -108,4 +108,26 @@ TEST(TC, NonHermitianFockBuild) {
   EXPECT_GT(asym, 1e-3 * scale); // genuinely non-Hermitian
 }
 
+// Screening (tau > 0) must reproduce the exact (tau = 0) non-Hermitian Fock
+// build to ~tau: the geminal is short-ranged, so pairs across a wide gap are
+// safely pruned. Two clusters far apart exercise the screen.
+TEST(TC, NonHermitianFockScreened) {
+  auto basis = intti::make_basis<double>({{1.3, {0, 0, 0}, 0},
+                                          {0.7, {0.3, 0, 0}, 1},
+                                          {1.1, {12.0, 0, 0}, 0},
+                                          {0.6, {12.3, 0, 0}, 1}});
+  auto gem = intti::gaussian_geminal<double>({0.8, 2.0}, {0.5, 0.4});
+  const int nao = basis.nao;
+  std::vector<double> Dmat(static_cast<std::size_t>(nao) * nao);
+  std::mt19937 rng(9);
+  std::uniform_real_distribution<double> u(-1, 1);
+  for (auto &d : Dmat) d = u(rng);
+  auto Fexact = intti::tc_gradu_grad_build(basis, Dmat.data(), gem, 0.0);
+  auto Fscr = intti::tc_gradu_grad_build(basis, Dmat.data(), gem, 1e-11);
+  double scale = 0;
+  for (double v : Fexact) scale = std::max(scale, std::abs(v));
+  for (std::size_t i = 0; i < Fexact.size(); ++i)
+    EXPECT_NEAR(Fscr[i], Fexact[i], 1e-8 * scale) << "elem " << i;
+}
+
 } // namespace
