@@ -341,9 +341,18 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   marginally WORSE than the variational Galerkin eps0 for H. So the route's value
   is NOT per-basis accuracy but the structural properties (no diagonalisation,
   screened linear-scaling convolutions, GPU-friendly all-contraction SCF). Still
-  remaining: the many-electron case (fold J/K into V -- both are geminal (x)
-  Coulomb objects like M(kappa)) and the t-resolved-tensor amortisation across
-  the occupied kappa_i. Oracle: closed-form Yukawa
+  remaining -- the many-electron case (fold J/K into V) is a THREE-kernel build:
+  <mu|G_kappa J|nu> = sum_{rs} D_{rs} int^3 chi_mu(r) chi_nu(r') G_kappa(r-r')
+  chi_rho(r'') chi_sigma(r'')/|r'-r''| -- Yukawa (r,r') AND Coulomb (r',r''), a
+  threeel-topology integral (electron 2 central) with the density folded on
+  (rho sigma). Buildable like M(kappa): unfold 1/|r'-r''| on a Coulomb grid so
+  the (rho sigma) pair becomes a t-smeared Gaussian at P_{rs} (exponent
+  p t^2/(p+t^2)), then eri_quartet(pair(mu,ghost), pair(nu,G_smear), yukawa_grid)
+  summed over (rho sigma) pairs and t-nodes (fold the smear prefactor
+  K_{rs}(pi/(p+t^2))^{3/2}; general-L smears carry a polynomial). K analogous.
+  Validate via the He fixed point M_eff(kappa0)c0 = -1/2 S c0 with (eps0,c0) from
+  a mini-RHF; then the t-resolved-tensor amortisation across the occupied kappa_i.
+  Oracle: closed-form Yukawa
   integrals; the converged HK energy vs a standard diagonalizing SCF in the same
   basis (must agree in-basis), and vs the basis-set-limit reference.
 
