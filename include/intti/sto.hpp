@@ -23,6 +23,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 #include "fock.hpp"
@@ -181,18 +182,31 @@ template <class Real>
 std::vector<Real> contract_to_sto(const std::vector<Real> &Mprim, const StoExpansion<Real> &ex) {
   const int np = ex.nprim_ao, na = ex.nsto_ao;
   auto C = [&](int a, int p) { return ex.coeff[static_cast<std::size_t>(a) * np + p]; };
+  // The contraction matrix C is extremely sparse: each STO-AO row has nonzeros
+  // only in its own shell's primitive block (see expand_sto). Contract against
+  // just those entries -> O(na*ns*np) instead of O(na*np^2). Bit-identical to
+  // the dense products: the skipped C entries are exactly zero, and the kept
+  // ones are summed in the same (increasing index) order.
+  std::vector<std::vector<std::pair<int, Real>>> Crow(na);
+  for (int a = 0; a < na; ++a)
+    for (int p = 0; p < np; ++p) {
+      const Real c = C(a, p);
+      if (c != Real(0)) Crow[a].push_back({p, c});
+    }
   std::vector<Real> tmp(static_cast<std::size_t>(na) * np, Real(0)); // C M
   for (int a = 0; a < na; ++a)
     for (int q = 0; q < np; ++q) {
       Real s = 0;
-      for (int p = 0; p < np; ++p) s += C(a, p) * Mprim[static_cast<std::size_t>(p) * np + q];
+      for (const auto &pc : Crow[a])
+        s += pc.second * Mprim[static_cast<std::size_t>(pc.first) * np + q];
       tmp[static_cast<std::size_t>(a) * np + q] = s;
     }
-  std::vector<Real> Msto(static_cast<std::size_t>(na) * na, Real(0));
+  std::vector<Real> Msto(static_cast<std::size_t>(na) * na, Real(0)); // (C M) C^T
   for (int a = 0; a < na; ++a)
     for (int b = 0; b < na; ++b) {
       Real s = 0;
-      for (int q = 0; q < np; ++q) s += tmp[static_cast<std::size_t>(a) * np + q] * C(b, q);
+      for (const auto &qc : Crow[b])
+        s += tmp[static_cast<std::size_t>(a) * np + qc.first] * qc.second;
       Msto[static_cast<std::size_t>(a) * na + b] = s;
     }
   return Msto;
@@ -406,20 +420,30 @@ std::vector<Real> expand_density_to_prim(const std::vector<Real> &Dsto,
                                          const StoExpansion<Real> &ex) {
   const int na = ex.nsto_ao, np = ex.nprim_ao;
   auto C = [&](int a, int p) { return ex.coeff[static_cast<std::size_t>(a) * np + p]; };
+  // Same sparsity as contract_to_sto: each STO-AO row of C touches only its own
+  // shell's primitive block. Scatter over just the nonzeros -> O(na*ns*np)
+  // instead of O(na*np^2). Bit-identical to the dense products: for every
+  // (a,q)/(p,q) target the kept contributions arrive in the same increasing-b /
+  // increasing-a order, the skipped ones being exactly zero.
+  std::vector<std::vector<std::pair<int, Real>>> Crow(na);
+  for (int b = 0; b < na; ++b)
+    for (int q = 0; q < np; ++q) {
+      const Real c = C(b, q);
+      if (c != Real(0)) Crow[b].push_back({q, c});
+    }
   std::vector<Real> DC(static_cast<std::size_t>(na) * np, Real(0)); // D C
   for (int a = 0; a < na; ++a)
-    for (int q = 0; q < np; ++q) {
-      Real s = 0;
-      for (int b = 0; b < na; ++b) s += Dsto[static_cast<std::size_t>(a) * na + b] * C(b, q);
-      DC[static_cast<std::size_t>(a) * np + q] = s;
+    for (int b = 0; b < na; ++b) {
+      const Real dab = Dsto[static_cast<std::size_t>(a) * na + b];
+      for (const auto &qc : Crow[b])
+        DC[static_cast<std::size_t>(a) * np + qc.first] += dab * qc.second;
     }
   std::vector<Real> Dp(static_cast<std::size_t>(np) * np, Real(0)); // C^T (D C)
-  for (int p = 0; p < np; ++p)
-    for (int q = 0; q < np; ++q) {
-      Real s = 0;
-      for (int a = 0; a < na; ++a) s += C(a, p) * DC[static_cast<std::size_t>(a) * np + q];
-      Dp[static_cast<std::size_t>(p) * np + q] = s;
-    }
+  for (int a = 0; a < na; ++a)
+    for (const auto &pc : Crow[a])
+      for (int q = 0; q < np; ++q)
+        Dp[static_cast<std::size_t>(pc.first) * np + q] +=
+            pc.second * DC[static_cast<std::size_t>(a) * np + q];
   return Dp;
 }
 

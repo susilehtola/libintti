@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "batch.hpp"
+#include "blas.hpp"
 
 extern "C" {
 void dsyevd_(const char *jobz, const char *uplo, const int *n, double *a,
@@ -213,6 +214,9 @@ CholeskyBasis<Real> two_step_cholesky(const PairTable<Real> &pairs,
   // step 1: pivoted Cholesky driven by the updated diagonal; one batched
   // column sweep per selected pivot pair (all its components at once)
   std::vector<std::vector<Real>> Lcols; // step-1 vectors, each length nprod
+  // Contiguous packing of the finalized L columns (row k = column k = Lcols[k]),
+  // so the rank update col -= L (L^T e_j) is a single GEMV via detail::gemm.
+  std::vector<Real> Lflat;
   std::vector<std::pair<int, int>> pivots;
   std::vector<std::pair<int, int>> col_q(npair);
   while (true) {
@@ -253,10 +257,14 @@ CholeskyBasis<Real> two_step_cholesky(const PairTable<Real> &pairs,
           off += nci * ncj;
         }
       }
-      for (const auto &Lk : Lcols) {
-        const Real ljk = Lk[j];
-        for (int i = 0; i < nprod; ++i)
-          col[i] -= Lk[i] * ljk;
+      // col -= L (L^T e_j): GEMV of the accumulated nprod x ncols L block.
+      const int ncols = static_cast<int>(Lcols.size());
+      if (ncols > 0) {
+        std::vector<Real> yk(ncols);
+        for (int k = 0; k < ncols; ++k)
+          yk[k] = Lflat[static_cast<std::size_t>(k) * nprod + j];
+        detail::gemm('T', 'N', nprod, 1, ncols, Real(-1), Lflat.data(), nprod,
+                     yk.data(), 1, Real(1), col.data(), 1);
       }
       const Real diag = col[j];
       if (diag <= opt.tau) {
@@ -271,6 +279,7 @@ CholeskyBasis<Real> two_step_cholesky(const PairTable<Real> &pairs,
         if (D[i] < Real(0)) D[i] = 0;
       }
       pivots.push_back({jp, jc});
+      Lflat.insert(Lflat.end(), col.begin(), col.end());
       Lcols.push_back(std::move(col));
     }
   }
@@ -395,6 +404,8 @@ CholeskyBasis<Real> pivoted_cholesky_serial(const std::vector<ShellPair<Real>> &
     for (int c = 0; c < nc; ++c) D[basis.prod_offset[ip] + c] = blk[c * nc + c];
   }
   std::vector<std::vector<Real>> Lcols;
+  // Contiguous packing of the finalized L columns for the GEMV rank update.
+  std::vector<Real> Lflat;
   std::vector<std::pair<int, int>> pivots;
   while (true) {
     int jglob = -1;
@@ -424,9 +435,14 @@ CholeskyBasis<Real> pivoted_cholesky_serial(const std::vector<ShellPair<Real>> &
         const int nci = pn(ip);
         for (int c = 0; c < nci; ++c) col[basis.prod_offset[ip] + c] = colblk[ip][c * ncj + jc];
       }
-      for (const auto &Lk : Lcols) {
-        const Real ljk = Lk[j];
-        for (int i = 0; i < nprod; ++i) col[i] -= Lk[i] * ljk;
+      // col -= L (L^T e_j): GEMV of the accumulated nprod x ncols L block.
+      const int ncols = static_cast<int>(Lcols.size());
+      if (ncols > 0) {
+        std::vector<Real> yk(ncols);
+        for (int k = 0; k < ncols; ++k)
+          yk[k] = Lflat[static_cast<std::size_t>(k) * nprod + j];
+        detail::gemm('T', 'N', nprod, 1, ncols, Real(-1), Lflat.data(), nprod,
+                     yk.data(), 1, Real(1), col.data(), 1);
       }
       const Real diag = col[j];
       if (diag <= opt.tau) { D[j] = 0; continue; }
@@ -437,6 +453,7 @@ CholeskyBasis<Real> pivoted_cholesky_serial(const std::vector<ShellPair<Real>> &
         if (D[i] < Real(0)) D[i] = 0;
       }
       pivots.push_back({jp, jc});
+      Lflat.insert(Lflat.end(), col.begin(), col.end());
       Lcols.push_back(std::move(col));
     }
   }
