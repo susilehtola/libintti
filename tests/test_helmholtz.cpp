@@ -161,4 +161,100 @@ TEST(Helmholtz, TwoKernelMkappaFixedPoint) {
   EXPECT_LT(std::sqrt(num / den), 1e-4); // fixed-point holds to the basis limit
 }
 
+// M-HK many-electron: the full effective potential M_eff = M_nuc + M_J - 1/2 M_K
+// (J/K from helmholtz_jk_matrices, general-L three-kernel builds over threeel)
+// must satisfy the RHF-like fixed point M_eff(kappa0) c0 = -1/2 S c0, with
+// (eps0,c0) from F = T + V_nuc + J[D] - 1/2 K[D], D = 2 c c^T (fixed density).
+TEST(Helmholtz, ManyElectronJKFixedPoint) {
+  std::vector<intti::PrimitiveShell<double>> sh;
+  for (int i = 0; i < 5; ++i) sh.push_back({0.14 * std::pow(2.5, i), {0, 0, 0}, 0});
+  auto basis = intti::make_basis(sh);
+  const int n = basis.nao;
+  auto S = intti::overlap_matrix(basis);
+  auto T = intti::kinetic_matrix(basis);
+  auto cgrid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PointCharge<double>> ch{{-2.0, {0, 0, 0}}}; // He, Z=2
+  auto Vn = intti::nuclear_matrix(basis, ch, cgrid);
+  // ERI tensor (s-basis: one component per shell)
+  std::vector<double> ERI((size_t)n * n * n * n);
+  for (int a = 0; a < n; ++a)
+    for (int b = 0; b < n; ++b)
+      for (int d = 0; d < n; ++d)
+        for (int e = 0; e < n; ++e) {
+          double o;
+          intti::eri_quartet(intti::make_pair(sh[a], sh[b]),
+                             intti::make_pair(sh[d], sh[e]), cgrid, &o);
+          ERI[((size_t)a * n + b) * n * n + ((size_t)d * n + e)] = o;
+        }
+  // Lowdin generalized solve  F c = eps S c  ->  lowest (eps0, c0)
+  std::vector<double> sw, U;
+  intti::detail::jacobi_eigh(n, S, sw, U);
+  auto ev = [&](int i, int k) { return U[(size_t)k * n + i]; };
+  std::vector<double> Si((size_t)n * n, 0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double s = 0;
+      for (int k = 0; k < n; ++k) s += ev(i, k) * (1.0 / std::sqrt(sw[k])) * ev(j, k);
+      Si[i * n + j] = s;
+    }
+  auto mul = [&](const std::vector<double> &A, const std::vector<double> &B) {
+    std::vector<double> C((size_t)n * n, 0);
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) {
+        double s = 0;
+        for (int k = 0; k < n; ++k) s += A[i * n + k] * B[k * n + j];
+        C[i * n + j] = s;
+      }
+    return C;
+  };
+  auto ground = [&](const std::vector<double> &F, double &eps, std::vector<double> &c) {
+    auto Hp = mul(mul(Si, F), Si);
+    std::vector<double> hw, Uh;
+    intti::detail::jacobi_eigh(n, Hp, hw, Uh);
+    eps = hw[0];
+    c.assign(n, 0);
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) c[i] += Si[i * n + j] * Uh[0 * n + j];
+  };
+  std::vector<double> H0((size_t)n * n), chc, c0;
+  for (int i = 0; i < n * n; ++i) H0[i] = T[i] + Vn[i];
+  double e;
+  ground(H0, e, chc);
+  std::vector<double> D((size_t)n * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = 2 * chc[i] * chc[j]; // RHF density
+  std::vector<double> Jm((size_t)n * n, 0), Km((size_t)n * n, 0);
+  for (int mu = 0; mu < n; ++mu)
+    for (int nu = 0; nu < n; ++nu) {
+      double sj = 0, sk = 0;
+      for (int r = 0; r < n; ++r)
+        for (int sg = 0; sg < n; ++sg) {
+          sj += D[r * n + sg] * ERI[((size_t)mu * n + nu) * n * n + ((size_t)r * n + sg)];
+          sk += D[r * n + sg] * ERI[((size_t)mu * n + r) * n * n + ((size_t)nu * n + sg)];
+        }
+      Jm[mu * n + nu] = sj;
+      Km[mu * n + nu] = sk;
+    }
+  std::vector<double> F((size_t)n * n);
+  for (int i = 0; i < n * n; ++i) F[i] = T[i] + Vn[i] + Jm[i] - 0.5 * Km[i];
+  double eps0;
+  ground(F, eps0, c0);
+  ASSERT_LT(eps0, 0.0);
+  const double kappa0 = std::sqrt(-2 * eps0);
+  auto Mn = intti::helmholtz_nuclear_matrix(basis, ch, kappa0);
+  std::vector<double> MK;
+  auto MJ = intti::helmholtz_jk_matrices(basis, D.data(), kappa0, MK);
+  double num = 0, den = 0;
+  for (int i = 0; i < n; ++i) {
+    double Mc = 0, Sc = 0;
+    for (int k = 0; k < n; ++k) {
+      Mc += (Mn[i * n + k] + MJ[i * n + k] - 0.5 * MK[i * n + k]) * c0[k];
+      Sc += S[i * n + k] * c0[k];
+    }
+    num += (Mc + 0.5 * Sc) * (Mc + 0.5 * Sc);
+    den += (0.5 * Sc) * (0.5 * Sc);
+  }
+  EXPECT_LT(std::sqrt(num / den), 1e-3); // basis-limited fixed point
+}
+
 } // namespace

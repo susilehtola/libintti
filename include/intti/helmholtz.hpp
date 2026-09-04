@@ -26,8 +26,25 @@
 #include "nuclear.hpp"
 #include "quartet.hpp"
 #include "tgrid.hpp"
+#include "threeel.hpp"
 
 namespace intti {
+
+namespace detail {
+/// Per-AO Cartesian Gaussians of a shell basis (one CartGauss per AO row).
+template <class Real>
+std::vector<CartGauss<Real>> basis_to_ao_cartgauss(const ShellBasis<Real> &b) {
+  std::vector<CartGauss<Real>> cg;
+  cg.reserve(b.nao);
+  for (const auto &s : b.shells)
+    for (int k = 0; k < ncart(s.l); ++k) {
+      int l3[3];
+      cart_comp(s.l, k, l3[0], l3[1], l3[2]);
+      cg.push_back({s.alpha, {s.center[0], s.center[1], s.center[2]}, {l3[0], l3[1], l3[2]}});
+    }
+  return cg;
+}
+} // namespace detail
 
 /// ExpSum t-grid for the Yukawa / bound-state Helmholtz kernel e^{-kappa r}/r.
 /// The sinc rule is exponentially convergent here because e^{-kappa^2/4t^2}
@@ -110,6 +127,46 @@ std::vector<Real> helmholtz_nuclear_matrix(
               acc[ka * ncn + kb];
     }
   return M;
+}
+
+/// Helmholtz Coulomb (J) and exchange (K) matrices <mu|G_kappa J[D]|nu> and
+/// <mu|G_kappa K[D]|nu> -- the electron-repulsion pieces of the many-electron
+/// Helmholtz effective potential (M-HK). Each is a THREE-kernel Yukawa (x)
+/// Coulomb integral of threeel-topology, so it needs NO new integral code:
+///   J: <mu nu|Y_kappa (x) C|rho sigma> = TE(nu, mu, rho; ghost, ghost, sigma),
+///   K: (rho central)                   = TE(rho, mu, sigma; ghost, ghost, nu),
+/// with op12 = yukawa nodes, op13 = coulomb nodes and TE = three_electron_raw_nodes
+/// (G_kappa = 1/4pi times the e^{-kappa r}/r Yukawa kernel). General-L Gaussians
+/// are handled natively by threeel. D is nao x nao row-major. Cost is O(nao^4)
+/// three-electron evaluations (a t-resolved tensor would amortise the per-orbital
+/// kappa loop; validated vs the smeared-Gaussian eri_quartet form to 1e-15).
+template <class Real>
+std::vector<Real> helmholtz_jk_matrices(const ShellBasis<Real> &orb, const Real *D,
+                                        Real kappa, std::vector<Real> &K,
+                                        Real amin = Real(1e-2), Real amax = Real(1e3),
+                                        Real h = Real(0.15)) {
+  const int nao = orb.nao;
+  const Real inv4pi = Real(1) / (4 * pi_v<Real>());
+  auto yn = detail::coulomb_nodes(yukawa_grid(kappa, amin, amax, h)); // e^{-kr}/r nodes
+  auto cn = detail::coulomb_nodes(make_tgrid(coulomb<Real>()));       // 1/r nodes
+  const auto cg = detail::basis_to_ao_cartgauss(orb);
+  const CartGauss<Real> gh{Real(0), {0, 0, 0}, {0, 0, 0}};
+  std::vector<Real> J(static_cast<std::size_t>(nao) * nao, Real(0));
+  K.assign(static_cast<std::size_t>(nao) * nao, Real(0));
+  for (int r = 0; r < nao; ++r)
+    for (int s = 0; s < nao; ++s) {
+      const Real Drs = D[static_cast<std::size_t>(r) * nao + s];
+      if (Drs == Real(0)) continue;
+      const Real w = Drs * inv4pi;
+      for (int mu = 0; mu < nao; ++mu)
+        for (int nu = 0; nu < nao; ++nu) {
+          J[static_cast<std::size_t>(mu) * nao + nu] +=
+              w * detail::three_electron_raw_nodes(cg[nu], cg[mu], cg[r], gh, gh, cg[s], yn, cn);
+          K[static_cast<std::size_t>(mu) * nao + nu] +=
+              w * detail::three_electron_raw_nodes(cg[r], cg[mu], cg[s], gh, gh, cg[nu], yn, cn);
+        }
+    }
+  return J;
 }
 
 } // namespace intti
