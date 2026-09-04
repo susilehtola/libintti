@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "blas.hpp"     // detail::gemm
 #include "cholesky.hpp" // detail::syevd
 #include "fock.hpp"
 #include "ncenter.hpp"
@@ -49,27 +50,26 @@ RIFit<Real> ri_fit(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
   for (Real e : eval) emax = std::max(emax, e);
   std::vector<Real> Mhalf(static_cast<std::size_t>(naux) * naux, Real(0));
   // syevd returns eigenvectors as columns in column-major storage, so
-  // eigenvector k, component P is M[k*naux + P].
+  // eigenvector k, component P is M[k*naux + P] -- i.e. row-major M holds the
+  // eigenvectors as rows. Scale each eigenvector row by 1/√e (0 if dropped),
+  // then Mhalf = V^T diag(1/√e) V = M^T . Vs.
+  std::vector<Real> Vs(M.begin(), M.end());
   for (int k = 0; k < naux; ++k) {
-    if (eval[k] <= tau_lin * emax) continue;
-    const Real s = Real(1) / std::sqrt(eval[k]);
-    for (int P = 0; P < naux; ++P)
-      for (int Q = 0; Q < naux; ++Q)
-        Mhalf[P * naux + Q] += M[k * naux + P] * s * M[k * naux + Q]; // V diag(1/√e) V^T
+    const Real s = (eval[k] <= tau_lin * emax) ? Real(0)
+                                               : Real(1) / std::sqrt(eval[k]);
+    for (int P = 0; P < naux; ++P) Vs[k * naux + P] *= s;
   }
+  detail::gemm('T', 'N', naux, naux, naux, Real(1), M.data(), naux, Vs.data(),
+               naux, Real(0), Mhalf.data(), naux);
   // B = T . Mhalf  (contract over Q)
   RIFit<Real> fit;
   fit.nao = nao;
   fit.naux = naux;
   fit.B.assign(static_cast<std::size_t>(nao) * nao * naux, Real(0));
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
-  for (std::size_t mn = 0; mn < N; ++mn)
-    for (int P = 0; P < naux; ++P) {
-      Real s = 0;
-      for (int Q = 0; Q < naux; ++Q)
-        s += T[mn * naux + Q] * Mhalf[Q * naux + P];
-      fit.B[mn * naux + P] = s;
-    }
+  // B[N x naux] = T[N x naux] . Mhalf[naux x naux]
+  detail::gemm('N', 'N', static_cast<int>(N), naux, naux, Real(1), T.data(),
+               naux, Mhalf.data(), naux, Real(0), fit.B.data(), naux);
   return fit;
 }
 
@@ -96,26 +96,17 @@ void ri_jk(const RIFit<Real> &fit, const Real *D, Real *J, Real *K) {
     for (std::size_t i = 0; i < N; ++i)
       K[i] = 0;
     // K_{mu nu} = sum_P (B^P D B^P)_{mu nu}; B^P is nao x nao at stride naux
-    std::vector<Real> BD(N);
+    std::vector<Real> BP(N), BD(N);
     for (int P = 0; P < naux; ++P) {
+      // Gather the strided slice B^P into a contiguous nao x nao scratch.
+      for (std::size_t mn = 0; mn < N; ++mn)
+        BP[mn] = fit.B[mn * naux + P];
       // BD = B^P D
-      for (int mu = 0; mu < nao; ++mu)
-        for (int la = 0; la < nao; ++la) {
-          Real s = 0;
-          for (int nu = 0; nu < nao; ++nu)
-            s += fit.B[(static_cast<std::size_t>(mu) * nao + nu) * naux + P] *
-                 D[static_cast<std::size_t>(nu) * nao + la];
-          BD[static_cast<std::size_t>(mu) * nao + la] = s;
-        }
+      detail::gemm('N', 'N', nao, nao, nao, Real(1), BP.data(), nao, D, nao,
+                   Real(0), BD.data(), nao);
       // K += BD B^P
-      for (int mu = 0; mu < nao; ++mu)
-        for (int nu = 0; nu < nao; ++nu) {
-          Real s = 0;
-          for (int la = 0; la < nao; ++la)
-            s += BD[static_cast<std::size_t>(mu) * nao + la] *
-                 fit.B[(static_cast<std::size_t>(la) * nao + nu) * naux + P];
-          K[static_cast<std::size_t>(mu) * nao + nu] += s;
-        }
+      detail::gemm('N', 'N', nao, nao, nao, Real(1), BD.data(), nao, BP.data(),
+                   nao, Real(1), K, nao);
     }
   }
 }
@@ -133,24 +124,18 @@ void ri_k_occ(const RIFit<Real> &fit, const Real *C, int nocc, Real *K) {
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
   for (std::size_t i = 0; i < N; ++i)
     K[i] = 0;
-  std::vector<Real> W(static_cast<std::size_t>(nocc) * nao); // per P
+  std::vector<Real> BP(N);                                    // gathered B^P
+  std::vector<Real> X(static_cast<std::size_t>(nao) * nocc);  // half-transform
   for (int P = 0; P < naux; ++P) {
-    for (int i = 0; i < nocc; ++i)
-      for (int mu = 0; mu < nao; ++mu) {
-        Real s = 0;
-        for (int nu = 0; nu < nao; ++nu)
-          s += fit.B[(static_cast<std::size_t>(mu) * nao + nu) * naux + P] *
-               C[static_cast<std::size_t>(nu) * nocc + i];
-        W[static_cast<std::size_t>(i) * nao + mu] = s;
-      }
-    for (int mu = 0; mu < nao; ++mu)
-      for (int nu = 0; nu < nao; ++nu) {
-        Real s = 0;
-        for (int i = 0; i < nocc; ++i)
-          s += W[static_cast<std::size_t>(i) * nao + mu] *
-               W[static_cast<std::size_t>(i) * nao + nu];
-        K[static_cast<std::size_t>(mu) * nao + nu] += s;
-      }
+    // Gather the strided slice B^P into a contiguous nao x nao scratch.
+    for (std::size_t mn = 0; mn < N; ++mn)
+      BP[mn] = fit.B[mn * naux + P];
+    // X_{mu i} = sum_nu B^P_{mu nu} C_{nu i}  (nao x nocc)
+    detail::gemm('N', 'N', nao, nocc, nao, Real(1), BP.data(), nao, C, nocc,
+                 Real(0), X.data(), nocc);
+    // K += X X^T  (K_{mu nu} += sum_i X_{mu i} X_{nu i})
+    detail::gemm('N', 'T', nao, nao, nocc, Real(1), X.data(), nocc, X.data(),
+                 nocc, Real(1), K, nao);
   }
 }
 

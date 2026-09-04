@@ -765,13 +765,19 @@ for float/double, triple-loop fallback for long double / __float128 / MPFR), so
 GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
 
 - **threeel.hpp:511-583 -- O(nao^6) three-electron sextet loop** (three_electron_
-  energy / _fock). Builds and contracts every 3e integral individually, and
-  re-runs the entire (t,s) quadrature setup (te_inv3, central moments, prefactor
-  -- all functions of only the exponent triple and node) per angular/centre
-  combination. Same anti-pattern tc_gradu_grad_build was just rewritten out of:
-  fold the density into per-electron-pair moment tensors and couple once per
-  electron-1 pair (A[1][2]=0 gives a natural field structure). The single
-  highest-value change in the codebase.
+  energy / _fock). Builds and contracts every 3e integral individually. Because
+  op23 is absent (A[1][2]=0), integrating out electrons 2 and 3 gives a FIELD
+  form E = int rho(r1) W2(r1) W3(r1) dr1, and per (t,s) node the density folds
+  into two independent pair-pair "field" tensors -- each a geminal-J coupling
+  V2_{ad,t} = sum_be D_be <ad|e^{-t^2 r12^2}|be>, V3_{ad,s} = sum_cf D_cf
+  <ad|e^{-s^2 r13^2}|cf> (O(n^4) per node, cf. coulomb_build) -- which are then
+  contracted with electron 1's density through a 3-way Hermite overlap:
+  O(n^6 nt^2) -> O(n^4 nt^2). NOTE the reduction is NOT a trivial factorisation:
+  the central moments cm(k1,k2,k3) couple all three electrons (Ai is dense even
+  though A[1][2]=0), so it is a genuine re-derivation into the nested-J-build
+  form, not a mechanical refactor -- dedicated work, oracle-gated (test_threeel).
+  The single highest-value change; also caches te_core's exponent-triple+node
+  quantities (te_inv3, central moments, prefac) shared across sextets.
 - **rigrad.hpp RI-K Hessian -- O(N^5) loops that are textbook GEMMs**
   (798-807 response H=R^T S; 787-795 S=M^-1 R; plus the H/G/c3/c2 intermediate
   families in RI-K gradient 535-573 and Hessian 650-710, and RI-J Hessian
