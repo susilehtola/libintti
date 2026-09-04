@@ -38,7 +38,8 @@ add_executable(intti_tests
   test_rigrad.cpp
   test_sto.cpp
   test_threeel.cpp
-  test_multipole.cpp)
+  test_multipole.cpp
+  test_tc.cpp)
 if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_ri.cpp)
 endif()
