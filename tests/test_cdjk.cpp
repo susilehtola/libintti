@@ -86,6 +86,44 @@ double max_abs(const std::vector<double> &a) {
   return m;
 }
 
+// The low-rank exchange path cholesky_jk_occ (D = occ_scale C C^T) must
+// reproduce the generic cholesky_jk called with that same reconstructed D.
+TEST(CDJK, LowRankOccMatchesGeneric) {
+  auto b = test_basis();
+  const int nao = b.nao, nocc = 3;
+  const double occ_scale = 2.0;
+  std::mt19937 rng(71);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  std::vector<double> C(static_cast<std::size_t>(nao) * nocc);
+  for (auto &x : C) x = u(rng);
+  // reconstruct the equivalent dense density D = occ_scale C C^T
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  std::vector<double> D(n2, 0.0);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      double s = 0;
+      for (int k = 0; k < nocc; ++k) s += C[i * nocc + k] * C[j * nocc + k];
+      D[static_cast<std::size_t>(i) * nao + j] = occ_scale * s;
+    }
+  auto grid = intti::make_tgrid(intti::coulomb());
+  intti::CholeskyOptions<double> opt;
+  opt.tau = 1e-8;
+  auto cb = intti::two_step_cholesky(b, grid, opt);
+  std::vector<double> Jg(n2), Kg(n2), Jo(n2), Ko(n2);
+  intti::cholesky_jk(b, cb, D.data(), Jg.data(), Kg.data());
+  intti::cholesky_jk_occ(b, cb, C.data(), nocc, occ_scale, Jo.data(), Ko.data());
+  const double sc = max_abs(Kg) + max_abs(Jg) + 1.0;
+  EXPECT_LT(max_abs_diff(Jg, Jo), 1e-11 * sc) << "low-rank J != generic J";
+  EXPECT_LT(max_abs_diff(Kg, Ko), 1e-11 * sc) << "low-rank K != generic K";
+  // null-output branches must also work
+  intti::cholesky_jk_occ(b, cb, C.data(), nocc, occ_scale, static_cast<double *>(nullptr),
+                         Ko.data());
+  intti::cholesky_jk_occ(b, cb, C.data(), nocc, occ_scale, Jo.data(),
+                         static_cast<double *>(nullptr));
+  EXPECT_LT(max_abs_diff(Kg, Ko), 1e-11 * sc);
+  EXPECT_LT(max_abs_diff(Jg, Jo), 1e-11 * sc);
+}
+
 TEST(CDJK, ThresholdControlledAgainstExact) {
   auto b = test_basis();
   auto D = random_symmetric(b.nao, 23);

@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "blas.hpp"
 #include "cholesky.hpp"
 #include "fock.hpp"
 
@@ -99,6 +100,63 @@ void cholesky_jk(const ShellBasis<Real> &basis, const CholeskyBasis<Real> &cb,
       // major distinction cancels in the final product
       detail::matmul_nn(nao, LJ.data(), D, X.data(), Real(0));
       detail::matmul_nn(nao, X.data(), LJ.data(), K, Real(1));
+    }
+  }
+}
+
+/// J and/or K from Cholesky vectors for a LOW-RANK density D = occ_scale * C C^T
+/// (C the nao x nocc occupied-orbital coefficients, row-major; occ_scale = 2 for
+/// a closed shell). Identical result to cholesky_jk called with that D, but the
+/// exchange uses K = sum_J L^J D L^J = occ_scale sum_J (L^J C)(L^J C)^T, so K
+/// costs O(naux nao^2 nocc) instead of O(naux nao^3) -- a large win when
+/// nocc << nao. J is unchanged at O(naux nao^2). Either output may be null.
+template <class Real>
+void cholesky_jk_occ(const ShellBasis<Real> &basis, const CholeskyBasis<Real> &cb,
+                     const Real *C, int nocc, Real occ_scale, Real *J, Real *K) {
+  if (cb.pair_shells.empty())
+    throw std::invalid_argument(
+        "cholesky_jk_occ: CholeskyBasis lacks pair bookkeeping; use the "
+        "ShellBasis-level two_step_cholesky overload");
+  const int nao = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  if (J)
+    for (std::size_t i = 0; i < n2; ++i) J[i] = 0;
+  if (K)
+    for (std::size_t i = 0; i < n2; ++i) K[i] = 0;
+  // reconstruct the density only for the J trace: D = occ_scale C C^T
+  std::vector<Real> D;
+  if (J) {
+    D.assign(n2, Real(0));
+    detail::gemm('N', 'T', nao, nao, nocc, occ_scale, C, nocc, C, nocc, Real(0), D.data(), nao);
+  }
+  std::vector<Real> LJ(n2), M;
+  if (K) M.assign(static_cast<std::size_t>(nao) * nocc, Real(0));
+  const int npair = static_cast<int>(cb.pair_shells.size());
+  for (int Jx = 0; Jx < cb.naux; ++Jx) {
+    for (std::size_t i = 0; i < n2; ++i) LJ[i] = 0;
+    for (int p = 0; p < npair; ++p) {
+      const auto [i, j] = cb.pair_shells[p];
+      const int la = basis.shells[i].l, lb = basis.shells[j].l;
+      const int ncb2 = ncart(lb);
+      for (int ka = 0; ka < ncart(la); ++ka)
+        for (int kb = 0; kb < ncb2; ++kb) {
+          const Real v = cb.L(cb.prod_offset[p] + ka * ncb2 + kb, Jx);
+          const int r = basis.ao_off[i] + ka, c = basis.ao_off[j] + kb;
+          LJ[static_cast<std::size_t>(r) * nao + c] = v;
+          LJ[static_cast<std::size_t>(c) * nao + r] = v;
+        }
+    }
+    if (J) {
+      Real cJ = 0;
+      for (std::size_t i = 0; i < n2; ++i) cJ += D[i] * LJ[i];
+      for (std::size_t i = 0; i < n2; ++i) J[i] += cJ * LJ[i];
+    }
+    if (K) {
+      // M = L^J C (nao x nocc); K += occ_scale * M M^T
+      detail::gemm('N', 'N', nao, nocc, nao, Real(1), LJ.data(), nao, C, nocc, Real(0), M.data(),
+                   nocc);
+      detail::gemm('N', 'T', nao, nao, nocc, occ_scale, M.data(), nocc, M.data(), nocc, Real(1), K,
+                   nao);
     }
   }
 }

@@ -880,9 +880,14 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
 - **cholesky.hpp:256-260 rank update as scalar AXPYs** (O(naux^2 nprod)) -- really
   a GEMV/GEMM against the accumulated L block; float/double dispatch, scalar
   fallback for extended precision.
-- **cdjk.hpp:97-102 CD/RI exchange ignores density low rank.** Factor D=CC^T
-  (rank nocc) -> K build O(naux nao^3) -> O(naux nao^2 nocc); needs a PSD/low-rank
-  guard + fallback.
+- **cdjk.hpp CD/RI exchange density low rank** DONE (new overload, zero risk to
+  the generic path): cholesky_jk_occ(basis, cb, C, nocc, occ_scale, J, K) takes
+  the occupied orbitals (D = occ_scale C C^T) and builds K = occ_scale sum_J
+  (L^J C)(L^J C)^T via two rectangular gemms per aux vector -> O(naux nao^2
+  nocc) instead of O(naux nao^3) (nao/nocc x on K at scale). J unchanged. The
+  generic cholesky_jk is untouched; validated bit-close (1e-11) to it on
+  D=occ_scale C C^T incl. null-output branches. The pre-existing dense entry
+  point stays the fallback for non-low-rank (e.g. energy-weighted) densities.
 - **sto.hpp:185-197/410-422 contract_to_sto / expand_density_to_prim** -- dense
   C*M*C^T as triple loops in the STO J/K hot path; dispatch to gemm_nn AND exploit
   that C has exactly ns nonzeros per row (O(na ns np) not O(na np^2)).
