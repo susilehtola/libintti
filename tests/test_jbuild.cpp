@@ -117,4 +117,42 @@ TEST(JBuild, LongDouble) {
     EXPECT_LT(std::abs(J[i] - Jref[i]), 1e-15L * scale) << "product " << i;
 }
 
+// M-MP: the FMM near/far split (far_tau > 0) must reproduce the pure
+// t-quadrature build (far_tau = 0) to ~far_tau on a system with well-separated
+// pairs, and still match the dense quartet reference.
+TEST(JBuild, FarFieldMatchesExact) {
+  using Shell = intti::PrimitiveShell<double>;
+  System<double> s;
+  std::vector<Shell> shells;
+  for (double z : {0.0, 15.0, 30.0}) {          // three widely separated centres
+    shells.push_back({1.2, {0, 0, z}, 0});
+    shells.push_back({0.4, {0, 0, z}, 0});
+    shells.push_back({0.8, {0, 0, z}, 1});
+  }
+  for (std::size_t i = 0; i < shells.size(); ++i)
+    for (std::size_t j = i; j < shells.size(); ++j)
+      s.pairs.push_back(intti::make_pair(shells[i], shells[j]));
+  s.off.resize(s.pairs.size() + 1, 0);
+  for (std::size_t p = 0; p < s.pairs.size(); ++p)
+    s.off[p + 1] = s.off[p] + intti::ncart(s.pairs[p].la) * intti::ncart(s.pairs[p].lb);
+  s.nprod = s.off.back();
+
+  auto tab = intti::make_pair_table(s.pairs);
+  auto D = random_density(s.nprod);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<double> Jexact(s.nprod), Jfar(s.nprod);
+  intti::coulomb_build(tab, D.data(), grid, Jexact.data());
+  const double *noQ = nullptr;
+  intti::coulomb_build(tab, D.data(), grid, Jfar.data(), noQ, noQ, 0.0, 0, 1,
+                       /*far_tau=*/1e-13);
+  auto Jdense = dense_j(s, D, grid);
+  double scale = 0;
+  for (int i = 0; i < s.nprod; ++i)
+    scale = std::max(scale, std::abs(Jdense[i]));
+  for (int i = 0; i < s.nprod; ++i) {
+    EXPECT_LT(std::abs(Jfar[i] - Jexact[i]), 1e-9 * scale) << "far vs exact " << i;
+    EXPECT_LT(std::abs(Jfar[i] - Jdense[i]), 1e-8 * scale) << "far vs dense " << i;
+  }
+}
+
 } // namespace
