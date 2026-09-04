@@ -312,7 +312,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   contractions, no dense eigensolve -- a fit for the GPU-saturating matrix-level
   design; (c) FMM far-field (M-MP) + kappa-screening -> linear scaling. Payoff is
   in large / mixed GTO-STO / fully-numerical-adjacent bases, not def2-SVP water.
-  Plan: (1) the Yukawa-potential-of-GTO primitive vs a closed form; (2) the
+  Plan: (1) the Yukawa-potential-of-GTO primitive vs a closed form -- DONE
+  (helmholtz.hpp): yukawa_grid builds the ExpSum Yukawa t-grid and, because the
+  screened kernel differs from Coulomb only by the node weight e^{-kappa^2/4t^2},
+  EVERY existing builder computes the Yukawa analogue unchanged when fed it
+  (attraction_accumulate/nuclear_matrix -> Yukawa attraction, eri_quartet/
+  coulomb_build/exchange_build -> Yukawa ERI/J/K). yukawa_attraction_matrix
+  validated to ~1e-6 vs an independent real-space screened-Poisson radial oracle
+  (test_helmholtz); (2) the
   M(kappa) t-tensor build reusing the ExpSum Yukawa grid; (3) a Helmholtz-SCF
   proof-of-concept on H / He / H2 confirming the fixed point converges to the
   in-basis Galerkin/diagonalization energy, then measuring whether kinetic-
