@@ -248,8 +248,9 @@ std::array<std::vector<Real>, 3> angular_momentum(const ShellBasis<Real> &basis,
   std::array<std::vector<Real>, 3> L;
   for (auto &m : L) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
+  // L is antisymmetric: compute the upper triangle a <= b and mirror with -1.
   for (int a = 0; a < ns; ++a)
-    for (int b = 0; b < ns; ++b) {
+    for (int b = a; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
       const int la = sa.l, lb = sb.l, lb1 = lb + 1;
       std::vector<Real> Sf[3], Mf[3], Kf[3];
@@ -291,6 +292,13 @@ std::array<std::vector<Real>, 3> angular_momentum(const ShellBasis<Real> &basis,
           L[0][idx] = S(0) * (M(1) * K(2) - K(1) * M(2));
           L[1][idx] = S(1) * (M(2) * K(0) - M(0) * K(2));
           L[2][idx] = S(2) * (M(0) * K(1) - M(1) * K(0));
+          if (a != b) {
+            const std::size_t jdx = (basis.ao_off[b] + kb) * static_cast<std::size_t>(nao) +
+                                    basis.ao_off[a] + ka;
+            L[0][jdx] = -L[0][idx];
+            L[1][jdx] = -L[1][idx];
+            L[2][jdx] = -L[2][idx];
+          }
         }
       }
     }
