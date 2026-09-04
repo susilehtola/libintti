@@ -41,7 +41,8 @@ add_executable(intti_tests
   test_multipole.cpp
   test_tc.cpp
   test_helmholtz.cpp
-  test_blas.cpp)
+  test_blas.cpp
+  test_screening.cpp)
 if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_ri.cpp)
 endif()
