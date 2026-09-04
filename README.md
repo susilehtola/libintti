@@ -8,6 +8,17 @@ evaluates one- and two-electron integrals — and their arbitrary-order
 derivatives — through a one-dimensional quadrature that replaces the Boys
 function entirely.
 
+libintti is the **Swiss army knife of integral libraries**: from a single
+*t*-quadrature substrate it covers overlap, kinetic, multipole and angular-
+momentum properties, nuclear attraction and potential collocation, Coulomb and
+exchange, range-separated (erf/erfc/Yukawa) and Gaussian-geminal (F12/
+transcorrelated) operators, three-electron integrals, RI 2-/3-center tensors,
+Slater-type orbitals via the integral transform, GIAO/magnetic and geometric
+derivatives up to Hessians, far-field multipole integrals, and more — all in one
+templated, arbitrary-precision, GPU-portable engine. The pun is deliberate:
+*intti* is Finnish for the army, so the Swiss-army-knife breadth is right there
+in the name.
+
 ## Design
 
 - **Boys-free by construction.** The Coulomb operator is resolved as a 1-D
