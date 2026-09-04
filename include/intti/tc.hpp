@@ -36,6 +36,8 @@
 
 #include "fock.hpp"
 #include "gto.hpp"
+#include "hermite1d.hpp"
+#include "math.hpp"
 #include "quartet.hpp"
 #include "tgrid.hpp"
 
@@ -166,10 +168,21 @@ void tc_gradu_grad_quartet(const PrimitiveShell<Real> &p,
 /// for the Gaussian-geminal u carried by `geminal`. D and the returned F are
 /// nao x nao row-major Cartesian AO matrices; F is NOT symmetric (the operator
 /// is non-Hermitian -- that is the point of TC). This is the public,
-/// matrix-level consumer of tc_gradu_grad_quartet: density in, effective matrix
-/// out, quartets internal. (The Hermitian TC pieces 1/2 nabla^2 u and
+/// matrix-level consumer of the reduction: density in, effective matrix out,
+/// quartets never materialised. (The Hermitian TC pieces 1/2 nabla^2 u and
 /// 1/2 (nabla u)^2 are plain geminal J/K builds via gaussian_geminal; the 3-body
 /// L term is threeel.hpp.)
+///
+/// Structure -- a geminal J-build (cf. coulomb_build), NOT an N^4 quartet loop:
+///   F_{pr} = sum_{qs} D_{qs} ( rho~_{pr} | g | chi_q chi_s ),
+/// where the bra "charge" rho~_{pr} = -div(chi_p grad chi_r) is a FIXED modified
+/// pair density with a finite Hermite expansion. So: (phase 1) fold D into per
+/// ket-pair Hermite tensors d^{qs}; (phase 2) couple each bra pair (p,r) to all
+/// ket pairs through the geminal grid ONCE, giving the field j^{pr} in the bra
+/// Hermite basis; (phase 3) contract j^{pr} with the modified bra moments
+/// q~_{pr} = -sum_d M_d (x) S (x) S (per-axis: M_d combines the 1-D E-coeffs of
+/// (d_d p)(d_d r) and p(d_d^2 r); S is the plain 1-D E-coeff). Cost is that of a
+/// geminal J-build, O(npair^2 ng L^4), not O(N^4) materialised quartets.
 template <class Real>
 std::vector<Real> tc_gradu_grad_build(const ShellBasis<Real> &basis,
                                       const Real *D,
@@ -177,28 +190,202 @@ std::vector<Real> tc_gradu_grad_build(const ShellBasis<Real> &basis,
   const int nao = basis.nao;
   std::vector<Real> F(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
-  for (int sp = 0; sp < ns; ++sp)
-    for (int sq = 0; sq < ns; ++sq)
-      for (int sr = 0; sr < ns; ++sr)
-        for (int ss = 0; ss < ns; ++ss) {
-          const auto &P = basis.shells[sp], &Q = basis.shells[sq];
-          const auto &R = basis.shells[sr], &Sh = basis.shells[ss];
-          const int ncp = ncart(P.l), ncq = ncart(Q.l);
-          const int ncr = ncart(R.l), ncs = ncart(Sh.l);
-          std::vector<Real> blk(static_cast<std::size_t>(ncp) * ncq * ncr * ncs);
-          tc_gradu_grad_quartet(P, Q, R, Sh, geminal, blk.data());
-          const int op = basis.ao_off[sp], oq = basis.ao_off[sq];
-          const int orr = basis.ao_off[sr], os = basis.ao_off[ss];
-          for (int kp = 0; kp < ncp; ++kp)
-            for (int kq = 0; kq < ncq; ++kq)
-              for (int kr = 0; kr < ncr; ++kr)
-                for (int ks = 0; ks < ncs; ++ks)
-                  F[static_cast<std::size_t>(op + kp) * nao + orr + kr] +=
-                      D[static_cast<std::size_t>(oq + kq) * nao + os + ks] *
-                      blk[((static_cast<std::size_t>(kp) * ncq + kq) * ncr + kr) *
-                              ncs +
-                          ks];
+  const int ng = geminal.n();
+  const Real pi = pi_v<Real>();
+
+  // ---- phase 1: per ordered ket shell-pair (sq,ss), density-weighted Hermite
+  //      tensor d^{qs}_{tuv} = sum_{kq,ks} D_{qs} E^{qs} (tuv up to lq+ls). ----
+  struct Ket {
+    Real p, P[3];
+    int Lq;
+    std::vector<Real> d; // (Lq+1)^3
+  };
+  std::vector<Ket> kets;
+  kets.reserve(static_cast<std::size_t>(ns) * ns);
+  for (int sq = 0; sq < ns; ++sq)
+    for (int ss = 0; ss < ns; ++ss) {
+      const auto &Q = basis.shells[sq], &Sh = basis.shells[ss];
+      const int lq = Q.l, ls = Sh.l, n1 = lq + ls + 1;
+      const int esz = (lq + 1) * (ls + 1) * n1;
+      const Real p = Q.alpha + Sh.alpha, mu = Q.alpha * Sh.alpha / p;
+      Ket k;
+      k.p = p;
+      k.Lq = lq + ls;
+      std::vector<Real> E(static_cast<std::size_t>(3) * esz);
+      for (int d = 0; d < 3; ++d) {
+        k.P[d] = (Q.alpha * Q.center[d] + Sh.alpha * Sh.center[d]) / p;
+        const Real ab = Q.center[d] - Sh.center[d];
+        e_coeffs(lq, ls, p, k.P[d] - Q.center[d], k.P[d] - Sh.center[d],
+                 exp_(-mu * ab * ab), E.data() + d * esz);
+      }
+      k.d.assign(static_cast<std::size_t>(n1) * n1 * n1, Real(0));
+      const int oq = basis.ao_off[sq], os = basis.ao_off[ss];
+      for (int kq = 0; kq < ncart(lq); ++kq) {
+        int a3[3];
+        cart_comp(lq, kq, a3[0], a3[1], a3[2]);
+        for (int ksh = 0; ksh < ncart(ls); ++ksh) {
+          int b3[3];
+          cart_comp(ls, ksh, b3[0], b3[1], b3[2]);
+          const Real Dv = D[static_cast<std::size_t>(oq + kq) * nao + os + ksh];
+          if (Dv == Real(0)) continue;
+          const Real *Ex = E.data() + 0 * esz + (a3[0] * (ls + 1) + b3[0]) * n1;
+          const Real *Ey = E.data() + 1 * esz + (a3[1] * (ls + 1) + b3[1]) * n1;
+          const Real *Ez = E.data() + 2 * esz + (a3[2] * (ls + 1) + b3[2]) * n1;
+          for (int tx = 0; tx <= a3[0] + b3[0]; ++tx)
+            for (int ty = 0; ty <= a3[1] + b3[1]; ++ty)
+              for (int tz = 0; tz <= a3[2] + b3[2]; ++tz)
+                k.d[(tx * n1 + ty) * n1 + tz] += Dv * Ex[tx] * Ey[ty] * Ez[tz];
         }
+      }
+      kets.push_back(std::move(k));
+    }
+
+  // ---- bra loop over ordered shell-pairs (sp,sr) ----
+  for (int sp = 0; sp < ns; ++sp)
+    for (int sr = 0; sr < ns; ++sr) {
+      const auto &P = basis.shells[sp], &R = basis.shells[sr];
+      const int lp = P.l, lr = R.l;
+      const int lpm = lp + 1, lrm = lr + 2;       // raised for the derivatives
+      const int Lb = lp + lr + 2, nb1 = Lb + 1;   // bra Hermite order
+      const int nbm = lpm + lrm + 1;
+      const int ebsz = (lpm + 1) * (lrm + 1) * nbm;
+      const Real ppr = P.alpha + R.alpha, mu = P.alpha * R.alpha / ppr;
+      Real Ppr[3];
+      std::vector<Real> Eb(static_cast<std::size_t>(3) * ebsz);
+      for (int d = 0; d < 3; ++d) {
+        Ppr[d] = (P.alpha * P.center[d] + R.alpha * R.center[d]) / ppr;
+        const Real ab = P.center[d] - R.center[d];
+        e_coeffs(lpm, lrm, ppr, Ppr[d] - P.center[d], Ppr[d] - R.center[d],
+                 exp_(-mu * ab * ab), Eb.data() + d * ebsz);
+      }
+      auto E1 = [&](int d, int i, int j) {
+        return Eb.data() + d * ebsz + (i * (lrm + 1) + j) * nbm;
+      };
+
+      // phase 2: field j^{pr}_{tuv} from coupling to every ket pair
+      std::vector<Real> jp(static_cast<std::size_t>(nb1) * nb1 * nb1, Real(0));
+      std::vector<Real> Bx, By, Bz, t1, t2;
+      for (const auto &k : kets) {
+        Real X[3];
+        for (int d = 0; d < 3; ++d) X[d] = Ppr[d] - k.P[d];
+        const int Lq = k.Lq, nq1 = Lq + 1, nB = Lb + Lq + 1;
+        Bx.resize(nB);
+        By.resize(nB);
+        Bz.resize(nB);
+        t1.assign(static_cast<std::size_t>(nb1) * nq1 * nq1, Real(0));
+        t2.assign(static_cast<std::size_t>(nb1) * nb1 * nq1, Real(0));
+        for (int it = 0; it < ng; ++it) {
+          const Real t = geminal.t[it], g = t * t;
+          const Real Dden = ppr * k.p + g * (ppr + k.p);
+          const Real theta = g * ppr * k.p / Dden;
+          const Real pr = pi / sqrt_(Dden);
+          const Real wpref = geminal.w[it] * pr * pr * pr;
+          hermite_b(nB - 1, theta, X[0], Bx.data());
+          hermite_b(nB - 1, theta, X[1], By.data());
+          hermite_b(nB - 1, theta, X[2], Bz.data());
+          for (int a = 0; a < nb1; ++a)
+            for (int nu = 0; nu < nq1; ++nu)
+              for (int ph = 0; ph < nq1; ++ph) {
+                Real s = 0;
+                for (int tau = 0; tau < nq1; ++tau) {
+                  const Real term = k.d[(tau * nq1 + nu) * nq1 + ph] * Bx[a + tau];
+                  s += tau % 2 ? -term : term;
+                }
+                t1[(a * nq1 + nu) * nq1 + ph] = s;
+              }
+          for (int a = 0; a < nb1; ++a)
+            for (int b = 0; b < nb1; ++b)
+              for (int ph = 0; ph < nq1; ++ph) {
+                Real s = 0;
+                for (int nu = 0; nu < nq1; ++nu) {
+                  const Real term = t1[(a * nq1 + nu) * nq1 + ph] * By[b + nu];
+                  s += nu % 2 ? -term : term;
+                }
+                t2[(a * nb1 + b) * nq1 + ph] = s;
+              }
+          for (int a = 0; a < nb1; ++a)
+            for (int b = 0; b < nb1; ++b)
+              for (int c = 0; c < nb1; ++c) {
+                Real s = 0;
+                for (int ph = 0; ph < nq1; ++ph) {
+                  const Real term = t2[(a * nb1 + b) * nq1 + ph] * Bz[c + ph];
+                  s += ph % 2 ? -term : term;
+                }
+                jp[(a * nb1 + b) * nb1 + c] += wpref * s;
+              }
+        }
+      }
+
+      // phase 3: F_{pr} = sum_tuv q~_{pr}[tuv] j^{pr}[tuv], with
+      //   q~ = -sum_d M_d (x) S (x) S  (M_d = 1-D coeffs of (d_d p)(d_d r) + p d_d^2 r)
+      const int op = basis.ao_off[sp], orr = basis.ao_off[sr];
+      std::vector<Real> S[3], M[3];
+      for (int c = 0; c < 3; ++c) {
+        S[c].resize(nb1);
+        M[c].resize(nb1);
+      }
+      for (int kp = 0; kp < ncart(lp); ++kp) {
+        int ap[3];
+        cart_comp(lp, kp, ap[0], ap[1], ap[2]);
+        for (int kr = 0; kr < ncart(lr); ++kr) {
+          int cr[3];
+          cart_comp(lr, kr, cr[0], cr[1], cr[2]);
+          for (int d = 0; d < 3; ++d) {
+            const int a = ap[d], c = cr[d];
+            std::fill(S[d].begin(), S[d].end(), Real(0));
+            std::fill(M[d].begin(), M[d].end(), Real(0));
+            const Real *Sc = E1(d, a, c);
+            for (int t = 0; t <= a + c; ++t) S[d][t] = Sc[t];
+            // (d_d p)(d_d r): a c E[a-1,c-1] - 2ar a E[a-1,c+1]
+            //                 - 2ap c E[a+1,c-1] + 4 ap ar E[a+1,c+1]
+            if (a > 0 && c > 0) {
+              const Real *e = E1(d, a - 1, c - 1);
+              for (int t = 0; t <= a + c - 2; ++t) M[d][t] += Real(a * c) * e[t];
+            }
+            if (a > 0) {
+              const Real *e = E1(d, a - 1, c + 1);
+              for (int t = 0; t <= a + c; ++t) M[d][t] += Real(-2) * R.alpha * Real(a) * e[t];
+            }
+            if (c > 0) {
+              const Real *e = E1(d, a + 1, c - 1);
+              for (int t = 0; t <= a + c; ++t) M[d][t] += Real(-2) * P.alpha * Real(c) * e[t];
+            }
+            {
+              const Real *e = E1(d, a + 1, c + 1);
+              for (int t = 0; t <= a + c + 2; ++t)
+                M[d][t] += Real(4) * P.alpha * R.alpha * e[t];
+            }
+            // p d_d^2 r: c(c-1) E[a,c-2] - 2ar(2c+1) E[a,c] + 4 ar^2 E[a,c+2]
+            if (c >= 2) {
+              const Real *e = E1(d, a, c - 2);
+              for (int t = 0; t <= a + c - 2; ++t) M[d][t] += Real(c * (c - 1)) * e[t];
+            }
+            {
+              const Real *e = E1(d, a, c);
+              for (int t = 0; t <= a + c; ++t)
+                M[d][t] += Real(-2) * R.alpha * Real(2 * c + 1) * e[t];
+            }
+            {
+              const Real *e = E1(d, a, c + 2);
+              for (int t = 0; t <= a + c + 2; ++t)
+                M[d][t] += Real(4) * R.alpha * R.alpha * e[t];
+            }
+          }
+          // F = - sum_d sum_tuv (M_d in dir d)(S in others) jp[tuv]
+          Real acc = 0;
+          for (int tx = 0; tx < nb1; ++tx)
+            for (int ty = 0; ty < nb1; ++ty)
+              for (int tz = 0; tz < nb1; ++tz) {
+                const Real j = jp[(tx * nb1 + ty) * nb1 + tz];
+                if (j == Real(0)) continue;
+                acc += j * (M[0][tx] * S[1][ty] * S[2][tz] +
+                            S[0][tx] * M[1][ty] * S[2][tz] +
+                            S[0][tx] * S[1][ty] * M[2][tz]);
+              }
+          F[static_cast<std::size_t>(op + kp) * nao + orr + kr] = -acc;
+        }
+      }
+    }
   return F;
 }
 

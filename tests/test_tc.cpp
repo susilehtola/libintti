@@ -66,6 +66,7 @@ TEST(TC, NonHermitianBraKetPtype) {
 TEST(TC, NonHermitianFockBuild) {
   auto basis = intti::make_basis<double>({{1.3, {0, 0, 0}, 0},
                                           {0.7, {0.4, 0, 0}, 1},
+                                          {1.0, {0, 0.5, -0.3}, 2}, // d: exercises c>=2
                                           {0.9, {0, 0.5, -0.3}, 0}});
   auto gem = intti::gaussian_geminal<double>({0.5, 1.4}, {0.6, 0.3});
   const int nao = basis.nao;
