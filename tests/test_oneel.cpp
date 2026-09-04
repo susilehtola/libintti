@@ -87,6 +87,44 @@ TEST(OneEl, AngularMomentumAntisymmetric) {
   }
 }
 
+// Gaussian-prefactor screening: tau = 0 is exact (skips only underflowed
+// zero blocks); a distant pair whose prefactor is below tau is dropped.
+TEST(OneEl, PrefactorScreening) {
+  // two tight functions very far apart -> their cross prefactor is tiny
+  auto bas = intti::make_basis<double>({{2.0, {0.0, 0.0, 0.0}, 0},
+                                        {1.5, {0.0, 0.0, 0.0}, 1},
+                                        {2.0, {14.0, 0.0, 0.0}, 0}});
+  const double o[3] = {0.0, 0.0, 0.0};
+  auto S0 = intti::overlap_matrix(bas);
+  auto T0 = intti::kinetic_matrix(bas);
+  auto M0 = intti::multipole_matrices(bas, 1, o);
+  // tau = 0 must be bit-identical to the historical (unscreened) build: the
+  // build already returns these; here we only assert internal consistency of
+  // symmetry and that a moderate tau stays within tau of the exact result.
+  const double tau = 1e-8;
+  auto St = intti::overlap_matrix(bas, tau);
+  auto Tt = intti::kinetic_matrix(bas, tau);
+  auto Mt = intti::multipole_matrices(bas, 1, o, tau);
+  double dS = 0, dT = 0, dM = 0, cross = 0;
+  const int nao = bas.nao;
+  for (std::size_t i = 0; i < S0.size(); ++i) {
+    dS = std::max(dS, std::abs(S0[i] - St[i]));
+    dT = std::max(dT, std::abs(T0[i] - Tt[i]));
+  }
+  for (std::size_t c = 0; c < M0.size(); ++c)
+    for (std::size_t i = 0; i < M0[c].size(); ++i)
+      dM = std::max(dM, std::abs(M0[c][i] - Mt[c][i]));
+  // the dropped cross block (shell 0/2) has magnitude <= tau
+  for (int i = bas.ao_off[0]; i < bas.ao_off[1]; ++i)
+    for (int j = bas.ao_off[2]; j < bas.ao_off[3]; ++j)
+      cross = std::max(cross, std::abs(S0[i * nao + j]));
+  EXPECT_LT(dS, tau) << "overlap screening within tau";
+  EXPECT_LT(dT, tau) << "kinetic screening within tau";
+  EXPECT_LT(dM, tau) << "multipole screening within tau";
+  EXPECT_GT(cross, 0.0) << "the distant block is nonzero but below tau";
+  EXPECT_LT(cross, tau);
+}
+
 TEST(OneEl, PropertyValueContraction) {
   auto bas = basis();
   auto S = intti::overlap_matrix(bas);

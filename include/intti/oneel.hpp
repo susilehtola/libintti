@@ -27,6 +27,22 @@ namespace intti {
 
 namespace detail {
 
+/// Gaussian pair prefactor exp(-mu |R_a - R_b|^2), mu = alpha beta / (alpha +
+/// beta): the common factor of every element of the shell-pair block. When it
+/// underflows to 0 (distant or very tight pairs) the whole block is exactly 0,
+/// so a `pref <= tau` test screens pairs (tau = 0 skips only the exactly-zero
+/// blocks -- exact; tau > 0 is an approximate distance screen).
+template <class Real>
+Real pair_gauss_prefactor(const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb) {
+  const Real p = sa.alpha + sb.alpha, mu = sa.alpha * sb.alpha / p;
+  Real r2 = 0;
+  for (int d = 0; d < 3; ++d) {
+    const Real ab = sa.center[d] - sb.center[d];
+    r2 += ab * ab;
+  }
+  return exp_(-mu * r2);
+}
+
 /// Per-direction 1D overlap table for a primitive shell pair:
 ///   s1[i*(lbx+1)+j] = int (x-A)^i e^{-alpha (x-A)^2} (x-B)^j e^{-beta (x-B)^2} dx,
 /// for i = 0..la+exa, j = 0..lb+exb. Built from the MD E coefficients
@@ -95,7 +111,7 @@ void multipole_1d(const std::vector<Real> &s1, int lbx, int la, int lb, Real A,
 
 /// Overlap matrix S (nao x nao, row-major) over the primitive Cartesian AOs.
 template <class Real>
-std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis) {
+std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis, Real tau = Real(0)) {
   const int nao = basis.nao;
   std::vector<Real> S(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
@@ -103,6 +119,7 @@ std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis) {
   for (int a = 0; a < ns; ++a)
     for (int b = a; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      if (detail::pair_gauss_prefactor(sa, sb) <= tau) continue; // exact at tau=0
       std::vector<Real> sx, sy, sz;
       int lbx;
       detail::overlap_1d(sa.alpha, sa.center[0], sb.alpha, sb.center[0], sa.l, sb.l, 0, 0, sx, lbx);
@@ -127,7 +144,7 @@ std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis) {
 
 /// Kinetic energy matrix T = -1/2 <a| nabla^2 |b>.
 template <class Real>
-std::vector<Real> kinetic_matrix(const ShellBasis<Real> &basis) {
+std::vector<Real> kinetic_matrix(const ShellBasis<Real> &basis, Real tau = Real(0)) {
   const int nao = basis.nao;
   std::vector<Real> T(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
@@ -135,6 +152,7 @@ std::vector<Real> kinetic_matrix(const ShellBasis<Real> &basis) {
   for (int a = 0; a < ns; ++a)
     for (int b = a; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      if (detail::pair_gauss_prefactor(sa, sb) <= tau) continue; // exact at tau=0
       std::vector<Real> sx, sy, sz, tx, ty, tz;
       int lbx;
       detail::overlap_1d(sa.alpha, sa.center[0], sb.alpha, sb.center[0], sa.l, sb.l, 0, 2, sx, lbx);
@@ -174,7 +192,8 @@ std::vector<Real> kinetic_matrix(const ShellBasis<Real> &basis) {
 template <class Real>
 std::vector<std::vector<Real>> multipole_matrices(const ShellBasis<Real> &basis,
                                                   int max_order,
-                                                  const Real origin[3]) {
+                                                  const Real origin[3],
+                                                  Real tau = Real(0)) {
   const int nao = basis.nao;
   // component list: (ex,ey,ez), total order 0..max_order, cart_comp ordering
   std::vector<std::array<int, 3>> comps;
@@ -191,6 +210,7 @@ std::vector<std::vector<Real>> multipole_matrices(const ShellBasis<Real> &basis,
   for (int a = 0; a < ns; ++a)
     for (int b = a; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      if (detail::pair_gauss_prefactor(sa, sb) <= tau) continue; // exact at tau=0
       std::vector<Real> s[3], m[3];
       int lbx;
       for (int d = 0; d < 3; ++d) {

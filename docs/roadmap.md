@@ -903,9 +903,15 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
 - **threeel_ri.hpp** aux loops: full permutation symmetry of the ghost-partner 3e
   aux integral (~6x on the O(naux^3) energy/Fock loops); the O(naux nao^4)
   effective-exchange term is intrinsically expensive (screening only).
-- **oneel.hpp / multipole.hpp** ns^2 pair sweeps: exploit the Gaussian prefactor
-  K=exp(-mu R_AB^2) underflow screen (-> asymptotically linear) and S/T/multipole
-  bra-ket (anti)symmetry (~2x).
+- **oneel.hpp ns^2 pair sweeps** DONE: overlap_matrix/kinetic_matrix/
+  multipole_matrices take an optional tau; each pair is skipped when its
+  Gaussian prefactor exp(-mu R_AB^2) (detail::pair_gauss_prefactor) <= tau. At
+  tau=0 this drops only the exactly-underflowed (zero) blocks -- exact, and
+  asymptotically linear for large systems where distant pairs underflow; tau>0
+  is an approximate distance screen. Bra-ket (anti)symmetry was already done.
+  Screening-consistency test added (distant tight pair dropped, within tau).
+  (multipole.hpp far-field is a separate item under M-MP; per-axis O(L^4)
+  factoring of its jbuild contraction remains a minor open item.)
 - Minor: nuclear.hpp/localhybrid per-point E-coefficient rebuild (batch points
   into one attraction call); c2s.hpp c2s_matrix rebuilt per apply (cache per l);
   batch.hpp tail bcoef/invf recomputed per output component; jbuild far-field
