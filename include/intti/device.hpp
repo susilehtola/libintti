@@ -9,6 +9,7 @@
 // scaffolding, not the genuinely distinct builder algorithms.
 
 #include <cstddef>
+#include <string>
 #include <vector>
 
 #include <Kokkos_Core.hpp>
@@ -18,7 +19,7 @@ namespace intti::detail {
 /// Allocate a 1-D device View and copy a host std::vector into it.
 template <class T>
 Kokkos::View<T *> to_device(const std::vector<T> &v, const char *label) {
-  Kokkos::View<T *> d(label, v.size());
+  Kokkos::View<T *> d(std::string(label), v.size());
   auto h = Kokkos::create_mirror_view(d);
   for (std::size_t i = 0; i < v.size(); ++i) h(i) = v[i];
   Kokkos::deep_copy(d, h);
@@ -28,7 +29,7 @@ Kokkos::View<T *> to_device(const std::vector<T> &v, const char *label) {
 /// Allocate a 1-D device View and copy n elements from a host pointer into it.
 template <class T>
 Kokkos::View<T *> to_device(const T *p, std::size_t n, const char *label) {
-  Kokkos::View<T *> d(label, n);
+  Kokkos::View<T *> d(std::string(label), n);
   auto h = Kokkos::create_mirror_view(d);
   for (std::size_t i = 0; i < n; ++i) h(i) = p[i];
   Kokkos::deep_copy(d, h);
