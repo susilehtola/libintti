@@ -65,4 +65,24 @@ TEST(NCenter, ThreeCenterMatchesGhostQuartet) {
     }
 }
 
+// M-MP: the RI 3-center far-field (far_tau > 0) must reproduce the exact
+// t-quadrature (mu nu|P) tensor to ~far_tau when the orbital pairs and auxiliary
+// functions are well separated. Orbitals at the origin, aux far away (and one
+// aux near, exercising both branches).
+TEST(NCenter, ThreeCenterFarFieldMatchesExact) {
+  auto orb = intti::make_basis<double>({{1.2, {0, 0, 0}, 0},
+                                        {0.8, {0, 0, 0}, 1},
+                                        {0.5, {0.3, 0, 0}, 0}});
+  auto aux = intti::make_basis<double>({{2.6, {0.1, 0, 0}, 0},   // near
+                                        {1.1, {0, 0, 18.0}, 2},  // far
+                                        {1.7, {20.0, -3.0, 0}, 1}}); // far
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto Texact = intti::coulomb_3c(orb, aux, grid, /*far_tau=*/0.0);
+  auto Tfar = intti::coulomb_3c(orb, aux, grid, /*far_tau=*/1e-13);
+  double scale = 0;
+  for (double v : Texact) scale = std::max(scale, std::abs(v));
+  for (std::size_t i = 0; i < Texact.size(); ++i)
+    EXPECT_LT(std::abs(Tfar[i] - Texact[i]), 1e-10 * scale) << "elem " << i;
+}
+
 } // namespace
