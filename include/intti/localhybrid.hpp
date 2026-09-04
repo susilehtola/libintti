@@ -89,7 +89,7 @@ LocalExchange<Real> local_exchange(const ShellBasis<Real> &basis, const Real *C,
   LocalExchange<Real> out;
   out.eps.assign(np, Real(0));
   const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
-  std::vector<Real> V(n2), psi(nocc), VC(static_cast<std::size_t>(nao) * nocc);
+  std::vector<Real> V(n2), psi(nocc), u(nao);
   for (int g = 0; g < np; ++g) {
     // potential collocation matrix V^g (unit charge at r_g)
     std::fill(V.begin(), V.end(), Real(0));
@@ -102,23 +102,20 @@ LocalExchange<Real> local_exchange(const ShellBasis<Real> &basis, const Real *C,
       for (int mu = 0; mu < nao; ++mu) s += phg[mu] * C[mu * nocc + i];
       psi[i] = s;
     }
-    // VC_{mu i} = sum_nu V_{mu nu} C_{nu i}
-    for (int mu = 0; mu < nao; ++mu)
-      for (int i = 0; i < nocc; ++i) {
-        Real s = 0;
-        for (int nu = 0; nu < nao; ++nu) s += V[mu * nao + nu] * C[nu * nocc + i];
-        VC[mu * nocc + i] = s;
-      }
-    // eps = -1/2 sum_ij psi_i psi_j (C^T V C)_ij
-    //     = -1/2 sum_i psi_i sum_mu C_mu i VC_mu... contract:
-    // (C^T V C)_ij = sum_mu C_mu i VC_mu j
+    // eps = -1/2 sum_ij psi_i psi_j (C^T V C)_ij collapses (sum over i,j first):
+    //     = -1/2 sum_{mu nu} V_{mu nu} u_mu u_nu,  u_mu = sum_i C_{mu i} psi_i.
+    // This drops the occupied index -- O(nao^2 nocc)+O(nocc^2 nao) -> O(nao^2).
+    for (int mu = 0; mu < nao; ++mu) {
+      Real s = 0;
+      for (int i = 0; i < nocc; ++i) s += C[mu * nocc + i] * psi[i];
+      u[mu] = s;
+    }
     Real e = 0;
-    for (int i = 0; i < nocc; ++i)
-      for (int j = 0; j < nocc; ++j) {
-        Real Kij = 0;
-        for (int mu = 0; mu < nao; ++mu) Kij += C[mu * nocc + i] * VC[mu * nocc + j];
-        e += psi[i] * psi[j] * Kij;
-      }
+    for (int mu = 0; mu < nao; ++mu) {
+      Real row = 0;
+      for (int nu = 0; nu < nao; ++nu) row += V[mu * nao + nu] * u[nu];
+      e += u[mu] * row;
+    }
     out.eps[g] = Real(-0.5) * e;
   }
   if (!weights.empty()) {
