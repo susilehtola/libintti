@@ -9,6 +9,8 @@
 // Gaussian integration of the operator -- no by-parts, no libintti).
 
 #include <cmath>
+#include <random>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -56,6 +58,53 @@ TEST(TC, NonHermitianBraKetPtype) {
   intti::tc_gradu_grad_quartet(P(1), Q(0), R(1), S(0), gem, out);
   // p = p_y (kp=1), r = p_x (kr=0)
   EXPECT_NEAR(out[(1 * 1 + 0) * 3 + 0], -0.015163762479314398, 1e-12);
+}
+
+// Matrix-level non-Hermitian TC Fock build vs a dense reference contraction of
+// the validated quartet. Confirms the density-in/matrix-out driver's indexing,
+// and that F is non-symmetric (the operator is non-Hermitian).
+TEST(TC, NonHermitianFockBuild) {
+  auto basis = intti::make_basis<double>({{1.3, {0, 0, 0}, 0},
+                                          {0.7, {0.4, 0, 0}, 1},
+                                          {0.9, {0, 0.5, -0.3}, 0}});
+  auto gem = intti::gaussian_geminal<double>({0.5, 1.4}, {0.6, 0.3});
+  const int nao = basis.nao;
+  std::vector<double> Dmat(static_cast<std::size_t>(nao) * nao);
+  std::mt19937 rng(31);
+  std::uniform_real_distribution<double> u(-1, 1);
+  for (auto &d : Dmat) d = u(rng);
+
+  auto F = intti::tc_gradu_grad_build(basis, Dmat.data(), gem);
+
+  // dense reference: loop shell quartets, contract the validated quartet
+  std::vector<double> Fref(static_cast<std::size_t>(nao) * nao, 0.0);
+  const int ns = static_cast<int>(basis.shells.size());
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b)
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          const auto &P = basis.shells[a], &Q = basis.shells[b];
+          const auto &R = basis.shells[c], &S = basis.shells[d];
+          const int np = intti::ncart(P.l), nq = intti::ncart(Q.l);
+          const int nr = intti::ncart(R.l), nsc = intti::ncart(S.l);
+          std::vector<double> blk(static_cast<std::size_t>(np) * nq * nr * nsc);
+          intti::tc_gradu_grad_quartet(P, Q, R, S, gem, blk.data());
+          for (int kp = 0; kp < np; ++kp)
+            for (int kq = 0; kq < nq; ++kq)
+              for (int kr = 0; kr < nr; ++kr)
+                for (int ks = 0; ks < nsc; ++ks)
+                  Fref[(basis.ao_off[a] + kp) * nao + basis.ao_off[c] + kr] +=
+                      Dmat[(basis.ao_off[b] + kq) * nao + basis.ao_off[d] + ks] *
+                      blk[((kp * nq + kq) * nr + kr) * nsc + ks];
+        }
+  double scale = 0, asym = 0;
+  for (double v : Fref) scale = std::max(scale, std::abs(v));
+  for (std::size_t i = 0; i < F.size(); ++i)
+    EXPECT_NEAR(F[i], Fref[i], 1e-12 * scale) << "elem " << i;
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j)
+      asym = std::max(asym, std::abs(F[i * nao + j] - F[j * nao + i]));
+  EXPECT_GT(asym, 1e-3 * scale); // genuinely non-Hermitian
 }
 
 } // namespace

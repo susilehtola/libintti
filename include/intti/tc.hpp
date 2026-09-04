@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "fock.hpp"
 #include "gto.hpp"
 #include "quartet.hpp"
 #include "tgrid.hpp"
@@ -158,6 +159,47 @@ void tc_gradu_grad_quartet(const PrimitiveShell<Real> &p,
           }
     }
   }
+}
+
+/// Matrix-level non-Hermitian TC two-body Fock contribution
+///   F_{p r} = sum_{q s} D_{q s} <p q| nabla_1 u . nabla_1 |r s>
+/// for the Gaussian-geminal u carried by `geminal`. D and the returned F are
+/// nao x nao row-major Cartesian AO matrices; F is NOT symmetric (the operator
+/// is non-Hermitian -- that is the point of TC). This is the public,
+/// matrix-level consumer of tc_gradu_grad_quartet: density in, effective matrix
+/// out, quartets internal. (The Hermitian TC pieces 1/2 nabla^2 u and
+/// 1/2 (nabla u)^2 are plain geminal J/K builds via gaussian_geminal; the 3-body
+/// L term is threeel.hpp.)
+template <class Real>
+std::vector<Real> tc_gradu_grad_build(const ShellBasis<Real> &basis,
+                                      const Real *D,
+                                      const TGrid<Real> &geminal) {
+  const int nao = basis.nao;
+  std::vector<Real> F(static_cast<std::size_t>(nao) * nao, Real(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  for (int sp = 0; sp < ns; ++sp)
+    for (int sq = 0; sq < ns; ++sq)
+      for (int sr = 0; sr < ns; ++sr)
+        for (int ss = 0; ss < ns; ++ss) {
+          const auto &P = basis.shells[sp], &Q = basis.shells[sq];
+          const auto &R = basis.shells[sr], &Sh = basis.shells[ss];
+          const int ncp = ncart(P.l), ncq = ncart(Q.l);
+          const int ncr = ncart(R.l), ncs = ncart(Sh.l);
+          std::vector<Real> blk(static_cast<std::size_t>(ncp) * ncq * ncr * ncs);
+          tc_gradu_grad_quartet(P, Q, R, Sh, geminal, blk.data());
+          const int op = basis.ao_off[sp], oq = basis.ao_off[sq];
+          const int orr = basis.ao_off[sr], os = basis.ao_off[ss];
+          for (int kp = 0; kp < ncp; ++kp)
+            for (int kq = 0; kq < ncq; ++kq)
+              for (int kr = 0; kr < ncr; ++kr)
+                for (int ks = 0; ks < ncs; ++ks)
+                  F[static_cast<std::size_t>(op + kp) * nao + orr + kr] +=
+                      D[static_cast<std::size_t>(oq + kq) * nao + os + ks] *
+                      blk[((static_cast<std::size_t>(kp) * ncq + kq) * ncr + kr) *
+                              ncs +
+                          ks];
+        }
+  return F;
 }
 
 } // namespace intti
