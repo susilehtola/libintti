@@ -25,6 +25,7 @@
 #include "gto.hpp"
 #include "hermite1d.hpp"
 #include "math.hpp"
+#include "multipole.hpp"
 #include "tgrid.hpp"
 
 namespace intti {
@@ -42,12 +43,19 @@ namespace detail {
 template <class Real>
 void attraction_accumulate(const ShellBasis<Real> &basis,
                            const std::vector<PointCharge<Real>> &centers,
-                           const TGrid<Real> &grid, Real tau, Real *V) {
+                           const TGrid<Real> &grid, Real tau, Real *V,
+                           Real far_tau = Real(0)) {
   const int nao = basis.nao;
   const int nt = grid.n();
   const Real pi = pi_v<Real>();
   const int ns = static_cast<int>(basis.shells.size());
   const bool screen = tau > Real(0);
+  // FMM far-field: a centre well separated from the pair (p |P-c|^2 > far_cut)
+  // is a monopole seen through the exponent-free multipole tensor T_{tuv}(P-c);
+  // <a|1/r_c|b> = (pi/p)^{3/2} sum_tuv E^{ab}_tuv T_tuv, exact up to exp(-p R^2).
+  const bool far = far_tau > Real(0);
+  const Real far_cut = far ? -log_(far_tau) : Real(0);
+  std::vector<Real> Tbuf;
   for (int a = 0; a < ns; ++a)
     for (int b = 0; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
@@ -69,13 +77,43 @@ void attraction_accumulate(const ShellBasis<Real> &basis,
       const int nca = ncart(la), ncb = ncart(lb);
       std::vector<Real> acc(static_cast<std::size_t>(nca) * ncb, Real(0));
       std::vector<Real> Bx(la + lb + 1), By(la + lb + 1), Bz(la + lb + 1);
+      const int n1 = la + lb + 1;
       for (const auto &c : centers) {
+        Real d2 = 0;
+        if (screen || far)
+          for (int d = 0; d < 3; ++d)
+            d2 += (Pd[d] - c.R[d]) * (Pd[d] - c.R[d]);
         if (screen) {
-          Real d2 = 0;
-          for (int d = 0; d < 3; ++d) d2 += (Pd[d] - c.R[d]) * (Pd[d] - c.R[d]);
           using std::sqrt;
           const Real fb = d2 * p > Real(1) ? Real(0.5) * sqrt(pi / (p * d2)) : Real(1);
           if (std::abs(c.weight) * pair_bound * fb < tau) continue;
+        }
+        if (far && p * d2 > far_cut) {
+          // multipole far branch: T_{tuv}(P - c), monopole charge (no ket sign)
+          const Real X[3] = {Pd[0] - c.R[0], Pd[1] - c.R[1], Pd[2] - c.R[2]};
+          const int Dt = la + lb + 1;
+          Tbuf.assign(static_cast<std::size_t>(Dt) * Dt * Dt, Real(0));
+          multipole_tensor(la + lb, X, Tbuf.data());
+          const Real pop = pi / p;
+          const Real wpref = c.weight * pop * sqrt_(pop); // (pi/p)^{3/2}
+          for (int ka = 0; ka < nca; ++ka) {
+            int a3[3];
+            cart_comp(la, ka, a3[0], a3[1], a3[2]);
+            for (int kb = 0; kb < ncb; ++kb) {
+              int b3[3];
+              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+              const Real *Ex = E.data() + 0 * esz + (a3[0] * (lb + 1) + b3[0]) * n1;
+              const Real *Ey = E.data() + 1 * esz + (a3[1] * (lb + 1) + b3[1]) * n1;
+              const Real *Ez = E.data() + 2 * esz + (a3[2] * (lb + 1) + b3[2]) * n1;
+              Real s = 0;
+              for (int tx = 0; tx <= a3[0] + b3[0]; ++tx)
+                for (int ty = 0; ty <= a3[1] + b3[1]; ++ty)
+                  for (int tz = 0; tz <= a3[2] + b3[2]; ++tz)
+                    s += Ex[tx] * Ey[ty] * Ez[tz] * Tbuf[(tx * Dt + ty) * Dt + tz];
+              acc[ka * ncb + kb] += wpref * s;
+            }
+          }
+          continue;
         }
         for (int it = 0; it < nt; ++it) {
           const Real t = grid.t[it];
@@ -210,10 +248,11 @@ void nuclear_moment_accumulate(const ShellBasis<Real> &basis,
 template <class Real>
 std::vector<Real> nuclear_matrix(const ShellBasis<Real> &basis,
                                  const std::vector<PointCharge<Real>> &charges,
-                                 const TGrid<Real> &grid, Real tau = Real(0)) {
+                                 const TGrid<Real> &grid, Real tau = Real(0),
+                                 Real far_tau = Real(0)) {
   std::vector<Real> V(static_cast<std::size_t>(basis.nao) * basis.nao, Real(0));
   // charges here already carry weight = -Z (caller sets it); provide a helper
-  detail::attraction_accumulate(basis, charges, grid, tau, V.data());
+  detail::attraction_accumulate(basis, charges, grid, tau, V.data(), far_tau);
   return V;
 }
 
@@ -251,14 +290,15 @@ template <class Real>
 std::vector<std::vector<Real>>
 potential_matrices(const ShellBasis<Real> &basis,
                    const std::vector<std::array<Real, 3>> &points,
-                   const TGrid<Real> &grid, Real tau = Real(0)) {
+                   const TGrid<Real> &grid, Real tau = Real(0),
+                   Real far_tau = Real(0)) {
   std::vector<std::vector<Real>> out;
   out.reserve(points.size());
   const std::size_t n2 = static_cast<std::size_t>(basis.nao) * basis.nao;
   for (const auto &pt : points) {
     std::vector<Real> V(n2, Real(0));
     std::vector<PointCharge<Real>> one{{Real(1), {pt[0], pt[1], pt[2]}}};
-    detail::attraction_accumulate(basis, one, grid, tau, V.data());
+    detail::attraction_accumulate(basis, one, grid, tau, V.data(), far_tau);
     out.push_back(std::move(V));
   }
   return out;

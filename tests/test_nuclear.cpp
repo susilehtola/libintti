@@ -79,4 +79,32 @@ TEST(Nuclear, CollocationMatchesUnitCharge) {
   EXPECT_LT(as, 1e-13);
 }
 
+// M-MP: the nuclear-attraction far-field (far_tau > 0) must reproduce the pure
+// t-quadrature build (far_tau = 0) to ~far_tau when charges are well separated
+// from the pairs. Mix of near (bonded) and far charges, with an spd basis.
+TEST(Nuclear, FarFieldMatchesExact) {
+  auto bas = spd_basis();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PointCharge<double>> ch{
+      {-1.0, {0.0, 0.0, 1.1}},   // near
+      {-6.0, {0.0, 0.0, 20.0}},  // far
+      {-8.0, {25.0, -5.0, 0.0}}, // far
+  };
+  auto Vexact = intti::nuclear_matrix(bas, ch, grid, 0.0, /*far_tau=*/0.0);
+  auto Vfar = intti::nuclear_matrix(bas, ch, grid, 0.0, /*far_tau=*/1e-13);
+  double scale = 0;
+  for (double v : Vexact) scale = std::max(scale, std::abs(v));
+  for (std::size_t i = 0; i < Vexact.size(); ++i)
+    EXPECT_LT(std::abs(Vfar[i] - Vexact[i]), 1e-10 * scale) << "elem " << i;
+
+  // collocation far-field too (a distant grid point)
+  std::array<double, 3> pt{18.0, 0.0, 0.0};
+  auto Vp0 = intti::potential_matrices(bas, {pt}, grid, 0.0, 0.0);
+  auto Vpf = intti::potential_matrices(bas, {pt}, grid, 0.0, 1e-13);
+  double s2 = 0;
+  for (double v : Vp0[0]) s2 = std::max(s2, std::abs(v));
+  for (std::size_t i = 0; i < Vp0[0].size(); ++i)
+    EXPECT_LT(std::abs(Vpf[0][i] - Vp0[0][i]), 1e-10 * s2) << "coll " << i;
+}
+
 } // namespace
