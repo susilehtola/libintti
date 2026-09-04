@@ -104,6 +104,9 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
   Kokkos::parallel_for(
       "intti::k::build", Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {ns, ns}),
       KOKKOS_LAMBDA(int a, int b) {
+        // K is symmetric (K_ab = sum_cd D_cd (ac|bd) = K_ba): compute the upper
+        // triangle a <= b only and mirror the block into (b,a) -- ~2x.
+        if (b < a) return;
         if (nranks > 1 && (a * ns + b) % nranks != rank) return;
         const int la = lv(a), lb = lv(b);
         const int nca = ncart(la), ncb = ncart(lb);
@@ -224,8 +227,11 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
           }
         }
         for (int ka = 0; ka < nca; ++ka)
-          for (int kb = 0; kb < ncb; ++kb)
-            Kv((aov(a) + ka) * nao + aov(b) + kb) = Kblk[ka * ncb + kb];
+          for (int kb = 0; kb < ncb; ++kb) {
+            const Real v = Kblk[ka * ncb + kb];
+            Kv((aov(a) + ka) * nao + aov(b) + kb) = v;
+            if (a != b) Kv((aov(b) + kb) * nao + aov(a) + ka) = v; // mirror
+          }
       });
 
   auto hK = Kokkos::create_mirror_view(Kv);
