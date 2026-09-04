@@ -362,10 +362,20 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   pair smeared). The RHF-like fixed point M_eff(kappa0)c0 = -1/2 S c0 with
   M_eff = M_nuc + M_J - 1/2 M_K holds to the basis limit (4.1e-4 at 6 fns,
   2.4e-5 at 9). So ALL THREE integral pieces of the Helmholtz apply work; the
-  route is conceptually de-risked end to end. Remaining is engineering: general-L
-  M_J/M_K (the smeared pair carries the pair's Hermite moments -> a
-  Hermite-Gaussian ket, not a plain shell), the full many-electron SCF driver,
-  and the t-resolved-tensor amortisation across the occupied kappa_i.
+  route is conceptually de-risked end to end. Remaining is engineering, and it
+  needs NO new integral code: the three-kernel (mu nu | Y_kappa (x) C | rho sigma)
+  is exactly threeel.hpp's three_electron_kind with op12 = yukawa nodes, op13 =
+  coulomb nodes, and the central electron on nu:
+    (mu nu|Y_k (x) C|rho sigma) = three_electron_kind(nu, mu, rho, ghost, ghost,
+                                    sigma, yukawa_nodes, coulomb_nodes),
+  so general-L M_J = sum_{rho sigma} D_{rho sigma} (mu nu|...|rho sigma) and M_K
+  the analogous contraction (rho on the Yukawa/central side). No smear-as-shell
+  needed -- threeel handles general-L Gaussians natively (the s-case PoCs use the
+  cheaper eri_quartet smear). Remaining pieces: wire yukawa nodes into an OpNode
+  list; the matrix-level M_J/M_K density contraction over three_electron_kind;
+  the full many-electron SCF driver; and the t-resolved-tensor amortisation
+  across the occupied kappa_i (only the Yukawa node weight e^{-kappa^2/4s^2}
+  depends on kappa, so one (s,t)-resolved tensor serves every orbital).
   Oracle: closed-form Yukawa
   integrals; the converged HK energy vs a standard diagonalizing SCF in the same
   basis (must agree in-basis), and vs the basis-set-limit reference.
