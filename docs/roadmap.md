@@ -371,11 +371,19 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   so general-L M_J = sum_{rho sigma} D_{rho sigma} (mu nu|...|rho sigma) and M_K
   the analogous contraction (rho on the Yukawa/central side). No smear-as-shell
   needed -- threeel handles general-L Gaussians natively (the s-case PoCs use the
-  cheaper eri_quartet smear). Remaining pieces: wire yukawa nodes into an OpNode
-  list; the matrix-level M_J/M_K density contraction over three_electron_kind;
-  the full many-electron SCF driver; and the t-resolved-tensor amortisation
+  cheaper eri_quartet smear). DONE (helmholtz_jk_matrices): general-L M_J and M_K
+  are library functions -- the density contraction over three_electron_raw_nodes
+  with yukawa_grid nodes as op12 (via coulomb_nodes, since OpNode just carries
+  {w,t}) and a per-AO CartGauss helper. Validated by the He effective-potential
+  fixed point M_eff = M_nuc + M_J - 1/2 M_K (test_helmholtz ManyElectronJKFixedPoint)
+  and vs the s-case smear PoCs to 1e-15. So the ENTIRE Helmholtz-apply integral
+  machinery (yukawa_grid, helmholtz_nuclear_matrix, helmholtz_jk_matrices) is in
+  the library. Remaining: the many-electron SCF DRIVER (application-level; the
+  fixed-point checks already prove convergence); and efficiency -- the current
+  J/K is O(nao^4) three-electron evals, so the t-resolved-tensor amortisation
   across the occupied kappa_i (only the Yukawa node weight e^{-kappa^2/4s^2}
-  depends on kappa, so one (s,t)-resolved tensor serves every orbital).
+  depends on kappa, so one (s,t)-resolved tensor serves every orbital) plus
+  density-folding (as tc_gradu_grad_build did) are the perf steps.
   Oracle: closed-form Yukawa
   integrals; the converged HK energy vs a standard diagonalizing SCF in the same
   basis (must agree in-basis), and vs the basis-set-limit reference.
