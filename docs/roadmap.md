@@ -353,11 +353,19 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   build (s-case) is VALIDATED (references/hk_j_poc.cpp): for a fixed density D,
   the eigenpair of F=T+V_nuc+J[D] satisfies M_eff(kappa0)c0 = -1/2 S c0 with
   M_eff = M_nuc + M_J[D] -- residual drops from 0.72 (M_nuc only, J missing) to
-  3.2e-4 (6 fns) / 5.2e-6 (9 fns), basis-limited. Remaining: general-L M_J (the
-  smeared pair carries the pair's Hermite moments -> a Hermite-Gaussian ket, not
-  a plain shell); the exchange M_K (nonlocal 4-index, the harder piece); the full
-  many-electron SCF; then the t-resolved-tensor amortisation across the occupied
-  kappa_i.
+  3.2e-4 (6 fns) / 5.2e-6 (9 fns), basis-limited. EXCHANGE M_K also VALIDATED
+  (references/hk_jk_poc.cpp): despite first appearances it is NOT a 4-point
+  object -- (K chi_nu)(r) = sum_{rs} D_rs chi_rho(r) int chi_sigma chi_nu(r')/
+  |r-r'|, so <mu|G_kappa K|nu> = sum_{rs} D_rs int^3 chi_mu(r'') G_kappa(r''-r)
+  chi_rho(r) chi_sigma chi_nu(r')/|r-r'| is the SAME three-kernel threeel-topology
+  as M_J, just contracted differently (rho on the Yukawa side, the (sigma,nu)
+  pair smeared). The RHF-like fixed point M_eff(kappa0)c0 = -1/2 S c0 with
+  M_eff = M_nuc + M_J - 1/2 M_K holds to the basis limit (4.1e-4 at 6 fns,
+  2.4e-5 at 9). So ALL THREE integral pieces of the Helmholtz apply work; the
+  route is conceptually de-risked end to end. Remaining is engineering: general-L
+  M_J/M_K (the smeared pair carries the pair's Hermite moments -> a
+  Hermite-Gaussian ket, not a plain shell), the full many-electron SCF driver,
+  and the t-resolved-tensor amortisation across the occupied kappa_i.
   Oracle: closed-form Yukawa
   integrals; the converged HK energy vs a standard diagonalizing SCF in the same
   basis (must agree in-basis), and vs the basis-set-limit reference.
