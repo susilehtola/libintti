@@ -37,7 +37,8 @@ add_executable(intti_tests
   test_geohess.cpp
   test_rigrad.cpp
   test_sto.cpp
-  test_threeel.cpp)
+  test_threeel.cpp
+  test_multipole.cpp)
 if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_ri.cpp)
 endif()
