@@ -330,7 +330,20 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   one build serves all kappa_i (the per-orbital amortisation); (3) a Helmholtz-SCF
   proof-of-concept on H / He / H2 confirming the fixed point converges to the
   in-basis Galerkin/diagonalization energy (add J/K to V for many-electron), then
-  measuring whether kinetic-exactness buys accuracy per basis function. Oracle: closed-form Yukawa
+  measuring whether kinetic-exactness buys accuracy per basis function.
+  (3) PROOF-OF-CONCEPT DONE for the H atom (references/hk_scf_poc.cpp): the pure
+  integral-form eps* -- the self-consistent point where A(eps)=-2 S^{-1} M(kappa)
+  has dominant eigenvalue 1, found by power iteration + secant, extracting the
+  energy WITHOUT the projected kinetic -- converges to machine precision
+  (lambda-1 ~ 1e-13) and agrees with Galerkin eps0 in the basis limit
+  (eps*-eps0: 3.2e-3 at 4 fns -> 2.8e-5 at 8 fns; both -> -0.5). HONEST FINDING:
+  kinetic-exactness does NOT give better accuracy per basis function -- eps* is
+  marginally WORSE than the variational Galerkin eps0 for H. So the route's value
+  is NOT per-basis accuracy but the structural properties (no diagonalisation,
+  screened linear-scaling convolutions, GPU-friendly all-contraction SCF). Still
+  remaining: the many-electron case (fold J/K into V -- both are geminal (x)
+  Coulomb objects like M(kappa)) and the t-resolved-tensor amortisation across
+  the occupied kappa_i. Oracle: closed-form Yukawa
   integrals; the converged HK energy vs a standard diagonalizing SCF in the same
   basis (must agree in-basis), and vs the basis-set-limit reference.
 
