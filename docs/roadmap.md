@@ -349,9 +349,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   the (rho sigma) pair becomes a t-smeared Gaussian at P_{rs} (exponent
   p t^2/(p+t^2)), then eri_quartet(pair(mu,ghost), pair(nu,G_smear), yukawa_grid)
   summed over (rho sigma) pairs and t-nodes (fold the smear prefactor
-  K_{rs}(pi/(p+t^2))^{3/2}; general-L smears carry a polynomial). K analogous.
-  Validate via the He fixed point M_eff(kappa0)c0 = -1/2 S c0 with (eps0,c0) from
-  a mini-RHF; then the t-resolved-tensor amortisation across the occupied kappa_i.
+  K_{rs}(pi/(p+t^2))^{3/2}; general-L smears carry a polynomial). The G_kappa J
+  build (s-case) is VALIDATED (references/hk_j_poc.cpp): for a fixed density D,
+  the eigenpair of F=T+V_nuc+J[D] satisfies M_eff(kappa0)c0 = -1/2 S c0 with
+  M_eff = M_nuc + M_J[D] -- residual drops from 0.72 (M_nuc only, J missing) to
+  3.2e-4 (6 fns) / 5.2e-6 (9 fns), basis-limited. Remaining: general-L M_J (the
+  smeared pair carries the pair's Hermite moments -> a Hermite-Gaussian ket, not
+  a plain shell); the exchange M_K (nonlocal 4-index, the harder piece); the full
+  many-electron SCF; then the t-resolved-tensor amortisation across the occupied
+  kappa_i.
   Oracle: closed-form Yukawa
   integrals; the converged HK energy vs a standard diagonalizing SCF in the same
   basis (must agree in-basis), and vs the basis-set-limit reference.
