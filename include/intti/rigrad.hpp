@@ -14,11 +14,13 @@
 // (2 alpha [.+1] - m [.-1]) drives them; the zero-exponent ghost never moves.
 // Matrix-level: density in, per-shell forces out; no quartet is exposed.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <map>
 #include <vector>
 
+#include "blas.hpp"    // detail::gemm (row-major GEMM)
 #include "erigrad.hpp" // detail::comp_index, detail::eri_block4
 #include "fock.hpp"
 #include "gto.hpp"
@@ -288,11 +290,11 @@ RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
   const int nao = orb.nao, naux = aux.nao;
   auto M = coulomb_2c(aux, grid);             // naux x naux
   auto T = coulomb_3c(orb, aux, grid);        // nao*nao x naux
-  // d_P = sum_mn (mn|P) D_mn
+  // d_P = sum_mn (mn|P) D_mn = (T^T D)[P], T viewed as N x naux, D as N-vector
   std::vector<Real> d(naux, Real(0));
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
-  for (std::size_t mn = 0; mn < N; ++mn)
-    for (int P = 0; P < naux; ++P) d[P] += T[mn * naux + P] * D[mn];
+  detail::gemm('T', 'N', naux, 1, static_cast<int>(N), Real(1), T.data(), naux, D, 1, Real(0),
+               d.data(), 1);
   // gamma = M^{-1} d via the eigendecomposition (pseudo-inverse with cutoff)
   std::vector<Real> V = M, eval(naux);
   detail::syevd(naux, V.data(), eval.data()); // V: eigenvectors (columns, col-major)
@@ -372,10 +374,10 @@ std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
   auto T = coulomb_3c(orb, aux, grid);
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
-  // d_P and M^{-1}
+  // d_P and M^{-1}: d_P = sum_mn (mn|P) D_mn = (T^T D)[P]
   std::vector<Real> d(naux, Real(0));
-  for (std::size_t mn = 0; mn < N; ++mn)
-    for (int P = 0; P < naux; ++P) d[P] += T[mn * naux + P] * D[mn];
+  detail::gemm('T', 'N', naux, 1, static_cast<int>(N), Real(1), T.data(), naux, D, 1, Real(0),
+               d.data(), 1);
   std::vector<Real> Vv = M, eval(naux);
   detail::syevd(naux, Vv.data(), eval.data());
   Real emax = 0;
@@ -441,26 +443,16 @@ std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
           }
         }
     }
-  // s[x] = M^{-1} r[x]
+  // s[x] = M^{-1} r[x]: s[x][P] = sum_Q r[x][Q] Minv[P][Q] = (r Minv^T)[x][P]
   std::vector<Real> s(static_cast<std::size_t>(dim) * naux, Real(0));
-  for (int x = 0; x < dim; ++x)
-    for (int P = 0; P < naux; ++P) {
-      Real acc = 0;
-      for (int Q = 0; Q < naux; ++Q)
-        acc += Minv[P * naux + Q] * r[static_cast<std::size_t>(x) * naux + Q];
-      s[static_cast<std::size_t>(x) * naux + P] = acc;
-    }
+  detail::gemm('N', 'T', dim, naux, naux, Real(1), r.data(), naux, Minv.data(), naux,
+               Real(0), s.data(), naux);
 
   std::vector<Real> H(static_cast<std::size_t>(dim) * dim, Real(0));
   auto Hadd = [&](int x, int y, Real v) { H[static_cast<std::size_t>(x) * dim + y] += v; };
-  // response term r_x^T M^{-1} r_y
-  for (int x = 0; x < dim; ++x)
-    for (int y = 0; y < dim; ++y) {
-      Real acc = 0;
-      for (int P = 0; P < naux; ++P)
-        acc += r[static_cast<std::size_t>(x) * naux + P] * s[static_cast<std::size_t>(y) * naux + P];
-      Hadd(x, y, acc);
-    }
+  // response term H[x][y] = sum_P r[x][P] s[y][P] = (r s^T)[x][y]
+  detail::gemm('N', 'T', dim, dim, naux, Real(1), r.data(), naux, s.data(), naux, Real(1),
+               H.data(), dim);
   // direct term 1: gamma^T d_xy, 3-centre with coeff D_mn gamma_P
   for (int m = 0; m < nso; ++m)
     for (int n = 0; n < nso; ++n)
@@ -531,46 +523,33 @@ RIGrad<Real> ri_k_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
       for (int Q = 0; Q < naux; ++Q) Minv[R * naux + Q] += s * V[k * naux + R] * V[k * naux + Q];
   }
 
-  // H[(s*nao+n)*naux+Q] = sum_l D_sl (l n|Q)
+  // H[(s*nao+n)*naux+Q] = sum_l D_sl (l n|Q): H[s][(n,Q)] = sum_l D[s][l] T[l][(n,Q)]
+  // = (D * T_reshaped)[s][(n,Q)] with T viewed as nao x (nao*naux).
   std::vector<Real> H(no2 * naux, Real(0));
-  for (int s = 0; s < nao; ++s)
-    for (int l = 0; l < nao; ++l) {
-      const Real dsl = Dm(s, l);
-      if (dsl == Real(0)) continue;
-      for (int n = 0; n < nao; ++n)
-        for (int Q = 0; Q < naux; ++Q)
-          H[(static_cast<std::size_t>(s) * nao + n) * naux + Q] +=
-              dsl * T[(static_cast<std::size_t>(l) * nao + n) * naux + Q];
-    }
-  // G[(a*nao+b)*naux+R] = sum_Q M^{-1}_RQ H[(a*nao+b)*naux+Q]
+  detail::gemm('N', 'N', nao, nao * naux, nao, Real(1), D, nao, T.data(), nao * naux, Real(0),
+               H.data(), nao * naux);
+  // G[(a*nao+b)*naux+R] = sum_Q M^{-1}_RQ H[ab][Q] = (H Minv^T)[ab][R]
   std::vector<Real> G(no2 * naux, Real(0));
-  for (std::size_t ab = 0; ab < no2; ++ab)
-    for (int R = 0; R < naux; ++R) {
-      Real s = 0;
-      for (int Q = 0; Q < naux; ++Q) s += Minv[R * naux + Q] * H[ab * naux + Q];
-      G[ab * naux + R] = s;
-    }
-  // c3[(l*nao+n)*naux+R] = -1/2 sum_s D_ls G[(n*nao+s)*naux+R]
+  detail::gemm('N', 'T', static_cast<int>(no2), naux, naux, Real(1), H.data(), naux, Minv.data(),
+               naux, Real(0), G.data(), naux);
+  // c3[(l*nao+n)*naux+R] = -1/2 sum_s D_ls G[(n*nao+s)*naux+R]. Batched over n:
+  // for each n, c3[l][n][R] = -1/2 (D * G[n])[l][R], G[n] the (sig,R) slice.
   std::vector<Real> c3(no2 * naux, Real(0));
-  for (int l = 0; l < nao; ++l)
-    for (int n = 0; n < nao; ++n)
-      for (int R = 0; R < naux; ++R) {
-        Real s = 0;
-        for (int sig = 0; sig < nao; ++sig)
-          s += Dm(l, sig) * G[(static_cast<std::size_t>(n) * nao + sig) * naux + R];
-        c3[(static_cast<std::size_t>(l) * nao + n) * naux + R] = Real(-0.5) * s;
-      }
-  // c2[T*naux+U] = 1/4 sum_{sn} G[(n*nao+s)*naux+T] G[(s*nao+n)*naux+U]
+  for (int n = 0; n < nao; ++n)
+    detail::gemm('N', 'N', nao, naux, nao, Real(-0.5), D, nao,
+                 G.data() + static_cast<std::size_t>(n) * nao * naux, naux, Real(0),
+                 c3.data() + static_cast<std::size_t>(n) * naux, nao * naux);
+  // c2[T*naux+U] = 1/4 sum_{sn} G[(n*nao+s)*naux+T] G[(s*nao+n)*naux+U]. With the
+  // (n,s)->(s,n) inner transpose as a permuted copy Gp, c2 = 1/4 G^T Gp.
+  std::vector<Real> Gp(no2 * naux, Real(0));
+  for (int n = 0; n < nao; ++n)
+    for (int sig = 0; sig < nao; ++sig)
+      for (int R = 0; R < naux; ++R)
+        Gp[(static_cast<std::size_t>(n) * nao + sig) * naux + R] =
+            G[(static_cast<std::size_t>(sig) * nao + n) * naux + R];
   std::vector<Real> c2(static_cast<std::size_t>(naux) * naux, Real(0));
-  for (int Tc = 0; Tc < naux; ++Tc)
-    for (int U = 0; U < naux; ++U) {
-      Real s = 0;
-      for (int n = 0; n < nao; ++n)
-        for (int sig = 0; sig < nao; ++sig)
-          s += G[(static_cast<std::size_t>(n) * nao + sig) * naux + Tc] *
-               G[(static_cast<std::size_t>(sig) * nao + n) * naux + U];
-      c2[Tc * naux + U] = Real(0.25) * s;
-    }
+  detail::gemm('T', 'N', naux, naux, static_cast<int>(no2), Real(0.25), G.data(), naux, Gp.data(),
+               naux, Real(0), c2.data(), naux);
 
   RIGrad<Real> g;
   g.forb.assign(orb.shells.size(), {Real(0), Real(0), Real(0)});
@@ -645,44 +624,29 @@ std::vector<Real> ri_k_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
     for (int P = 0; P < naux; ++P)
       for (int Q = 0; Q < naux; ++Q) Minv[P * naux + Q] += s * Vv[k * naux + P] * Vv[k * naux + Q];
   }
-  // H[(a*nao+b)*naux+Q] = sum_l D_al (l b|Q); G = M^{-1} H
+  // H[(a*nao+b)*naux+Q] = sum_l D_al (l b|Q) = (D * T_reshaped); G = M^{-1} H = H Minv^T
   std::vector<Real> Hm(no2 * naux, Real(0)), G(no2 * naux, Real(0));
-  for (int a = 0; a < nao; ++a)
-    for (int l = 0; l < nao; ++l) {
-      const Real dal = Dm(a, l);
-      if (dal == Real(0)) continue;
-      for (int b = 0; b < nao; ++b)
-        for (int Q = 0; Q < naux; ++Q)
-          Hm[(static_cast<std::size_t>(a) * nao + b) * naux + Q] +=
-              dal * T[(static_cast<std::size_t>(l) * nao + b) * naux + Q];
-    }
-  for (std::size_t ab = 0; ab < no2; ++ab)
-    for (int Q = 0; Q < naux; ++Q) {
-      Real acc = 0;
-      for (int R = 0; R < naux; ++R) acc += Minv[Q * naux + R] * Hm[ab * naux + R];
-      G[ab * naux + Q] = acc;
-    }
-  // coeff3[(l*nao+n)*naux+R] = -1/2 sum_s D_ls G[(n*nao+s)*naux+R]
+  detail::gemm('N', 'N', nao, nao * naux, nao, Real(1), D, nao, T.data(), nao * naux, Real(0),
+               Hm.data(), nao * naux);
+  detail::gemm('N', 'T', static_cast<int>(no2), naux, naux, Real(1), Hm.data(), naux, Minv.data(),
+               naux, Real(0), G.data(), naux);
+  // coeff3[(l*nao+n)*naux+R] = -1/2 sum_s D_ls G[(n*nao+s)*naux+R], batched over n
   std::vector<Real> coeff3(no2 * naux, Real(0));
-  for (int l = 0; l < nao; ++l)
-    for (int n = 0; n < nao; ++n)
-      for (int R = 0; R < naux; ++R) {
-        Real acc = 0;
-        for (int sig = 0; sig < nao; ++sig)
-          acc += Dm(l, sig) * G[(static_cast<std::size_t>(n) * nao + sig) * naux + R];
-        coeff3[(static_cast<std::size_t>(l) * nao + n) * naux + R] = Real(-0.5) * acc;
-      }
-  // coeff2[T*naux+U] = 1/4 sum_{sn} G[(n*nao+s)*naux+T] G[(s*nao+n)*naux+U]
+  for (int n = 0; n < nao; ++n)
+    detail::gemm('N', 'N', nao, naux, nao, Real(-0.5), D, nao,
+                 G.data() + static_cast<std::size_t>(n) * nao * naux, naux, Real(0),
+                 coeff3.data() + static_cast<std::size_t>(n) * naux, nao * naux);
+  // coeff2[T*naux+U] = 1/4 sum_{sn} G[(n*nao+s)*T] G[(s*nao+n)*U] = 1/4 G^T Gp,
+  // Gp the (n,s)->(s,n) inner-transposed copy of G.
+  std::vector<Real> Gp(no2 * naux, Real(0));
+  for (int n = 0; n < nao; ++n)
+    for (int sig = 0; sig < nao; ++sig)
+      for (int R = 0; R < naux; ++R)
+        Gp[(static_cast<std::size_t>(n) * nao + sig) * naux + R] =
+            G[(static_cast<std::size_t>(sig) * nao + n) * naux + R];
   std::vector<Real> coeff2(static_cast<std::size_t>(naux) * naux, Real(0));
-  for (int Tc = 0; Tc < naux; ++Tc)
-    for (int U = 0; U < naux; ++U) {
-      Real acc = 0;
-      for (int n = 0; n < nao; ++n)
-        for (int sig = 0; sig < nao; ++sig)
-          acc += G[(static_cast<std::size_t>(n) * nao + sig) * naux + Tc] *
-                 G[(static_cast<std::size_t>(sig) * nao + n) * naux + U];
-      coeff2[Tc * naux + U] = Real(0.25) * acc;
-    }
+  detail::gemm('T', 'N', naux, naux, static_cast<int>(no2), Real(0.25), G.data(), naux, Gp.data(),
+               naux, Real(0), coeff2.data(), naux);
 
   auto cshell = [&](bool isaux, int sidx) { return isaux ? nso + sidx : sidx; };
   const auto ghost = [&](const PrimitiveShell<Real> &sx) { return detail::ghost_shell(sx); };
@@ -782,29 +746,23 @@ std::vector<Real> ri_k_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
             }
         }
     }
-  // S = M^{-1} R (over Q); response Hess[x][y] += -1/2 sum_{ab,Q} R_x S_y
+  // S = M^{-1} R (over Q): S[(x,ab)][Q] = sum_Rr R[(x,ab)][Rr] Minv[Q][Rr]
+  // = (R Minv^T) with (x,ab) flattened into one dim*no2 row index.
   std::vector<Real> S(static_cast<std::size_t>(dim) * no2 * naux, Real(0));
+  detail::gemm('N', 'T', static_cast<int>(static_cast<std::size_t>(dim) * no2), naux, naux,
+               Real(1), R.data(), naux, Minv.data(), naux, Real(0), S.data(), naux);
+  // response Hess[x][y] += -1/2 sum_{a,b,Q} R_x[b,a,Q] S_y[a,b,Q]. L_GG couples
+  // (a,b) with (b,a): form the (a,b)->(b,a) inner-permuted copy Rp of R, then the
+  // sum over the flattened (a,b,Q) index is the GEMM Hess += -1/2 Rp S^T.
+  std::vector<Real> Rp(static_cast<std::size_t>(dim) * no2 * naux, Real(0));
   for (int x = 0; x < dim; ++x)
-    for (std::size_t ab = 0; ab < no2; ++ab)
-      for (int Q = 0; Q < naux; ++Q) {
-        Real acc = 0;
-        for (int Rr = 0; Rr < naux; ++Rr)
-          acc += Minv[Q * naux + Rr] *
-                 R[(static_cast<std::size_t>(x) * no2 + ab) * naux + Rr];
-        S[(static_cast<std::size_t>(x) * no2 + ab) * naux + Q] = acc;
-      }
-  // response Hess[x][y] += -1/2 sum_{a,b,Q} R_x[b,a,Q] S_y[a,b,Q] (L_GG couples
-  // (a,b) with (b,a), so R_x carries the orbital transpose relative to S_y)
-  for (int x = 0; x < dim; ++x)
-    for (int y = 0; y < dim; ++y) {
-      Real acc = 0;
-      for (int a = 0; a < nao; ++a)
-        for (int b = 0; b < nao; ++b) {
-          const std::size_t rx = Ridx(x, b, a, 0), sy = Ridx(y, a, b, 0);
-          for (int Q = 0; Q < naux; ++Q) acc += R[rx + Q] * S[sy + Q];
-        }
-      Hadd(x, y, Real(-0.5) * acc);
-    }
+    for (int a = 0; a < nao; ++a)
+      for (int b = 0; b < nao; ++b)
+        std::copy(R.data() + Ridx(x, b, a, 0), R.data() + Ridx(x, b, a, 0) + naux,
+                  Rp.data() + Ridx(x, a, b, 0));
+  const int Kab = static_cast<int>(no2 * naux);
+  detail::gemm('N', 'T', dim, dim, Kab, Real(-0.5), Rp.data(), Kab, S.data(), Kab, Real(1),
+               Hess.data(), dim);
   return Hess;
 }
 
