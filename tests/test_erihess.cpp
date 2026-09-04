@@ -110,4 +110,35 @@ TEST(EriHess, TranslationalInvariance) {
   EXPECT_LT(worst, 1e-9 * (mx + 1)) << "sum over differentiated centre must vanish";
 }
 
+// Tiny-tau screening must reproduce the exact Hessian; exercises the 8-fold
+// permutational orbit including a d shell.
+TEST(EriHess, ScreeningMatchesExact) {
+  std::vector<Shell> shells = {{1.3, {0.0, 0.0, 0.0}, 0},
+                               {0.8, {0.0, 0.0, 0.0}, 1},
+                               {0.5, {0.0, 0.0, 0.0}, 2},
+                               {1.1, {1.5, -0.4, 0.2}, 1}};
+  auto bas = intti::make_basis(shells);
+  const int nao = bas.nao, ns = static_cast<int>(bas.shells.size()), dim = 3 * ns;
+  std::mt19937 rng(21);
+  std::normal_distribution<double> nd;
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int k = 0; k < 3; ++k) {
+    std::vector<double> v(nao);
+    for (auto &x : v) x = nd(rng);
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j) D[i * nao + j] += v[i] * v[j];
+  }
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto H0 = intti::two_electron_hessian(bas, D.data(), grid);
+  auto Hs = intti::two_electron_hessian(bas, D.data(), grid, 1e-14);
+  double worst = 0, scale = 0;
+  for (std::size_t i = 0; i < H0.size(); ++i) {
+    worst = std::max(worst, std::abs(H0[i] - Hs[i]));
+    scale = std::max(scale, std::abs(H0[i]));
+  }
+  (void)dim;
+  EXPECT_GT(scale, 1e-2);
+  EXPECT_LT(worst, 1e-10 * (scale + 1)) << "tiny-tau screening must match exact";
+}
+
 } // namespace

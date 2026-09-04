@@ -71,4 +71,34 @@ TEST(EriGrad, TwoElectronForceVsFiniteDifference) {
     }
 }
 
+// Screening at a tiny threshold must reproduce the exact (unscreened) gradient;
+// exercises the 8-fold permutational orbit on an s/p/d basis.
+TEST(EriGrad, ScreeningMatchesExact) {
+  std::vector<Shell> shells = {
+      {1.3, {0.0, 0.0, 0.0}, 0}, {0.8, {0.0, 0.0, 0.0}, 1}, {0.5, {0.0, 0.0, 0.0}, 2},
+      {1.1, {1.6, -0.4, 0.2}, 0}, {0.6, {1.6, -0.4, 0.2}, 1}};
+  auto bas = intti::make_basis(shells);
+  const int nao = bas.nao;
+  std::mt19937 rng(9);
+  std::normal_distribution<double> nd;
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int k = 0; k < 3; ++k) {
+    std::vector<double> v(nao);
+    for (auto &x : v) x = nd(rng);
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j) D[i * nao + j] += v[i] * v[j];
+  }
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto g0 = intti::two_electron_gradient(bas, D.data(), grid);
+  auto gs = intti::two_electron_gradient(bas, D.data(), grid, 1e-14);
+  double worst = 0, scale = 0;
+  for (std::size_t s = 0; s < g0.size(); ++s)
+    for (int e = 0; e < 3; ++e) {
+      worst = std::max(worst, std::abs(g0[s][e] - gs[s][e]));
+      scale = std::max(scale, std::abs(g0[s][e]));
+    }
+  EXPECT_GT(scale, 1e-2);
+  EXPECT_LT(worst, 1e-10 * (scale + 1)) << "tiny-tau screening must match exact";
+}
+
 } // namespace

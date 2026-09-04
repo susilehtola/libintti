@@ -19,13 +19,20 @@
 //   dJ_munu/dB_k = sum_ls d/dB_k (mn|ls) D_ls,
 //   dK_munu/dB_k = sum_ls d/dB_k (ml|ns) D_ls.
 // Matrix-level: density in, dJ/dK matrices out; quartets stay internal.
+//
+// Permutational symmetry (see erigrad.hpp): loop canonical shell quartets only
+// and replay the *unchanged* per-quartet contraction on every distinct orbit
+// member. The body recomputes the phase-vector cross products from each
+// member's own centres, so the sign flips under a<->b, c<->d and (ab)<->(cd)
+// are handled automatically; only the (permutation-invariant) base and
+// singly-promoted ERI blocks are shared (~8x fewer quartet evals).
 
 #include <array>
 #include <complex>
 #include <cstddef>
 #include <vector>
 
-#include "erigrad.hpp" // detail::comp_index, detail::eri_block4
+#include "erigrad.hpp" // detail::comp_index, detail::eri_block4, permute_block, eri_perms
 #include "fock.hpp"
 #include "gto.hpp"
 #include "quartet.hpp"
@@ -54,84 +61,119 @@ GiaoJKderiv<Real> giao_jk_dB(const ShellBasis<Real> &basis, const Real *D,
     Kim[k].assign(n2, Real(0));
   }
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
-  auto shell = [&](int s, int dl) {
-    auto sh = basis.shells[s];
-    sh.l += dl;
-    return sh;
-  };
   auto idx4 = [](const int n[4], int i0, int i1, int i2, int i3) {
     return ((static_cast<std::size_t>(i0) * n[1] + i1) * n[2] + i2) * n[3] + i3;
   };
 
-  for (int a = 0; a < ns; ++a)
-    for (int b = 0; b < ns; ++b)
-      for (int cc = 0; cc < ns; ++cc)
-        for (int dd = 0; dd < ns; ++dd) {
-          const int la = basis.shells[a].l, lb = basis.shells[b].l;
-          const int lc = basis.shells[cc].l, ld = basis.shells[dd].l;
-          const int na = ncart(la), nb = ncart(lb), nc = ncart(lc), nd = ncart(ld);
-          const int oa = basis.ao_off[a], ob = basis.ao_off[b];
-          const int oc = basis.ao_off[cc], od = basis.ao_off[dd];
-          // base and bra-promoted quartet blocks (real ERIs at B = 0)
-          auto base = detail::eri_block4(basis.shells[a], basis.shells[b],
-                                         basis.shells[cc], basis.shells[dd], grid);
-          auto plusA = detail::eri_block4(shell(a, 1), basis.shells[b],
-                                          basis.shells[cc], basis.shells[dd], grid);
-          auto plusC = detail::eri_block4(basis.shells[a], basis.shells[b],
-                                          shell(cc, 1), basis.shells[dd], grid);
-          const int nbase[4] = {na, nb, nc, nd};
-          const int npA[4] = {ncart(la + 1), nb, nc, nd};
-          const int npC[4] = {na, nb, ncart(lc + 1), nd};
-          const Real w1[3] = {basis.shells[a].center[0] - basis.shells[b].center[0],
-                              basis.shells[a].center[1] - basis.shells[b].center[1],
-                              basis.shells[a].center[2] - basis.shells[b].center[2]};
-          const Real w2[3] = {basis.shells[cc].center[0] - basis.shells[dd].center[0],
-                              basis.shells[cc].center[1] - basis.shells[dd].center[1],
-                              basis.shells[cc].center[2] - basis.shells[dd].center[2]};
-          const Real *Ra = basis.shells[a].center, *Rc = basis.shells[cc].center;
-          for (int ka = 0; ka < na; ++ka) {
-            int a3[3];
-            cart_comp(la, ka, a3[0], a3[1], a3[2]);
-            for (int kb = 0; kb < nb; ++kb)
-              for (int kc = 0; kc < nc; ++kc) {
-                int c3[3];
-                cart_comp(lc, kc, c3[0], c3[1], c3[2]);
-                for (int kd = 0; kd < nd; ++kd) {
-                  const Real b0 = base[idx4(nbase, ka, kb, kc, kd)];
-                  // position-weighted blocks M1_e = (a^{+e} b|cd) + Ra_e base,
-                  //                          M2_e = (ab|c^{+e} d) + Rc_e base
-                  Real M1[3], M2[3];
-                  for (int e = 0; e < 3; ++e) {
-                    int m[3] = {a3[0], a3[1], a3[2]};
-                    m[e] += 1;
-                    const int ip = detail::comp_index(la + 1, m[0], m[1]);
-                    M1[e] = plusA[idx4(npA, ip, kb, kc, kd)] + Ra[e] * b0;
-                    int mc[3] = {c3[0], c3[1], c3[2]};
-                    mc[e] += 1;
-                    const int icp = detail::comp_index(lc + 1, mc[0], mc[1]);
-                    M2[e] = plusC[idx4(npC, ka, kb, icp, kd)] + Rc[e] * b0;
-                  }
-                  // dI_k = (1/2)[ (e_k x w1).M1 + (e_k x w2).M2 ]  (real part;
-                  // the derivative is i*dI_k)
-                  const Real dI[3] = {
-                      Real(0.5) * ((-w1[2] * M1[1] + w1[1] * M1[2]) +
-                                   (-w2[2] * M2[1] + w2[1] * M2[2])),
-                      Real(0.5) * ((w1[2] * M1[0] - w1[0] * M1[2]) +
-                                   (w2[2] * M2[0] - w2[0] * M2[2])),
-                      Real(0.5) * ((-w1[1] * M1[0] + w1[0] * M1[1]) +
-                                   (-w2[1] * M2[0] + w2[0] * M2[1]))};
-                  const Real Dcd = Dm(oc + kc, od + kd);
-                  const Real Dbd = Dm(ob + kb, od + kd);
-                  const std::size_t jjk = (oa + ka) * static_cast<std::size_t>(nao) + ob + kb;
-                  const std::size_t kkk = (oa + ka) * static_cast<std::size_t>(nao) + oc + kc;
-                  for (int k = 0; k < 3; ++k) {
-                    Jim[k][jjk] += dI[k] * Dcd;
-                    Kim[k][kkk] += dI[k] * Dbd;
-                  }
-                }
-              }
+  // contract one (member) shell quartet: the original, unmodified GIAO body.
+  // base/plusBra/plusKet are the member-layout base, bra-promoted (slot 0) and
+  // ket-promoted (slot 2) ERI blocks.
+  auto contribute = [&](const int mem[4], const int L[4], const int off[4],
+                        const std::vector<Real> &base, const std::vector<Real> &plusBra,
+                        const std::vector<Real> &plusKet) {
+    const int la = L[0], lb = L[1], lc = L[2], ld = L[3];
+    const int na = ncart(la), nb = ncart(lb), nc = ncart(lc), nd = ncart(ld);
+    const int oa = off[0], ob = off[1], oc = off[2], od = off[3];
+    const int nbase[4] = {na, nb, nc, nd};
+    const int npA[4] = {ncart(la + 1), nb, nc, nd};
+    const int npC[4] = {na, nb, ncart(lc + 1), nd};
+    const Real *Ra = basis.shells[mem[0]].center, *Rb = basis.shells[mem[1]].center;
+    const Real *Rc = basis.shells[mem[2]].center, *Rd = basis.shells[mem[3]].center;
+    const Real w1[3] = {Ra[0] - Rb[0], Ra[1] - Rb[1], Ra[2] - Rb[2]};
+    const Real w2[3] = {Rc[0] - Rd[0], Rc[1] - Rd[1], Rc[2] - Rd[2]};
+    for (int ka = 0; ka < na; ++ka) {
+      int a3[3];
+      cart_comp(la, ka, a3[0], a3[1], a3[2]);
+      for (int kb = 0; kb < nb; ++kb)
+        for (int kc = 0; kc < nc; ++kc) {
+          int c3[3];
+          cart_comp(lc, kc, c3[0], c3[1], c3[2]);
+          for (int kd = 0; kd < nd; ++kd) {
+            const Real b0 = base[idx4(nbase, ka, kb, kc, kd)];
+            Real M1[3], M2[3];
+            for (int e = 0; e < 3; ++e) {
+              int m[3] = {a3[0], a3[1], a3[2]};
+              m[e] += 1;
+              const int ip = detail::comp_index(la + 1, m[0], m[1]);
+              M1[e] = plusBra[idx4(npA, ip, kb, kc, kd)] + Ra[e] * b0;
+              int mc[3] = {c3[0], c3[1], c3[2]};
+              mc[e] += 1;
+              const int icp = detail::comp_index(lc + 1, mc[0], mc[1]);
+              M2[e] = plusKet[idx4(npC, ka, kb, icp, kd)] + Rc[e] * b0;
+            }
+            const Real dI[3] = {
+                Real(0.5) * ((-w1[2] * M1[1] + w1[1] * M1[2]) +
+                             (-w2[2] * M2[1] + w2[1] * M2[2])),
+                Real(0.5) * ((w1[2] * M1[0] - w1[0] * M1[2]) +
+                             (w2[2] * M2[0] - w2[0] * M2[2])),
+                Real(0.5) * ((-w1[1] * M1[0] + w1[0] * M1[1]) +
+                             (-w2[1] * M2[0] + w2[0] * M2[1]))};
+            const Real Dcd = Dm(oc + kc, od + kd);
+            const Real Dbd = Dm(ob + kb, od + kd);
+            const std::size_t jjk = (oa + ka) * static_cast<std::size_t>(nao) + ob + kb;
+            const std::size_t kkk = (oa + ka) * static_cast<std::size_t>(nao) + oc + kc;
+            for (int k = 0; k < 3; ++k) {
+              Jim[k][jjk] += dI[k] * Dcd;
+              Kim[k][kkk] += dI[k] * Dbd;
+            }
           }
         }
+    }
+  };
+
+  // canonical shell quartets: a>=b, c>=d, pair(a,b) >= pair(c,d)
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b <= a; ++b) {
+      const int Pab = a * ns + b;
+      for (int cc = 0; cc < ns; ++cc)
+        for (int dd = 0; dd <= cc; ++dd) {
+          if (cc * ns + dd > Pab) continue;
+          const int canon[4] = {a, b, cc, dd};
+          const int Lc[4] = {basis.shells[a].l, basis.shells[b].l, basis.shells[cc].l,
+                             basis.shells[dd].l};
+          const int dC[4] = {ncart(Lc[0]), ncart(Lc[1]), ncart(Lc[2]), ncart(Lc[3])};
+
+          // canonical base and single (l+1) promotions of each slot
+          auto cbase = detail::eri_block4(basis.shells[a], basis.shells[b], basis.shells[cc],
+                                          basis.shells[dd], grid);
+          std::vector<Real> cplus[4];
+          for (int p = 0; p < 4; ++p) {
+            auto mk = [&](int slot) {
+              auto s = basis.shells[canon[slot]];
+              if (slot == p) s.l += 1;
+              return s;
+            };
+            cplus[p] = detail::eri_block4(mk(0), mk(1), mk(2), mk(3), grid);
+          }
+
+          int seen[8][4];
+          int nseen = 0;
+          for (int g = 0; g < 8; ++g) {
+            const int *pm = detail::eri_perms[g];
+            const int mem[4] = {canon[pm[0]], canon[pm[1]], canon[pm[2]], canon[pm[3]]};
+            bool dup = false;
+            for (int t = 0; t < nseen && !dup; ++t)
+              dup = seen[t][0] == mem[0] && seen[t][1] == mem[1] && seen[t][2] == mem[2] &&
+                    seen[t][3] == mem[3];
+            if (dup) continue;
+            for (int t = 0; t < 4; ++t) seen[nseen][t] = mem[t];
+            ++nseen;
+
+            const int Lm[4] = {Lc[pm[0]], Lc[pm[1]], Lc[pm[2]], Lc[pm[3]]};
+            const int offm[4] = {basis.ao_off[mem[0]], basis.ao_off[mem[1]],
+                                 basis.ao_off[mem[2]], basis.ao_off[mem[3]]};
+            auto mbase = detail::permute_block(cbase, dC, pm);
+            // member bra-promotion = canonical slot pm[0] promoted; ket = pm[2]
+            int dBra[4], dKet[4];
+            for (int i = 0; i < 4; ++i) dBra[i] = dKet[i] = dC[i];
+            dBra[pm[0]] = ncart(Lc[pm[0]] + 1);
+            dKet[pm[2]] = ncart(Lc[pm[2]] + 1);
+            auto mBra = detail::permute_block(cplus[pm[0]], dBra, pm);
+            auto mKet = detail::permute_block(cplus[pm[2]], dKet, pm);
+            contribute(mem, Lm, offm, mbase, mBra, mKet);
+          }
+        }
+    }
   GiaoJKderiv<Real> out;
   for (int k = 0; k < 3; ++k) {
     out.dJ[k].assign(n2, C(0));

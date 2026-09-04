@@ -856,12 +856,24 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
 - **ri.hpp RI J/K + fit as hand triple-loops** (ri_jk K-build O(naux nao^3)
   100-119; ri_fit B=T Mhalf O(nao^2 naux^2) 66-72; Mhalf reconstruction 53-58;
   ri_k_occ 137-153). All GEMMs; gather the strided B^P slice contiguous first.
-- **Naive O(ns^4) shell-quartet builds with no screening/symmetry**:
-  erihess.hpp:42-178 (two_electron_hessian), erigrad.hpp:64-149
-  (two_electron_gradient), giao2e.hpp:66-134 (giao_jk_dB). Add Schwarz + density
-  screening and 8-fold permutational symmetry (~8x + screened reduction; GIAO
-  needs sign care under the symmetry map; erihess also has a per-quartet std::map
-  cache to replace with a stack array).
+- **Naive O(ns^4) shell-quartet builds with no screening/symmetry**: DONE
+  (erigrad.hpp two_electron_gradient, erihess.hpp two_electron_hessian,
+  giao2e.hpp giao_jk_dB). Exact 8-fold permutational symmetry: loop canonical
+  quartets only (a>=b, c>=d, pair(ab)>=pair(cd)), evaluate the promoted/demoted
+  integral blocks ONCE, and replay the *unchanged* per-quartet contraction on
+  every distinct orbit member by permuting the block axes (detail::permute_block
+  + eri_perms). Correctness of the sign/centre bookkeeping rides entirely on the
+  original body -- it recomputes everything from each member's own shell data;
+  only the permutation-invariant integral values are shared, so the GIAO phase
+  sign flips under a<->b/c<->d/(ab)<->(cd) are handled automatically. erihess's
+  per-quartet std::map became a canonical block cache shared across the orbit.
+  Optional Schwarz+density screening via a tau param (default 0 = exact; the
+  Schwarz bound carries a +1 (grad) / +2 (hess) promotion margin so it bounds
+  the derivative integrals). Validated bit-exact-to-rounding vs the pre-symmetry
+  reference on an s/p/d/mixed system (grad 1e-12, hess 2e-14, giao 8e-16 rel);
+  measured 5.1x on a 12-shell s/p/d set (approaching the 8x ceiling, gap =
+  permute-copy overhead + smaller diagonal orbits). Screening-consistency tests
+  added (tiny-tau == exact). Existing FD oracles + full suite green (194/194).
 - **kbuild.hpp:104-229 exchange -- no permutational symmetry.** K_ab=K_ba gives a
   free 2x (compute a<=b, mirror); full (ac|bd) 8-fold is ~8x but needs atomics
   and a reworked MPI split. Hottest kernel, so even 2x matters.
