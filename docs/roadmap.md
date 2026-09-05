@@ -962,6 +962,17 @@ grid (or per-nucleus tensorial grids) with the element-pair loop bridging
 centers via the far/near split -- accepting the over-resolution that the product
 structure costs, for the factorization simplicity.
 
+5. **t-ADAPTED element-pair quadrature is the crux for machine precision**
+   (user, 2026-09-05). The kernel matrix element over two elements,
+   \int\int L_i(x) e^{-t^2(x-x')^2} L_j(x') dx dx', has a large-t "knife's edge":
+   a fixed grid suited to the polynomials L_i L_j misses the sharp Gaussian --
+   the classic pitfall of Sundholm-group naive implementations. Fix: substitute
+   x' = x - v/t, so the inner integral becomes (1/t)\int L_j(x - v/t) e^{-v^2} dv
+   with e^{-v^2} FLAT for all t; Gauss quadrature in v samples the (piecewise-
+   polynomial) shape function at near-constant argument -> EXACT for any t at
+   fixed order, no delta-tail needed. i.e. redistribute the quadrature *along the
+   exponential*, not along the polynomial.
+
 **Plan (one-center first -- self-contained, perfect oracle).**
 1. Per-nucleus tensorial FE grid; represent the Gaussian basis on it; evaluate
    1e integrals and (pq|rs) on-grid via the element-pair loop; validate to
@@ -970,7 +981,19 @@ structure costs, for the factorization simplicity.
 2. Multi-center element-pair bridging (the real research step): the far/near box
    split across nuclei on the global tensorial grid.
 3. Fold in the Helmholtz grid solver (the M-HK capstone) on the same FE machinery.
-Status: design recorded; not started.
+
+**Status (2026-09-05): one-center prototype stood up** (prototype/fe_onecenter.cpp,
+validated against eri_quartet + analytic). Findings: (a) overlap by tensorial
+grid quadrature is MACHINE-EXACT (1.8e-15) -- the Gaussian basis representation
+claim holds; (b) the naive fixed-grid Coulomb + leading delta-tail converges
+only ~1/t_c^2 (8e-4 -> 5e-5 as t_c 15->60) -- the expected naive-quadrature
+limit; (c) the t-adapted quadrature (design point 5) is 100-600x better than the
+naive one at large t (t=64: 9.4e-5 vs 5.6e-2; t=256: 1.3e-3 vs 0.20), confirming
+the coordinate-change fix. Residual at extreme t is the OUTER x-geometry (large
+overlapping elements -> a corner in "which x couples"), which small matched
+elements + the near/far split remove. Next: element-subdivided FE representation
+(piecewise polynomials) + t-adapted element-pair quadrature -> machine-precision
+(pq|rs) on one centre; then multi-centre bridging.
 
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
