@@ -1310,9 +1310,17 @@ the uniform special case (byte-identical, existing tests pass) built via
 detail::make_fegrid1d_elements; and make_fegrid1d_hp(gaussians, eps, pmin, pmax)
 is the per-axis grid constructor (domain to amplitude eps, seed at centres, hp-
 refine). fe_conv1d/fe_dage3d/fe_inner consume variable order unchanged. CI:
-HpGridResolvesGaussian + HpDageCoulombSmoke (suite 217/217). Next: grid-RI J/K
-on a molecule -- build the molecular density on the hp grid, DAGE -> V, contract
-J = <pq|V> (and co-density K), compared to the GTO-RI path (ncenter/ri.hpp).
+HpGridResolvesGaussian + HpDageCoulombSmoke (suite 217/217).
+GRID-RI J ON A MOLECULE PROTOTYPED (prototype/fe_gridri_j.cpp, 2026-09-05): the
+grid-RI payoff on a real GTO basis. Build the total density rho = sum_uv D_uv
+chi_u chi_v on the hp grid, DAGE -> V, contract J_uv = <chi_u chi_v | V>, and
+compare to the library's EXACT GTO coulomb_build on the same unnormalized-
+primitive basis + density. Result (4 s-AOs, two centres, hp grid 56 nodes/axis):
+the full J matrix matches element-by-element, worst rel error 2.4e-4 -- with NO
+auxiliary fit and NO (P|Q)^{-1} metric inversion, just density-on-grid + DAGE.
+So the FE route reproduces the molecular Coulomb matrix, confirming grid-RI end
+to end. Next: co-density K the same way; p+ shells (the x^l factors on the grid);
+then library-ize as a grid-RI J/K builder and benchmark vs GTO-RI.
 GPU note (user Q, 2026-09-05): hp variation is NOT a load-balancing problem for
 the tensorial DAGE and is arguably good. The DAGE parallelism is over lines
 (N^2/axis) + t-nodes, and in a TENSOR-PRODUCT grid every line along an axis uses
