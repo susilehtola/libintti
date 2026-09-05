@@ -1422,14 +1422,23 @@ the AO product space is massively linearly dependent and the analytic high-l cos
 explodes while the grid (set by the molecule's extent + exponent range) barely
 grows. Fixed 2-atom geometry, growing angular momentum (l = 0..3, two exponents
 per l), J only (nao, gridN, ratio grid/analytic):
-  maxl=0: nao=4,  N=36, 3275x    maxl=2: nao=40, N=60, 205x
-  maxl=1: nao=16, N=48, 1153x    maxl=3(f): nao=80, N=78, 85x
-So on the RIGHT axis the gap COLLAPSES: analytic J grows ~680x (0.0009->0.61s,
-the high-l quartet cost) while grid-RI grows ~18x (2.87->52.5s), the ratio
-dropping 3275->85, ~x3-4 per l-level. Extrapolating, the crossover is a few
-levels further (g/h, or full aug-diffuse augmentation + more atoms -- the
-aug-cc-pVTZ regime), and this is STILL on CPU; a GPU drops grid-RI's absolute
-time and moves the crossover much earlier. (An earlier run grew the molecule --
+  maxl=0: nao=4,  N=36, 3438x    maxl=3(f): nao=80,  N=78, 81x
+  maxl=1: nao=16, N=48, 1170x    maxl=4(g): nao=140, N=92, 34x
+  maxl=2: nao=40, N=60, 219x
+So on the RIGHT axis the gap COLLAPSES: analytic J grows ~4000x (0.0008->3.38s,
+the high-l quartet cost) while grid-RI grows ~44x (2.6->116s), the ratio
+dropping 3438->34, ~x2.4-3 per l-level. Extrapolating (h~14x, i~6x) the crossover
+is near l~7 on CPU, and much earlier with full aug-diffuse augmentation + more
+atoms (the aug-cc-pVTZ regime) or on GPU (which drops grid-RI's absolute time).
+L-CAP note (user): the analytic engine's L caps (JLMAX=8 in jbuild, KLMAX=4 in
+kbuild) are NOT fundamental -- they size compile-time fixed per-thread arrays
+(Hermite/E tables, the Kblk[KNC*KNC] exchange block) so the Kokkos kernels avoid
+dynamic device allocation; sizing for arbitrary L would waste registers on the
+common low-L case. The MD recursion + t-quadrature are L-agnostic. grid-RI is the
+uncapped numerical route (AO evaluator is x^lx y^ly z^lz e^{-a r^2}, any l, no
+fixed Hermite buffer) -- and it WINS exactly in the high-L regime, so the
+analytic cap and the grid-RI crossover coincide. To lift the analytic cap: raise
+the constants (register cost), template-dispatch on L, or team-scratch for high L. (An earlier run grew the molecule --
 the WRONG axis -- and saw the gap widen; that measured grid growth, not the RI
 regime.) grid-RI's value, confirmed by the trend: (a) rich / linearly-dependent
 bases (grid cost ~independent of the product-space redundancy; no (P|Q)^{-1}

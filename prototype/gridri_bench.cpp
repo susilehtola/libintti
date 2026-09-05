@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
   std::printf("fixed 2-atom geometry, growing angular momentum (J only)\n");
   std::printf("%-5s %-5s %-6s  %10s %10s %8s   %8s\n", "maxl", "nao", "gridN",
               "J_ana(s)", "J_grid(s)", "grid/ana", "Jrel");
-  for (int maxl = 0; maxl <= 3; ++maxl) {
+  for (int maxl = 0; maxl <= 4; ++maxl) { // up to g (analytic J supports l_a+l_b <= 8)
     std::vector<intti::PrimitiveShell<double>> shells;
     for (double z : zs)
       for (int l = 0; l <= maxl; ++l)
