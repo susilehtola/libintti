@@ -1327,8 +1327,33 @@ V_vi, contract K_uv = sum_i <g_ui | V_vi>. Validated vs the exact GTO
 exchange_build (4 s-AOs, rank-1 D, hp grid 32 nodes/axis): the K matrix matches
 element-by-element, worst rel error 6.4e-3 (coarse grid; improves with
 refinement). So BOTH grid-RI J and K reproduce the exact GTO Fock matrices via
-density-on-grid + DAGE. Next: p+ shells (the x^l factors / real solid harmonics
-on the grid); then library-ize as a grid-RI J/K builder and benchmark vs GTO-RI.
+density-on-grid + DAGE.
+P (AND HIGHER-l) SHELLS PROTOTYPED (prototype/fe_gridri_jp.cpp, 2026-09-05): the
+grid AO evaluator gains the x^lx y^ly z^lz polynomial factor (via cart_comp) --
+the whole cost of higher angular momentum on the grid is a pointwise AO
+evaluation (as predicted for spherical/contracted AOs). grid-RI J with an s+p+s
+basis (5 Cartesian AOs) matches the exact GTO coulomb_build to worst rel error
+1.65e-5. So the AO evaluator is general in l; the same holds for real solid
+harmonics (2l+1 components) and contracted AOs. Next: library-ize as a grid-RI
+J/K builder (general-l AO evaluator: Cartesian / spherical / contracted; one DAGE
+for J, co-density DAGEs for K) and benchmark vs GTO-RI.
+
+ORTHONORMAL / MO-BASIS grid-RI is viable (user, 2026-09-05). For J it is a non-
+issue by INVARIANCE: rho = sum D_uv chi_u chi_v is basis-independent, so V =
+DAGE(rho) is computed once regardless of the D representation and grid-RI J is
+already stable (never touches the primitive-integral cancellation). The
+orthonormal-basis question is really about K, whose co-densities g_ui = chi_u
+phi_i use the delocalized occupied orbitals. Concerns and why they are bounded:
+(i) "fit all functions at once" = the molecular extent, which the AO-PRODUCT grid
+already spans -- delocalized phi_i store dense values on the SAME grid, no larger
+grid needed; (ii) delocalization is absorbed by the ELEMENT-PAIR processing
+(near -> t-quadrature, far -> multipole): cost ~ element-pairs x t-nodes, not
+per-function support, so a delocalized phi_i only loses some function-locality
+screening, bounded by the far-field multipole -- a modest increase, not a blow-
+up; (iii) MO integrals are dense, but MOOT under our matrix-level API -- we only
+ever produce Fock-like quantities <chi|V>, never the 4-index MO ERIs. So grid-RI
+in the orthonormal / natural-orbital basis buys the stability win (above) at
+bounded extra cost.
 
 **NUMERICAL STABILITY -- grid-RI evaluates in the contracted/orthonormal AO
 basis, avoiding the contraction cancellation** (user, 2026-09-05). The analytic
