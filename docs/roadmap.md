@@ -901,6 +901,77 @@ best sequenced LL -> SL -> SS -> Gaunt/Breit, each oracle-checked against its
 nonrelativistic limit -- and it, not semilocal ECP, is libintti's heavy-element
 story (see the ECP decision above).
 
+## M-FE -- tensorial finite-element integral engine (2026-09-05)
+
+A second integral route alongside the GTO/STO one: represent functions on a
+tensorial (Cartesian-product) finite-element grid and evaluate every integral by
+grid quadrature. Strategic payoff: it is OPERATOR-AGNOSTIC -- spin-orbit, Gaunt/
+Breit, ECP, finite-nucleus, arbitrary range-separation all become "an operator
+on the grid," so the whole libcint-parity breadth (above) and the relativistic
+layer come by construction rather than as N analytic integral families. It also
+IS the 3D grid solver we want for Helmholtz-SCF (M-HK): the FE machinery and the
+orbital update (psi <- -2 G_kappa V psi) reuse our Yukawa/Helmholtz kernels.
+
+**Attribution (the shared kernel identity is old -- credit it correctly).** The
+whole family rests on the Gaussian/Laplace ("proper-time") transform of 1/r,
+  1/r = (2/sqrt(pi)) \int_0^\infty e^{-r^2 t^2} dt
+      = (2/sqrt(pi)) \int_0^\infty w^{-2} e^{-r^2/w^2} dw   (w = 1/t),
+which is the same identity the Boys function and our t-quadrature use. It is
+decades old: the plain Laplace transform; the Gaussian-transform molecular-
+integral method of Shavitt & Karplus (1960s); White, Wilkins & Teter (1989,
+eqn 25) as the finite-element realization; Losilla & Sundholm et al. (DAGE,
+2010) as the tensorial-real-space-grid realization. DAGE/White contributed the
+grid/FE discretization + accuracy/scaling engineering, NOT the kernel identity.
+Document this lineage in the numerical-methods notes and citations.bib (do not
+credit DAGE with the 1/r representation).
+
+**Design decisions (user, 2026-09-05).**
+1. **Tensorial (Cartesian-product) grid**, deliberately, over adaptive/
+   unstructured FE. It over-resolves in the periodic copies / far regions, but
+   its attraction is SIMPLICITY: the Coulomb kernel factorizes by Cartesian
+   dimension exactly like GTO integrals (White eqn 22: operator matrix elements
+   are 1D integrals x Kronecker deltas), so the whole separable-1D + delta-tail
+   apparatus we already have applies unchanged.
+2. **Two routes, permanently**: GTO/STO (the current engine) and FEM. They share
+   the kernel machinery (tgrid.hpp t-quadrature, multipole.hpp T(R), the Losilla
+   delta-tail, Yukawa/Helmholtz), differing only in the basis the integrand is
+   discretized on.
+3. A Gaussian is not a polynomial, but its **polynomial (FE) approximation is
+   numerically exact** to any target by element order/refinement -- and gridding
+   the smooth Gaussian basis is easy (~a dozen points along 1/sqrt(alpha) per
+   function; the per-nucleus grid is the union of the per-function grids).
+4. **No n^3 grid tensor is ever stored -- everything is ELEMENT-PAIR local.**
+   The unit of work is a pair of Cartesian 3D boxes (elements), exactly like a
+   GTO shell-pair. For an integral (pq|rs) the element pairs are screened by
+   separation:
+   * **far box pairs -> multipole** (reuse multipole.hpp T_{tuv}(R); the box's
+     local polynomial density -> its moments, contracted through the exponent-
+     free interaction tensor). This is the M-MP far-field, with a box in place of
+     a Gaussian pair.
+   * **near box pairs -> t-quadrature** (the separable Cartesian Coulomb above).
+   * **large-t within a near pair -> multipole / moment again** (the short-range,
+     nearly-local end of the t-integral is the Losilla delta-tail we already do:
+     a local moment correction, not dense quadrature).
+   So the FE engine is structurally the SAME screened pair loop as the GTO J/K
+   build (shell-pair x shell-pair, multipole-far / quadrature-near), with box
+   elements as the pairs -- which is why the storage is O(elements) working set,
+   not O(n^3), and why it inherits our screening/tiling directly.
+
+**Multi-center.** Handled by the tensorial choice (1): a global Cartesian box
+grid (or per-nucleus tensorial grids) with the element-pair loop bridging
+centers via the far/near split -- accepting the over-resolution that the product
+structure costs, for the factorization simplicity.
+
+**Plan (one-center first -- self-contained, perfect oracle).**
+1. Per-nucleus tensorial FE grid; represent the Gaussian basis on it; evaluate
+   1e integrals and (pq|rs) on-grid via the element-pair loop; validate to
+   machine precision against the ANALYTIC t-quadrature values we already produce
+   (clean CPU oracle -- no external reference needed).
+2. Multi-center element-pair bridging (the real research step): the far/near box
+   split across nuclei on the global tensorial grid.
+3. Fold in the Helmholtz grid solver (the M-HK capstone) on the same FE machinery.
+Status: design recorded; not started.
+
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
 A project-wide audit for loops whose cost scales with system size and could be
