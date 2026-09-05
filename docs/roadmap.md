@@ -1334,9 +1334,19 @@ the whole cost of higher angular momentum on the grid is a pointwise AO
 evaluation (as predicted for spherical/contracted AOs). grid-RI J with an s+p+s
 basis (5 Cartesian AOs) matches the exact GTO coulomb_build to worst rel error
 1.65e-5. So the AO evaluator is general in l; the same holds for real solid
-harmonics (2l+1 components) and contracted AOs. Next: library-ize as a grid-RI
-J/K builder (general-l AO evaluator: Cartesian / spherical / contracted; one DAGE
-for J, co-density DAGEs for K) and benchmark vs GTO-RI.
+harmonics (2l+1 components) and contracted AOs.
+LIBRARY-IZED (include/intti/gridri.hpp, 2026-09-05): the grid-RI Fock builders.
+grid_for_basis(basis, eps) auto-builds the hp grid from the AO-product envelopes;
+ao_values_on_grid evaluates every Cartesian AO on the grid (general-l via
+cart_comp + the x^l factor, per-axis factorised); grid_coulomb_build (density ->
+one DAGE -> contract J = <pq|V>) and grid_exchange_build (co-densities g_ui =
+chi_u phi_i from occupied Cocc -> DAGE -> contract K). Matrix-level API (D /
+orbitals in, J / K out; never per-quartet). Host reference (precomputes AO values
+nao*N^3; Kokkos/streaming port is future). CI tests (tests/test_gridri.cpp):
+grid-RI J on an s+p basis and grid-RI K (rank-1 occ) both match the exact GTO
+coulomb_build / exchange_build (coarse grid, ~5s; suite 219/219). Next: real
+solid harmonics + contracted AOs in the evaluator (both free, per the notes
+below); a benchmark vs GTO-RI; and a Kokkos/streaming port.
 
 ORTHONORMAL / MO-BASIS grid-RI is viable (user, 2026-09-05). For J it is a non-
 issue by INVARIANCE: rho = sum D_uv chi_u chi_v is basis-independent, so V =

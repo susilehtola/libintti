@@ -41,6 +41,7 @@ add_executable(intti_tests
   test_threeel.cpp
   test_multipole.cpp
   test_fegrid.cpp
+  test_gridri.cpp
   test_tc.cpp
   test_helmholtz.cpp
   test_blas.cpp
