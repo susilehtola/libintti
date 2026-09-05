@@ -67,13 +67,23 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
                          const TGrid<Real> &grid, Real *K, Real tau,
                          const std::vector<Real> &Qex,
                          const PairTable<Real> &tab, int rank = 0,
-                         int nranks = 1, Symmetry sym = Symmetry::None) {
+                         int nranks = 1, Symmetry sym = Symmetry::None,
+                         int a0 = 0, int a1 = -1, bool tiled = false) {
   static_assert(kokkos_scalar_v<Real>,
                 "exchange_build requires a builtin floating-point type in M5");
   if (sym == Symmetry::Full) {
     exchange_build_impl_sym8(shells, ao_off, nao, D, grid, K, tau, Qex, tab, rank, nranks);
     return;
   }
+  // Output tiling: when tiled, compute only the K rows of shells [a0,a1) (all
+  // columns, DIRECT -- no a<=b/mirror), staging a device K of just the tile
+  // rows and writing them into the caller's K. The per-element computation is
+  // identical to the untiled build, so the result is bit-identical regardless
+  // of tile size (lossless linearity); the tiled path drops the mirror 2x in
+  // exchange for a device-K footprint of (tile rows) x nao instead of nao^2.
+  const int aend = (a1 < 0) ? static_cast<int>(shells.size()) : a1;
+  const int row0 = tiled ? ao_off[a0] : 0;
+  const int tile_rows = tiled ? (ao_off[aend] - row0) : nao;
   const int ns = static_cast<int>(shells.size());
   const int nt = grid.n();
   const Real pi = pi_v<Real>();
@@ -107,7 +117,7 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
   std::vector<int> ls(ns);
   for (int i = 0; i < ns; ++i) ls[i] = shells[i].l;
   auto lv = detail::to_device(ls, "intti::k::l");
-  Kokkos::View<Real *> Kv("intti::k::K", static_cast<std::size_t>(nao) * nao);
+  Kokkos::View<Real *> Kv("intti::k::K", static_cast<std::size_t>(tile_rows) * nao);
   Kokkos::deep_copy(Kv, Real(0));
   auto pv = tab.p;
   auto Pv = tab.P;
@@ -120,11 +130,13 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
   constexpr int KNC = (KLMAX + 1) * (KLMAX + 2) / 2;
 
   Kokkos::parallel_for(
-      "intti::k::build", Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {ns, ns}),
+      "intti::k::build",
+      Kokkos::MDRangePolicy<Kokkos::Rank<2>>({tiled ? a0 : 0, 0}, {aend, ns}),
       KOKKOS_LAMBDA(int a, int b) {
-        // K is symmetric (K_ab = sum_cd D_cd (ac|bd) = K_ba): compute the upper
-        // triangle a <= b only and mirror the block into (b,a) -- ~2x.
-        if (b < a) return;
+        // K is symmetric (K_ab = sum_cd D_cd (ac|bd) = K_ba): the untiled build
+        // computes the upper triangle a <= b and mirrors into (b,a) -- ~2x. The
+        // tiled build computes every (a,b) in its row range directly (no mirror).
+        if (!tiled && b < a) return;
         if (nranks > 1 && (a * ns + b) % nranks != rank) return;
         const int la = lv(a), lb = lv(b);
         const int nca = ncart(la), ncb = ncart(lb);
@@ -247,15 +259,21 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
         for (int ka = 0; ka < nca; ++ka)
           for (int kb = 0; kb < ncb; ++kb) {
             const Real v = Kblk[ka * ncb + kb];
-            Kv((aov(a) + ka) * nao + aov(b) + kb) = v;
-            if (a != b) Kv((aov(b) + kb) * nao + aov(a) + ka) = v; // mirror
+            if (tiled) {
+              Kv((aov(a) + ka - row0) * nao + aov(b) + kb) = v; // tile-local row
+            } else {
+              Kv((aov(a) + ka) * nao + aov(b) + kb) = v;
+              if (a != b) Kv((aov(b) + kb) * nao + aov(a) + ka) = v; // mirror
+            }
           }
       });
 
   auto hK = Kokkos::create_mirror_view(Kv);
   Kokkos::deep_copy(hK, Kv);
-  for (std::size_t i = 0; i < static_cast<std::size_t>(nao) * nao; ++i)
-    K[i] = hK(i);
+  const std::size_t ntile = static_cast<std::size_t>(tile_rows) * nao;
+  const std::size_t base = static_cast<std::size_t>(row0) * nao;
+  for (std::size_t i = 0; i < ntile; ++i)
+    K[base + i] = hK(i);
 }
 
 /// Full 8-fold-symmetry exchange build (Symmetry::Full). Each unique quartet

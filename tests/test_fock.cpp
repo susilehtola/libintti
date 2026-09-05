@@ -177,4 +177,26 @@ TEST(Fock, ExchangeSym8Screened) {
   EXPECT_LT(max_abs_diff(Ksym, Kref), 1e-7 * max_abs(Kref));
 }
 
+// Memory tiling is lossless: the tiled exchange build gives a bit-identical
+// result regardless of tile size (each element is computed independently), and
+// matches the untiled build to rounding.
+TEST(Fock, ExchangeTilingIsLossless) {
+  auto b = test_basis();
+  auto D = random_symmetric(b.nao, 29);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const std::size_t n2 = static_cast<std::size_t>(b.nao) * b.nao;
+  const int ns = static_cast<int>(b.shells.size());
+  std::vector<double> Kfull(n2), K1(n2), Kt(n2);
+  intti::exchange_build(b, D.data(), grid, Kfull.data(), 0.0);       // untiled
+  intti::exchange_build_tiled(b, D.data(), grid, K1.data(), ns, 0.0); // 1 tile
+  // bit-identical across every tile granularity
+  for (int ts : {1, 2, 3, 5}) {
+    intti::exchange_build_tiled(b, D.data(), grid, Kt.data(), ts, 0.0);
+    EXPECT_EQ(0.0, max_abs_diff(Kt, K1)) << "tile size " << ts << " not bit-identical";
+  }
+  // and equal to the untiled build to rounding (untiled mirrors the lower
+  // triangle, so this is a different FP path -> ~rounding, not bit-exact)
+  EXPECT_LT(max_abs_diff(K1, Kfull), 1e-11 * max_abs(Kfull));
+}
+
 } // namespace

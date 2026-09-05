@@ -193,4 +193,33 @@ void exchange_build(const ShellBasis<Real> &basis, const Real *D,
                               tau, Q, tab, rank, nranks, sym);
 }
 
+/// Memory-tiled exchange build for GPUs that cannot hold the whole K on device.
+/// Computes K one output shell-row tile at a time (tile_shells output shells per
+/// tile), so the device K allocation is bounded to (tile rows) x nao instead of
+/// nao^2. Because each element is computed identically to exchange_build, the
+/// result is bit-identical regardless of tile_shells (lossless linearity) and
+/// matches the untiled build to rounding. The tiled path computes directly
+/// (no K_ab=K_ba mirror), trading the 2x for bounded, tile-invariant memory.
+/// (D and the pair E-tables are still resident; density streaming and E-table
+/// tiling are the further axes for the full out-of-core engine.)
+template <class Real>
+void exchange_build_tiled(const ShellBasis<Real> &basis, const Real *D,
+                          const TGrid<Real> &grid, Real *K, int tile_shells,
+                          Real tau = Real(1e-12)) {
+  const int ns = static_cast<int>(basis.shells.size());
+  if (tile_shells < 1) tile_shells = ns;
+  std::vector<ShellPair<Real>> plist;
+  plist.reserve(static_cast<std::size_t>(ns) * ns);
+  for (int a = 0; a < ns; ++a)
+    for (int c = 0; c < ns; ++c)
+      plist.push_back(make_pair(basis.shells[a], basis.shells[c]));
+  auto tab = make_pair_table(plist);
+  auto Q = schwarz(tab, plist, grid);
+  for (int a0 = 0; a0 < ns; a0 += tile_shells) {
+    const int a1 = std::min(a0 + tile_shells, ns);
+    detail::exchange_build_impl(basis.shells, basis.ao_off, basis.nao, D, grid, K,
+                                tau, Q, tab, 0, 1, Symmetry::None, a0, a1, true);
+  }
+}
+
 } // namespace intti
