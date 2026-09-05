@@ -1012,11 +1012,22 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
     BIT-IDENTICAL across tile sizes (each element computed independently), tested
     for tile_shells in {1,2,3,5}, and equals the untiled build to rounding. This
     is the reusable pattern + the CPU-validatable proof methodology.
-  * **coulomb_build (J)** -- NEXT, same output-tiling pattern: keep phase-1 dq
-    (full ket Hermite density) shared, loop bra-pair output tiles for phases 2/3
-    with tile-local Hermite/prod offsets, dropping jp/Jv to tile size (~2x, the
-    output half; dq/Dv stay full). A real 3-phase restructure + far-field range
-    handling; modest gain. tc_gradu_grad_build is the same shape.
+  * **coulomb_build (J)** DONE (coulomb_build_tiled): loops bra shell-pair tiles
+    (pair_tile pairs/tile) for phases 2/3 at tile-local Hermite/product offsets,
+    dropping the per-pair j^p/J^p arrays to the tile footprint; phase-1 d^q (full
+    ket Hermite density) is rebuilt per tile (cheap) and D stays resident. Because
+    each output pair's j^p is the full ket sum regardless of tiling, the result is
+    BIT-EXACT vs coulomb_build and across pair_tile {1,2,3,7,1000}
+    (Fock.CoulombTilingIsBitExact). No far-field in the tiled path.
+  * **tc_gradu_grad_build** -- N/A in current form: it is a HOST build
+    (DefaultHostExecutionSpace) whose per-bra-pair field j^{pr} is already
+    LOCAL scratch (allocated inside the bra lambda), not a global O(npair) array.
+    Its only full arrays are the ket Hermite densities `kets` (input) and F
+    (output) -- neither reduced by bra-loop tiling. So there is nothing to tile
+    for GPU memory until tc is ported to a device kernel, at which point the
+    tiling axis is KET-STREAMING (accumulate F over ket-density tiles, since F is
+    linear in the ket sum), not the bra tiling J/K use. Deferred to the tc GPU
+    port; forcing a bra-tile now would save no memory.
   * **RI-J via the 3-index tensor (mu nu|P), nao^2 x naux** DONE (ri_j_tiled):
     the largest object and the real "too big for memory" case. RI-J is a sum over
     the auxiliary index, so it factors into two aux passes -- gamma_Q = sum_munu

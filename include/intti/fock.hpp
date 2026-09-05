@@ -176,6 +176,70 @@ void coulomb_build(const ShellBasis<Real> &basis, const Real *D,
   }
 }
 
+/// Memory-tiled Coulomb build for GPUs that cannot hold the whole per-pair
+/// Hermite/output arrays on device. Computes J over bra shell-pair tiles
+/// (pair_tile bra pairs per tile), so the per-pair tensors j^p and J^p occupy
+/// the tile footprint instead of the full O(npair) arrays; the ket Hermite
+/// density d^q is rebuilt (cheap phase 1) per tile and D stays resident. The
+/// per-element computation is identical to coulomb_build, so J is bit-identical
+/// regardless of pair_tile. (No far-field in the tiled path.)
+template <class Real>
+void coulomb_build_tiled(const ShellBasis<Real> &basis, const Real *D,
+                         const TGrid<Real> &grid, Real *J, int pair_tile,
+                         Real tau = Real(0)) {
+  std::vector<ShellPair<Real>> plist;
+  std::vector<std::pair<int, int>> pshell;
+  make_shell_pairs(basis, plist, pshell);
+  auto tab = make_pair_table(plist);
+  const int npair = tab.npair;
+  const int nao = basis.nao;
+  if (pair_tile < 1) pair_tile = npair;
+  std::vector<int> off(npair + 1, 0);
+  for (int p = 0; p < npair; ++p)
+    off[p + 1] = off[p] + ncart(plist[p].la) * ncart(plist[p].lb);
+  std::vector<Real> Dp(off[npair]), Jp(off[npair]);
+  for (int p = 0; p < npair; ++p) {
+    const auto [i, j] = pshell[p];
+    const int ncb = ncart(plist[p].lb);
+    for (int ka = 0; ka < ncart(plist[p].la); ++ka)
+      for (int kb = 0; kb < ncb; ++kb) {
+        const int r = basis.ao_off[i] + ka, c = basis.ao_off[j] + kb;
+        Dp[off[p] + ka * ncb + kb] =
+            i == j ? D[r * nao + c] : D[r * nao + c] + D[c * nao + r];
+      }
+  }
+  std::vector<Real> Q, bound;
+  const Real *Qp = nullptr, *bp = nullptr;
+  if (tau > Real(0)) {
+    Q = schwarz(tab, plist, grid);
+    bound.resize(npair);
+    for (int p = 0; p < npair; ++p) {
+      Real dmax = 0;
+      for (int c = off[p]; c < off[p + 1]; ++c) {
+        const Real a = Dp[c] < 0 ? -Dp[c] : Dp[c];
+        if (a > dmax) dmax = a;
+      }
+      bound[p] = Q[p] * dmax;
+    }
+    Qp = Q.data();
+    bp = bound.data();
+  }
+  for (int q0 = 0; q0 < npair; q0 += pair_tile) {
+    const int q1 = std::min(q0 + pair_tile, npair);
+    coulomb_build(tab, Dp.data(), grid, Jp.data(), Qp, bp, tau, 0, 1, Real(0), q0, q1, true);
+  }
+  for (int p = 0; p < npair; ++p) {
+    const auto [i, j] = pshell[p];
+    const int ncb = ncart(plist[p].lb);
+    for (int ka = 0; ka < ncart(plist[p].la); ++ka)
+      for (int kb = 0; kb < ncb; ++kb) {
+        const int r = basis.ao_off[i] + ka, c = basis.ao_off[j] + kb;
+        J[r * nao + c] = Jp[off[p] + ka * ncb + kb];
+        J[c * nao + r] = J[r * nao + c];
+      }
+  }
+}
+
 template <class Real>
 void exchange_build(const ShellBasis<Real> &basis, const Real *D,
                     const TGrid<Real> &grid, Real *K, Real tau, int rank,

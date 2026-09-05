@@ -199,4 +199,20 @@ TEST(Fock, ExchangeTilingIsLossless) {
   EXPECT_LT(max_abs_diff(K1, Kfull), 1e-11 * max_abs(Kfull));
 }
 
+// Coulomb tiling is lossless AND bit-exact vs the untiled build: each output
+// pair's j^p is the full ket sum regardless of tiling, so no summation is
+// regrouped (unlike RI-J).
+TEST(Fock, CoulombTilingIsBitExact) {
+  auto b = test_basis();
+  auto D = random_symmetric(b.nao, 31);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const std::size_t n2 = static_cast<std::size_t>(b.nao) * b.nao;
+  std::vector<double> Jfull(n2), Jt(n2);
+  intti::coulomb_build(b, D.data(), grid, Jfull.data());
+  for (int pt : {1, 2, 3, 7, 1000}) {
+    intti::coulomb_build_tiled(b, D.data(), grid, Jt.data(), pt);
+    EXPECT_EQ(0.0, max_abs_diff(Jt, Jfull)) << "pair_tile " << pt << " not bit-exact";
+  }
+}
+
 } // namespace

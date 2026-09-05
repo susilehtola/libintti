@@ -176,9 +176,16 @@ template <class Real>
 void coulomb_build(const PairTable<Real> &pairs, const Real *D,
                    const TGrid<Real> &grid, Real *J, const Real *Q = nullptr,
                    const Real *bound = nullptr, Real tau = Real(0),
-                   int rank = 0, int nranks = 1, Real far_tau = Real(0)) {
+                   int rank = 0, int nranks = 1, Real far_tau = Real(0),
+                   int p0 = 0, int p1 = -1, bool tiled = false) {
   static_assert(kokkos_scalar_v<Real>,
                 "coulomb_build requires float, double or long double");
+  // Output tiling: when tiled, phase 1 (the full ket Hermite density d^q) is
+  // shared, and phases 2/3 (the O(npair) per-bra-pair tensors j^p and the output
+  // J^p) are restricted to bra pairs [p0,p1) and staged at tile-local Hermite/
+  // product offsets, so j^p/J^p occupy the tile footprint instead of the whole
+  // O(npair) arrays. Per-element identical to the untiled build (bit-identical
+  // regardless of tile size); d^q and D stay resident (output-half tiling).
   const bool screen = tau > Real(0) && Q != nullptr && bound != nullptr;
   const bool far = far_tau > Real(0);
   const Real far_cut = far ? -log_(far_tau) : Real(0);
@@ -200,12 +207,17 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
     h_hoff[ip + 1] = h_hoff[ip] + n1 * n1 * n1;
   }
   const int nprod = h_prod[npair], nherm = h_hoff[npair];
+  const int P1 = (p1 < 0) ? npair : p1;
+  const int hbase = tiled ? h_hoff[p0] : 0;   // tile-local Hermite offset
+  const int pbase = tiled ? h_prod[p0] : 0;   // tile-local product offset
+  const int jp_sz = tiled ? (h_hoff[P1] - hbase) : nherm;
+  const int jv_sz = tiled ? (h_prod[P1] - pbase) : nprod;
 
   auto prodv = detail::to_device(h_prod, "intti::j::prod");
   auto hoffv = detail::to_device(h_hoff, "intti::j::hoff");
   auto Dv = detail::to_device(D, static_cast<std::size_t>(nprod), "intti::j::D");
-  Kokkos::View<Real *> dq("intti::j::dq", nherm), jp("intti::j::jp", nherm);
-  Kokkos::View<Real *> Jv("intti::j::J", nprod);
+  Kokkos::View<Real *> dq("intti::j::dq", nherm), jp("intti::j::jp", jp_sz);
+  Kokkos::View<Real *> Jv("intti::j::J", jv_sz);
   auto Qv = screen ? detail::to_device(Q, static_cast<std::size_t>(npair), "intti::j::Q")
                    : Kokkos::View<Real *>("intti::j::Q", 1);
   auto bv = screen ? detail::to_device(bound, static_cast<std::size_t>(npair), "intti::j::bound")
@@ -248,9 +260,9 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
 
   // phase 2: accumulate j^p over ket pairs and t nodes
   Kokkos::parallel_for(
-      "intti::j::couple", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+      "intti::j::couple", Kokkos::RangePolicy<>(tiled ? p0 : 0, P1), KOKKOS_LAMBDA(int p) {
         const int lap = lav(p), lbp = lbv(p), Lp = lap + lbp, np1 = Lp + 1;
-        const int joff = hoffv(p);
+        const int joff = hoffv(p) - hbase; // tile-local
         for (int i = 0; i < np1 * np1 * np1; ++i)
           jp(joff + i) = 0;
         if (nranks > 1 && p % nranks != rank) return;
@@ -360,10 +372,10 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
 
   // phase 3: transform back through the bra E tables
   Kokkos::parallel_for(
-      "intti::j::output", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+      "intti::j::output", Kokkos::RangePolicy<>(tiled ? p0 : 0, P1), KOKKOS_LAMBDA(int p) {
         const int la = lav(p), lb = lbv(p), L = la + lb, n1 = L + 1;
         const int esz = (la + 1) * (lb + 1) * n1;
-        const int joff = hoffv(p);
+        const int joff = hoffv(p) - hbase; // tile-local
         for (int ka = 0; ka < ncart(la); ++ka) {
           int a3[3];
           cart_comp(la, ka, a3[0], a3[1], a3[2]);
@@ -378,19 +390,20 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
               for (int u = 0; u <= a3[1] + b3[1]; ++u)
                 for (int v = 0; v <= a3[2] + b3[2]; ++v)
                   s += Ex[t] * Ey[u] * Ez[v] * jp(joff + (t * n1 + u) * n1 + v);
-            Jv(prodv(p) + ka * ncart(lb) + kb) = s;
+            Jv(prodv(p) - pbase + ka * ncart(lb) + kb) = s;
           }
         }
       });
 
   auto hJ = Kokkos::create_mirror_view(Jv);
   Kokkos::deep_copy(hJ, Jv);
-  for (int i = 0; i < nprod; ++i)
-    J[i] = hJ(i);
+  for (int i = 0; i < jv_sz; ++i)
+    J[pbase + i] = hJ(i);
 
   // FMM far-field: add the multipole contribution of the pairs the device
-  // kernel skipped (same near/far predicate -> exact partition).
-  if (far)
+  // kernel skipped (same near/far predicate -> exact partition). Not supported
+  // in the tiled path (the tiled driver uses far_tau = 0).
+  if (far && !tiled)
     detail::coulomb_farfield_add(pairs, D, h_prod, h_hoff, far_cut, J, Q, bound,
                                  tau, rank, nranks);
 }
