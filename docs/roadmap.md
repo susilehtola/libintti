@@ -1220,6 +1220,42 @@ Remaining: refine to production accuracy + multipole-far efficiency + screening/
 cost tuning; wire the 3D DAGE into a real co-density K build (molecular) and the
 Helmholtz grid solver; turn the prototypes into library code.
 
+**DESIGN NOTE -- grid-RI: the FE route IS resolution-of-the-identity, and the
+grid is the auxiliary basis** (user insight, 2026-09-05). The DAGE/FEM route
+already prototyped is exactly an RI: it resolves the density into a compact
+intermediate (the FE grid) instead of an auxiliary GTO set, computes the Coulomb
+potential V of that representation directly via the t-quadrature convolution, and
+contracts J_mn = <chi_m chi_n | V>. Versus GTO-RI it DROPS the (P|Q)^{-1} Coulomb-
+metric solve and the fit coefficients entirely -- DAGE gives V from rho exactly
+(to grid resolution), so it is a fitting-free, metric-free RI; it is grid-linear
+(no 3-index (mn|P) tensor); and the kernel is generic (Coulomb / erf / erfc /
+Yukawa-Helmholtz / position-dependent omega(r) for local hybrids) where the GTO
+metric is not. K follows via co-densities (g_pi = chi_p phi_i), already
+prototyped.
+
+The real design question is GRID CONSTRUCTION, and RI answers it: the grid must
+span the IMPORTANT part of the {pq} product space, which RI shows is only O(nao)
+wide (aux ~ 3-4 x nao), NOT the full O(nao^2) product set -- so an adapted grid
+sized to that span, not to every product, is where the efficiency is. Two
+composable, automatable constructions:
+  1. Cholesky-pivot-driven: reuse two_step_cholesky (cholesky.hpp) -- already a
+     pivoted Cholesky over the pair space that auto-selects the O(nao) important
+     pair-density directions (RI's aux auto-construction) -- as the TARGET SPAN,
+     and locally h-refine the FE grid only until it represents those pivot
+     densities to tolerance. This literally ties the two pillars: the RI aux
+     selection defines the grid.
+  2. Error-indicator adaptive h-refinement (standard adaptive FEM): subdivide
+     elements where the local interpolation residual of the represented density
+     / potential exceeds a threshold -- automatic, atom-centred (cusps drive
+     refinement), element-local so it stays cheap.
+Subtlety: the final <pq|V> contraction still needs pq resolved WHERE the AOs
+live, but chi_m chi_n has compact support and V is smoother than rho, so the same
+atom-centred adapted grid serves both the (global, smooth) potential and the
+(local) product quadrature. This grid-RI construction is the concrete plan for
+the near-nucleus refinement / bubbles + multipole-far items above, and the
+efficient bridge between the RI pillar (ncenter/ri.hpp) and the FE pillar
+(fegrid.hpp).
+
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
 A project-wide audit for loops whose cost scales with system size and could be
