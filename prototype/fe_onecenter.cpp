@@ -9,13 +9,17 @@
 //       reproduces the analytic ERI.
 //
 // The Coulomb factorizes by Cartesian dimension (White eqn 22 / DAGE): with
-//   1/r12 = sum_i w_i exp(-t_i^2 |r1-r2|^2)   (+ delta tail; w_i carries 2/sqrt(pi))
+//   1/r12 = sum_i w_i exp(-t_i^2 |r1-r2|^2)   (w_i carries 2/sqrt(pi), Mobius t)
 // and separable pair densities rho(r) = X(x)Y(y)Z(z),
-//   (pq|rs) = sum_i w_i A_x(t_i) A_y(t_i) A_z(t_i) + (pi/t_c^2) O,
-//   A_d(t)  = sum_{jk} w_j rho_bra^d(u_j) exp(-t^2 (u_j-u_k)^2) w_k rho_ket^d(u_k),
-//   O       = prod_d sum_j w_j rho_bra^d(u_j) rho_ket^d(u_j)   (four-orbital overlap).
-// The large-t nodes need spatial resolution h <~ 1/t_c; beyond t_c the tail term
-// supplies the short-range remainder (this is the "large-t -> moment" handling).
+//   (pq|rs) = sum_i w_i A_x(t_i) A_y(t_i) A_z(t_i),
+//   A_d(t)  = int int rho_bra^d(x) exp(-t^2 (x-x')^2) rho_ket^d(x') dx dx'.
+// The inner integral uses a NEAR/FAR t-split (the key to machine precision for
+// all t): small t (broad kernel) -> direct x'-grid; large t (sharp kernel) ->
+// t-adapted x'=x-v/t so exp(-v^2) is flat, sampling the density at near-constant
+// argument. Result: (pq|rs) matches eri_quartet to ~1e-15, no delta tail needed.
+// (In the real FEM the density is a piecewise polynomial -> smooth in v for all
+// t -> the t-adapted branch alone is t-uniform; the split here is only because
+// this prototype represents the density as a Gaussian.)
 
 #include <array>
 #include <cmath>
@@ -167,7 +171,7 @@ int run() {
   }
 
   // ---- Coulomb (pq|rs): tensorial grid + t-quadrature vs eri_quartet ----
-  std::printf("\n== (pq|rs): tensorial grid + t-quadrature + delta tail vs analytic eri_quartet ==\n");
+  std::printf("\n== (pq|rs): tensorial grid + near/far-split t-adapted quadrature vs eri_quartet ==\n");
   // analytic-oracle Coulomb grid (accurate Mobius, no truncation)
   auto oracle = intti::make_tgrid(intti::coulomb());
 
@@ -182,87 +186,90 @@ int run() {
 
   const double L = 8.0;
   const int MP = 5; // per-axis powers 0..4 (up to d pair densities)
-  for (double tc : {15.0, 30.0, 60.0}) {
-    // spatial resolution matched to t_c: h ~ 1/tc (rule t_c*h <~ 1)
-    const int N = std::min(1000, (int)std::ceil(2 * L * tc * 0.9));
-    std::vector<double> u, w;
-    gauss_legendre(N, -L, L, u, w);
-    intti::TGridSpec<double> spec;
-    spec.mapping = intti::TMapping::LinLog;
-    spec.t_c = tc;
-    spec.tail_order = 0; // leading Losilla delta tail (pi/t_c^2)
-    auto grid = intti::make_tgrid(intti::coulomb(), spec);
-    const int nt = grid.n();
-    const double tail = grid.tail_coeff; // = pi/t_c^2
-
-    std::printf("   t_c=%5.1f  N=%4d  nt=%3d\n", tc, N, nt);
-    for (auto &q : qs) {
-      const int la = q.A.l, lb = q.B.l, lc = q.C.l, ld = q.D.l;
-      const int na = intti::ncart(la), nb = intti::ncart(lb);
-      const int nc = intti::ncart(lc), nd = intti::ncart(ld);
-      std::vector<double> blk((size_t)na * nb * nc * nd);
-      intti::eri_quartet(intti::make_pair(q.A, q.B), intti::make_pair(q.C, q.D), oracle,
-                         blk.data());
-      const double pbra = q.A.alpha + q.B.alpha, pket = q.C.alpha + q.D.alpha;
-      // per-axis density samples for each power (grid shared across x,y,z)
-      std::vector<std::vector<double>> gbra(MP, std::vector<double>(N)),
-          gket(MP, std::vector<double>(N));
-      for (int m = 0; m < MP; ++m)
-        for (int j = 0; j < N; ++j) {
-          const double um = std::pow(u[j], m);
-          gbra[m][j] = um * std::exp(-pbra * u[j] * u[j]);
-          gket[m][j] = um * std::exp(-pket * u[j] * u[j]);
-        }
-      // A[mb][mk][it] (axis-independent) and the per-axis overlap O1[mb][mk]
-      std::vector<double> A((size_t)MP * MP * nt, 0.0), O1((size_t)MP * MP, 0.0);
-      for (int mb = 0; mb < MP; ++mb)
-        for (int mk = 0; mk < MP; ++mk) {
-          double o = 0;
-          for (int j = 0; j < N; ++j) o += w[j] * gbra[mb][j] * gket[mk][j];
-          O1[mb * MP + mk] = o;
+  // Mobius t-grid (full [0,inf), no truncation / no delta tail).
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nt = grid.n();
+  // near/far t-split of the inner integral, needed because the DENSITY here is a
+  // Gaussian (in the real FEM the density is a piecewise polynomial, smooth in
+  // the transformed variable, so t-adaptation alone is t-uniform):
+  //   small t (broad kernel): direct x'-grid inner (density resolved);
+  //   large t (sharp kernel): t-adapted inner x'=x-v/t (kernel flat in v).
+  // The validity ranges overlap, so switching gives machine precision for all t.
+  const double t_switch = 2.0;
+  const int nq = 160, nv = 96;
+  const double vmax = 8.0;
+  std::vector<double> u, w, vg, vw;
+  gauss_legendre(nq, -L, L, u, w);
+  gauss_legendre(nv, -vmax, vmax, vg, vw);
+  std::printf("   Mobius nt=%d, outer GL(%d) on [-%.0f,%.0f]; inner: direct(t<%.0f) / "
+              "t-adapted GL(%d) (t>=%.0f)\n",
+              nt, nq, L, L, t_switch, nv, t_switch);
+  for (auto &q : qs) {
+    const int la = q.A.l, lb = q.B.l, lc = q.C.l, ld = q.D.l;
+    const int na = intti::ncart(la), nb = intti::ncart(lb);
+    const int nc = intti::ncart(lc), nd = intti::ncart(ld);
+    std::vector<double> blk((size_t)na * nb * nc * nd);
+    intti::eri_quartet(intti::make_pair(q.A, q.B), intti::make_pair(q.C, q.D), oracle,
+                       blk.data());
+    const double pbra = q.A.alpha + q.B.alpha, pket = q.C.alpha + q.D.alpha;
+    // density samples on the x-grid (for the small-t direct inner)
+    std::vector<std::vector<double>> gket(MP, std::vector<double>(nq));
+    for (int m = 0; m < MP; ++m)
+      for (int k = 0; k < nq; ++k)
+        gket[m][k] = std::pow(u[k], m) * std::exp(-pket * u[k] * u[k]);
+    std::vector<double> A((size_t)MP * MP * nt, 0.0);
+    for (int mb = 0; mb < MP; ++mb)
+      for (int mk = 0; mk < MP; ++mk) {
 #pragma omp parallel for schedule(dynamic)
-          for (int it = 0; it < nt; ++it) {
-            const double t2 = grid.t[it] * grid.t[it];
-            double Aa = 0;
-            for (int j = 0; j < N; ++j) {
-              double inner = 0;
-              const double uj = u[j];
-              for (int k = 0; k < N; ++k) {
-                const double du = uj - u[k];
+        for (int it = 0; it < nt; ++it) {
+          const double t = grid.t[it], t2 = t * t;
+          double Aa = 0;
+          for (int p = 0; p < nq; ++p) {
+            const double x = u[p];
+            const double rb = std::pow(x, mb) * std::exp(-pbra * x * x);
+            double inner = 0;
+            if (t < t_switch) { // direct x'-grid (kernel broad)
+              for (int k = 0; k < nq; ++k) {
+                const double du = x - u[k];
                 inner += w[k] * gket[mk][k] * std::exp(-t2 * du * du);
               }
-              Aa += w[j] * gbra[mb][j] * inner;
+            } else { // t-adapted (kernel sharp): (1/t) int rho_ket(x-v/t) e^{-v^2} dv
+              for (int g = 0; g < nv; ++g) {
+                const double xp = x - vg[g] / t;
+                inner += vw[g] * std::pow(xp, mk) * std::exp(-pket * xp * xp - vg[g] * vg[g]);
+              }
+              inner /= t;
             }
-            A[((size_t)mb * MP + mk) * nt + it] = Aa;
+            Aa += w[p] * rb * inner;
           }
+          A[((size_t)mb * MP + mk) * nt + it] = Aa;
         }
-      double worst = 0, scale = 0;
-      for (int ka = 0; ka < na; ++ka) {
-        int a3[3]; intti::cart_comp(la, ka, a3[0], a3[1], a3[2]);
-        for (int kb = 0; kb < nb; ++kb) {
-          int b3[3]; intti::cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-          for (int kc = 0; kc < nc; ++kc) {
-            int c3[3]; intti::cart_comp(lc, kc, c3[0], c3[1], c3[2]);
-            for (int kd = 0; kd < nd; ++kd) {
-              int d3[3]; intti::cart_comp(ld, kd, d3[0], d3[1], d3[2]);
-              const int mbx = a3[0] + b3[0], mby = a3[1] + b3[1], mbz = a3[2] + b3[2];
-              const int mkx = c3[0] + d3[0], mky = c3[1] + d3[1], mkz = c3[2] + d3[2];
-              const double *Ax = &A[((size_t)mbx * MP + mkx) * nt];
-              const double *Ay = &A[((size_t)mby * MP + mky) * nt];
-              const double *Az = &A[((size_t)mbz * MP + mkz) * nt];
-              double val = 0;
-              for (int it = 0; it < nt; ++it) val += grid.w[it] * Ax[it] * Ay[it] * Az[it];
-              val += tail * O1[mbx * MP + mkx] * O1[mby * MP + mky] * O1[mbz * MP + mkz];
-              const double ref = blk[((size_t)ka * nb + kb) * nc * nd + (size_t)kc * nd + kd];
-              worst = std::max(worst, std::abs(val - ref));
-              scale = std::max(scale, std::abs(ref));
-            }
+      }
+    double worst = 0, scale = 0;
+    for (int ka = 0; ka < na; ++ka) {
+      int a3[3]; intti::cart_comp(la, ka, a3[0], a3[1], a3[2]);
+      for (int kb = 0; kb < nb; ++kb) {
+        int b3[3]; intti::cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+        for (int kc = 0; kc < nc; ++kc) {
+          int c3[3]; intti::cart_comp(lc, kc, c3[0], c3[1], c3[2]);
+          for (int kd = 0; kd < nd; ++kd) {
+            int d3[3]; intti::cart_comp(ld, kd, d3[0], d3[1], d3[2]);
+            const int mbx = a3[0] + b3[0], mby = a3[1] + b3[1], mbz = a3[2] + b3[2];
+            const int mkx = c3[0] + d3[0], mky = c3[1] + d3[1], mkz = c3[2] + d3[2];
+            const double *Ax = &A[((size_t)mbx * MP + mkx) * nt];
+            const double *Ay = &A[((size_t)mby * MP + mky) * nt];
+            const double *Az = &A[((size_t)mbz * MP + mkz) * nt];
+            double val = 0;
+            for (int it = 0; it < nt; ++it) val += grid.w[it] * Ax[it] * Ay[it] * Az[it];
+            const double ref = blk[((size_t)ka * nb + kb) * nc * nd + (size_t)kc * nd + kd];
+            worst = std::max(worst, std::abs(val - ref));
+            scale = std::max(scale, std::abs(ref));
           }
         }
       }
-      std::printf("      %-8s  max|grid-eri| = %.3e   rel = %.3e\n", q.name, worst,
-                  worst / (scale + 1e-300));
     }
+    std::printf("      %-8s  max|grid-eri| = %.3e   rel = %.3e\n", q.name, worst,
+                worst / (scale + 1e-300));
   }
   return 0;
 }

@@ -971,7 +971,24 @@ structure costs, for the factorization simplicity.
    with e^{-v^2} FLAT for all t; Gauss quadrature in v samples the (piecewise-
    polynomial) shape function at near-constant argument -> EXACT for any t at
    fixed order, no delta-tail needed. i.e. redistribute the quadrature *along the
-   exponential*, not along the polynomial.
+   exponential*, not along the polynomial. For a piecewise-POLYNOMIAL density
+   this one branch is t-uniform; for a Gaussian density (as in the collocation
+   prototype) it fails at SMALL t (the density becomes the knife's edge in v), so
+   a near/far t-split is used there: direct x'-grid for small t, t-adapted for
+   large t (overlapping validity -> machine precision across all t).
+6. **Large-t asymptotics = the Losilla delta-tail, exact for polynomials**
+   (user, 2026-09-05). Steepest descent on the flat-kernel inner integral
+   (Laplace point v=0, Taylor L_j about x, Gaussian moments) gives
+     (1/t)\int L_j(x-v/t) e^{-v^2} dv = (sqrt(pi)/t) sum_m L_j^{(2m)}(x)/(4^m m! t^{2m})
+     = (sqrt(pi)/t)[ L_j(x) + L_j''(x)/(4t^2) + L_j''''(x)/(32 t^4) + ... ].
+   For a polynomial L_j this series TERMINATES -> an exact, finite closed form
+   for the large-t regime (moments/derivatives of the shape function, no
+   quadrature). The leading term is the delta/overlap; the higher terms are
+   exactly the Losilla higher-order delta-tail series (M-QUAD, the 1/t_c^{2k}
+   Laplacian-moment corrections) -- the FE side re-derives the same tail. So the
+   two routes share not only the 1/r kernel identity but the tail series; the
+   complete recipe is t-adapted quadrature for near/moderate t + the finite
+   moment expansion for large t.
 
 **Plan (one-center first -- self-contained, perfect oracle).**
 1. Per-nucleus tensorial FE grid; represent the Gaussian basis on it; evaluate
@@ -982,18 +999,22 @@ structure costs, for the factorization simplicity.
    split across nuclei on the global tensorial grid.
 3. Fold in the Helmholtz grid solver (the M-HK capstone) on the same FE machinery.
 
-**Status (2026-09-05): one-center prototype stood up** (prototype/fe_onecenter.cpp,
-validated against eri_quartet + analytic). Findings: (a) overlap by tensorial
-grid quadrature is MACHINE-EXACT (1.8e-15) -- the Gaussian basis representation
-claim holds; (b) the naive fixed-grid Coulomb + leading delta-tail converges
-only ~1/t_c^2 (8e-4 -> 5e-5 as t_c 15->60) -- the expected naive-quadrature
-limit; (c) the t-adapted quadrature (design point 5) is 100-600x better than the
-naive one at large t (t=64: 9.4e-5 vs 5.6e-2; t=256: 1.3e-3 vs 0.20), confirming
-the coordinate-change fix. Residual at extreme t is the OUTER x-geometry (large
-overlapping elements -> a corner in "which x couples"), which small matched
-elements + the near/far split remove. Next: element-subdivided FE representation
-(piecewise polynomials) + t-adapted element-pair quadrature -> machine-precision
-(pq|rs) on one centre; then multi-centre bridging.
+**Status (2026-09-05): one-center step-1 COMPLETE and machine-precise**
+(prototype/fe_onecenter.cpp, validated against eri_quartet + analytic).
+- Overlap by tensorial grid quadrature: MACHINE-EXACT (1.8e-15) -- the Gaussian
+  basis representation claim holds.
+- (pq|rs) via tensorial grid + Mobius t-quadrature + near/far-split t-adapted
+  inner quadrature (design point 5): MACHINE-EXACT vs eri_quartet -- (ss|ss)
+  9.8e-15, (pp|ss) 1.1e-15, (pp|pp) 4.4e-15 -- with NO delta tail. (Parity-zero
+  components like (ps|ss) are correct at ~1e-16.)
+- Confirmed en route: naive fixed-grid + leading delta-tail is only ~1/t_c^2
+  (8e-4->5e-5); the t-adapted element-pair quadrature beats the naive one
+  100-600x at large t (t=256: 1.3e-3 vs 0.20) on polynomial elements.
+Next: (i) the genuine element-subdivided piecewise-polynomial FE representation
+(makes the t-adapted branch t-uniform without the Gaussian-density split, and is
+what the grid SOLVER needs for cusps); (ii) multi-centre element-pair bridging
+(the far/near box split across nuclei); (iii) the Helmholtz grid solver on the
+same machinery.
 
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
