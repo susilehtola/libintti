@@ -84,4 +84,47 @@ TEST(FEGrid, DageCoulombSmoke) {
   EXPECT_LT(std::abs(J - ref), 5e-2 * ref) << "grid " << J << " vs analytic " << ref;
 }
 
+// The hp-adaptive grid resolves a Gaussian: build a grid for exp(-a r^2) to a
+// tight interpolation eps, then the 3D quadrature int e^{-2a r^2} = (pi/2a)^{3/2}
+// is recovered (a well-resolved integrand integrates to the interpolation error).
+TEST(FEGrid, HpGridResolvesGaussian) {
+  const double a = 1.0;
+  std::vector<intti::FEGaussian1D<double>> ax = {{a, 0.0}};
+  auto g = intti::make_fegrid1d_hp(ax, 1e-9);
+  const int N = g.N;
+  std::vector<double> rho((std::size_t)N * N * N);
+  for (int ix = 0; ix < N; ++ix)
+    for (int iy = 0; iy < N; ++iy)
+      for (int iz = 0; iz < N; ++iz) {
+        const double x = g.xnode[ix], y = g.xnode[iy], z = g.xnode[iz];
+        rho[((std::size_t)ix * N + iy) * N + iz] = std::exp(-a * (x * x + y * y + z * z));
+      }
+  const double num = intti::fe_inner(g, rho, rho);
+  const double ref = std::pow(M_PI / (2 * a), 1.5);
+  EXPECT_LT(std::abs(num - ref), 1e-6 * ref) << "hp grid N=" << N;
+}
+
+// Variable-order DAGE on an hp grid: Coulomb self-energy of a Gaussian vs
+// analytic (g_a|1/r|g_a) = 2 pi^{5/2}/(a^2 sqrt(2a)). Small grid + coarse t-grid
+// keep it fast (accuracy is grid-limited, as in DageCoulombSmoke).
+TEST(FEGrid, HpDageCoulombSmoke) {
+  const double a = 2.0;
+  std::vector<intti::FEGaussian1D<double>> ax = {{a, 0.0}};
+  auto g = intti::make_fegrid1d_hp(ax, 1e-3); // small N
+  const int N = g.N;
+  std::vector<double> rho((std::size_t)N * N * N);
+  for (int ix = 0; ix < N; ++ix)
+    for (int iy = 0; iy < N; ++iy)
+      for (int iz = 0; iz < N; ++iz) {
+        const double x = g.xnode[ix], y = g.xnode[iy], z = g.xnode[iz];
+        rho[((std::size_t)ix * N + iy) * N + iz] = std::exp(-a * (x * x + y * y + z * z));
+      }
+  intti::TGridSpec<double> spec;
+  spec.n = 24;
+  auto V = intti::fe_dage3d(g, intti::make_tgrid(intti::coulomb(), spec), rho, 16);
+  const double J = intti::fe_inner(g, rho, V);
+  const double ref = 2 * std::pow(M_PI, 2.5) / (a * a * std::sqrt(2 * a));
+  EXPECT_LT(std::abs(J - ref), 5e-2 * ref) << "hp grid N=" << N << ", J=" << J;
+}
+
 } // namespace

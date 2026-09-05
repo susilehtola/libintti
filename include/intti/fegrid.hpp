@@ -8,8 +8,13 @@
 //
 // A 1D axis is split into elements; on each element a function is a local
 // polynomial through the element's Gauss-Legendre nodes (barycentric Lagrange).
-// The 3D grid is the tensor product. The Coulomb (or any 1/r-family) potential
-// of a density rho on the grid is the "direct approach" (DAGE):
+// Each element carries its OWN order (np), so the mesh is hp-adaptive: uniform
+// meshes come from make_fegrid1d(ne, np, L); adapted meshes from
+// make_fegrid1d_hp(gaussians, eps), which places elements/orders so every 1D
+// Gaussian is resolved to eps (a cheap 1D problem, since a 1D Gaussian is entire
+// and barycentric interpolation converges exponentially in the order). The 3D
+// grid is the tensor product. The Coulomb (or any 1/r-family) potential of a
+// density rho on the grid is the "direct approach" (DAGE):
 //   V(r1) = int rho(r2)/|r1-r2| dr2 = sum_t w_t int rho(r2) e^{-t^2|r1-r2|^2} dr2,
 // and since the Gaussian kernel factorizes per Cartesian axis, each t-node is
 // three successive 1D convolutions of the density tensor (along z, y, x). Each
@@ -26,6 +31,7 @@
 // kept tensor-at-a-time so a Kokkos/GPU port (team-scratch over lines) can slot
 // in later. Matrix/grid-level only -- no per-quartet surface.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -62,58 +68,169 @@ void fe_gauss_legendre(int n, Real a, Real b, std::vector<Real> &x, std::vector<
 }
 } // namespace detail
 
-/// 1D tensorial finite-element grid: ne equal elements on [-L,L], each carrying
-/// np Gauss-Legendre nodes (a degree-(np-1) local polynomial). The 3D grid is
-/// the tensor product of this along x, y, z (N = ne*np points per axis).
+/// 1D tensorial finite-element grid: `ne` elements on the boundaries `be`, each
+/// element e carrying `nps[e]` Gauss-Legendre nodes (a degree-(nps[e]-1) local
+/// polynomial). Uniform meshes have all nps[e] equal; hp meshes vary them. The
+/// 3D grid is the tensor product along x, y, z (N = sum_e nps[e] points/axis).
 template <class Real> struct FEGrid1D {
-  int ne{0}, np{0}, N{0};
-  Real L{0};
-  std::vector<Real> be;                 // element boundaries (ne+1)
-  std::vector<Real> rn, rw, bw;         // reference nodes/weights/bary weights (np, on [-1,1])
-  std::vector<Real> xnode, xw;          // global node coords / quadrature weights (N)
+  int ne{0}, N{0};
+  Real L{0};                    // nominal half-width (uniform meshes); |domain|/2
+  std::vector<Real> be;         // element boundaries (ne+1)
+  std::vector<int> nps, noff;   // per-element order (ne) and node offset (ne+1)
+  std::vector<Real> rn, bw;     // per-element ref nodes / bary weights (concat by noff)
+  std::vector<Real> xnode, xw;  // global node coords / quadrature weights (N)
   Real cen(int e) const { return Real(0.5) * (be[e] + be[e + 1]); }
   Real hw(int e) const { return Real(0.5) * (be[e + 1] - be[e]); }
+  int np(int e) const { return nps[e]; }
 };
 
-/// Build a 1D FE grid of ne elements x np nodes on [-L, L].
-template <class Real> FEGrid1D<Real> make_fegrid1d(int ne, int np, Real L) {
+namespace detail {
+/// Build a 1D FE grid from explicit element boundaries and per-element orders.
+template <class Real>
+FEGrid1D<Real> make_fegrid1d_elements(const std::vector<Real> &be,
+                                      const std::vector<int> &orders) {
   FEGrid1D<Real> g;
-  g.ne = ne; g.np = np; g.N = ne * np; g.L = L;
-  g.be.resize(ne + 1);
-  for (int e = 0; e <= ne; ++e) g.be[e] = -L + 2 * L * e / ne;
-  detail::fe_gauss_legendre<Real>(np, Real(-1), Real(1), g.rn, g.rw);
-  g.bw.assign(np, Real(1));
-  for (int k = 0; k < np; ++k)
-    for (int j = 0; j < np; ++j)
-      if (j != k) g.bw[k] /= (g.rn[k] - g.rn[j]);
-  g.xnode.resize(g.N); g.xw.resize(g.N);
-  for (int e = 0; e < ne; ++e)
-    for (int k = 0; k < np; ++k) {
-      g.xnode[e * np + k] = g.cen(e) + g.hw(e) * g.rn[k];
-      g.xw[e * np + k] = g.hw(e) * g.rw[k];
+  g.ne = static_cast<int>(orders.size());
+  g.be = be;
+  g.L = Real(0.5) * (be.back() - be.front());
+  g.nps = orders;
+  g.noff.assign(g.ne + 1, 0);
+  for (int e = 0; e < g.ne; ++e) g.noff[e + 1] = g.noff[e] + orders[e];
+  g.N = g.noff[g.ne];
+  g.xnode.resize(g.N);
+  g.xw.resize(g.N);
+  for (int e = 0; e < g.ne; ++e) {
+    const int p = orders[e];
+    std::vector<Real> rn, rw;
+    fe_gauss_legendre<Real>(p, Real(-1), Real(1), rn, rw);
+    std::vector<Real> bw(p, Real(1));
+    for (int k = 0; k < p; ++k)
+      for (int j = 0; j < p; ++j)
+        if (j != k) bw[k] /= (rn[k] - rn[j]);
+    for (int k = 0; k < p; ++k) {
+      g.xnode[g.noff[e] + k] = g.cen(e) + g.hw(e) * rn[k];
+      g.xw[g.noff[e] + k] = g.hw(e) * rw[k];
+      g.rn.push_back(rn[k]);
+      g.bw.push_back(bw[k]);
     }
+  }
   return g;
 }
+} // namespace detail
+
+/// Uniform 1D FE grid: ne equal elements on [-L, L], each of order np.
+template <class Real> FEGrid1D<Real> make_fegrid1d(int ne, int np, Real L) {
+  std::vector<Real> be(ne + 1);
+  for (int e = 0; e <= ne; ++e) be[e] = -L + 2 * L * e / ne;
+  return detail::make_fegrid1d_elements(be, std::vector<int>(ne, np));
+}
+
+/// A 1D Gaussian factor exp(-alpha (x - center)^2) that must be resolved on an
+/// axis (the per-axis projection of a primitive; see make_fegrid1d_hp).
+template <class Real> struct FEGaussian1D {
+  Real alpha, center;
+};
 
 namespace detail {
-/// Barycentric Lagrange value of the element-local polynomial (nodal values f,
-/// length np) at reference coordinate xi in [-1,1].
-template <class Real> Real fe_lag(const FEGrid1D<Real> &g, const Real *f, Real xi) {
+/// Barycentric Lagrange value of element e's local polynomial (nodal values f,
+/// length nps[e]) at reference coordinate xi in [-1,1].
+template <class Real> Real fe_lag(const FEGrid1D<Real> &g, int e, const Real *f, Real xi) {
   Real num = 0, den = 0;
-  for (int k = 0; k < g.np; ++k) {
-    Real d = xi - g.rn[k];
+  const int p = g.nps[e], o = g.noff[e];
+  for (int k = 0; k < p; ++k) {
+    Real d = xi - g.rn[o + k];
     if (std::abs(d) < Real(1e-13)) return f[k];
-    Real t = g.bw[k] / d;
+    Real t = g.bw[o + k] / d;
     num += t * f[k];
     den += t;
   }
   return num / den;
 }
 
+/// Worst absolute interpolation error of any Gaussian on [a,b] at order p
+/// (barycentric through p Gauss-Legendre nodes), probed at nprobe+1 points.
+template <class Real>
+Real fe_hp_elem_err(const std::vector<FEGaussian1D<Real>> &gs, Real a, Real b, int p,
+                    int nprobe = 64) {
+  std::vector<Real> nodes, gw;
+  fe_gauss_legendre<Real>(p, a, b, nodes, gw);
+  std::vector<Real> w(p, Real(1));
+  for (int k = 0; k < p; ++k)
+    for (int j = 0; j < p; ++j)
+      if (j != k) w[k] /= (nodes[k] - nodes[j]);
+  Real worst = 0;
+  std::vector<Real> vals(p);
+  for (const auto &gg : gs) {
+    for (int k = 0; k < p; ++k) {
+      const Real dx = nodes[k] - gg.center;
+      vals[k] = std::exp(-gg.alpha * dx * dx);
+    }
+    for (int m = 0; m <= nprobe; ++m) {
+      const Real xt = a + (b - a) * m / nprobe, dx = xt - gg.center;
+      Real num = 0, den = 0, interp = 0;
+      bool hit = false;
+      for (int k = 0; k < p; ++k) {
+        Real d = xt - nodes[k];
+        if (std::abs(d) < Real(1e-14)) { interp = vals[k]; hit = true; break; }
+        Real t = w[k] / d;
+        num += t * vals[k];
+        den += t;
+      }
+      if (!hit) interp = num / den;
+      worst = std::max(worst, std::abs(interp - std::exp(-gg.alpha * dx * dx)));
+    }
+  }
+  return worst;
+}
+
+/// Recursive hp refinement of [a,b]: try increasing order up to pmax; bisect (h)
+/// only when no order reaches eps. Appends (right boundary, order) per element.
+template <class Real>
+void fe_hp_refine(const std::vector<FEGaussian1D<Real>> &gs, Real a, Real b, Real eps,
+                  int pmin, int pmax, std::vector<Real> &bnd, std::vector<int> &ord) {
+  for (int p = pmin; p <= pmax; ++p)
+    if (fe_hp_elem_err(gs, a, b, p) <= eps) {
+      bnd.push_back(b);
+      ord.push_back(p);
+      return;
+    }
+  const Real m = Real(0.5) * (a + b);
+  fe_hp_refine(gs, a, m, eps, pmin, pmax, bnd, ord);
+  fe_hp_refine(gs, m, b, eps, pmin, pmax, bnd, ord);
+}
+} // namespace detail
+
+/// hp-adaptive 1D FE grid resolving every 1D Gaussian in `gaussians` to absolute
+/// interpolation error `eps`, with minimal degrees of freedom. The domain covers
+/// all Gaussians down to amplitude eps; element boundaries are seeded at the
+/// centres and then hp-refined (order up to pmax, bisecting only when needed).
+/// This is the cheap per-axis construction of the tensorial grid (roadmap M-FE).
+template <class Real>
+FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians,
+                                Real eps, int pmin = 4, int pmax = 16) {
+  Real xlo = gaussians.front().center, xhi = xlo;
+  for (const auto &g : gaussians) {
+    const Real w = std::sqrt(-std::log(eps) / g.alpha);
+    xlo = std::min(xlo, g.center - w);
+    xhi = std::max(xhi, g.center + w);
+  }
+  std::vector<Real> seeds{xlo, xhi};
+  for (const auto &g : gaussians)
+    if (g.center > xlo && g.center < xhi) seeds.push_back(g.center);
+  std::sort(seeds.begin(), seeds.end());
+  seeds.erase(std::unique(seeds.begin(), seeds.end()), seeds.end());
+  std::vector<Real> bnd{xlo};
+  std::vector<int> ord;
+  for (std::size_t s = 0; s + 1 < seeds.size(); ++s)
+    detail::fe_hp_refine(gaussians, seeds[s], seeds[s + 1], eps, pmin, pmax, bnd, ord);
+  return detail::make_fegrid1d_elements(bnd, ord);
+}
+
+namespace detail {
 /// t-adapted 1D convolution of an FE line (nodal values `in`, length N) with the
 /// Gaussian kernel exp(-t^2 (u1-u2)^2): out(u1) = int in(u2) exp(-t^2(u1-u2)^2)
 /// du2. vg/vw are reference GL nodes/weights on [-1,1]; vmax clamps the flat-
-/// kernel window.
+/// kernel window. Handles per-element variable order via g.noff / g.nps.
 template <class Real>
 void fe_conv1d(const FEGrid1D<Real> &g, const std::vector<Real> &vg,
                const std::vector<Real> &vw, Real vmax, const Real *in, Real t, Real *out) {
@@ -125,13 +242,13 @@ void fe_conv1d(const FEGrid1D<Real> &g, const std::vector<Real> &vg,
       Real lo = t * (u1 - g.be[eB + 1]), hi = t * (u1 - g.be[eB]);
       lo = std::max(lo, -vmax); hi = std::min(hi, vmax);
       if (hi <= lo) continue; // far element: outside the exp(-v^2) window
-      const Real *fB = in + static_cast<std::size_t>(eB) * g.np;
+      const Real *fB = in + g.noff[eB];
       const Real vc = Real(0.5) * (lo + hi), vh = Real(0.5) * (hi - lo);
       Real s = 0;
       for (int gi = 0; gi < nv; ++gi) {
         const Real v = vc + vh * vg[gi];
         const Real xi = ((u1 - v / t) - g.cen(eB)) / g.hw(eB);
-        s += vh * vw[gi] * fe_lag(g, fB, xi) * std::exp(-v * v);
+        s += vh * vw[gi] * fe_lag(g, eB, fB, xi) * std::exp(-v * v);
       }
       acc += s / t;
     }
@@ -145,7 +262,8 @@ void fe_conv1d(const FEGrid1D<Real> &g, const std::vector<Real> &vg,
 /// convolutions per t-node. rho and the returned V are N^3 tensors in
 /// row-major (ix,iy,iz) order (N = grid.N). The kernel is set by `tgrid`
 /// (coulomb -> 1/r; yukawa(kappa) -> e^{-kappa r}/r). `nv` is the inner
-/// (flat-kernel) quadrature order. Handles general non-separable densities.
+/// (flat-kernel) quadrature order. Handles general non-separable densities and
+/// hp (variable-order) grids.
 template <class Real>
 std::vector<Real> fe_dage3d(const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
                             const std::vector<Real> &rho, int nv = 32, Real vmax = Real(8)) {
