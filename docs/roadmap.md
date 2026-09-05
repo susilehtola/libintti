@@ -1067,6 +1067,19 @@ solves. Combined with the multi-centre DAGE, FE exchange for molecules is
 de-risked. Remaining: accuracy/cost tuning (near-nucleus resolution for the
 cusped co-densities), localized-orbital screening, and library-ization.
 
+**Helmholtz/Yukawa apply on the FE grid VALIDATED** (prototype/fe_yukawa_dage.cpp,
+2026-09-05) -- the last core operator for the real-space SCF solver (M-HK
+capstone). G_kappa = e^{-kappa r}/(4 pi r) applied to a grid function is the SAME
+3D t-adapted DAGE, only with the YUKAWA t-grid (the exp(-kappa^2/4t^2) weight is
+already in make_tgrid(yukawa)). Validated (rho|e^{-kappa r}/r|rho) for a
+non-separable density vs the analytic Yukawa from eri_quartet: rel 2.1e-7 at
+6 elem x deg 8 (N=54/axis), kappa=1. So ALL grid Fock/solver operators now exist
+and are validated on the FE grid: Coulomb J (DAGE), exchange K (co-density +
+DAGE), and the Helmholtz orbital-update kernel G_kappa. The grid SCF driver
+psi <- -2 G_kappa V psi (the previously efficiency-gated M-HK capstone) is now
+an ASSEMBLY of these validated operators + convergence control (the cusped 1/r
+potential needs near-nucleus FE refinement / bubbles for accuracy).
+
 **Step-3 (3D t-adapted DAGE) PROTOTYPED** (prototype/fe_dage3d.cpp, 2026-09-05):
 the Coulomb potential of a GENERAL 3D density on the tensorial FE grid,
 V(r1) = sum_t w_t int rho(r2) e^{-t^2|r1-r2|^2} dr2, done as three successive 1D
