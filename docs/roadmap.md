@@ -1351,9 +1351,22 @@ of grid_for_basis / ao_values_on_grid / grid_coulomb_build / grid_exchange_build
 x^l e^{-alpha_p r^2}, ec = coeff * cart_norm_pyscf), so contraction is FREE on
 the grid and the grid cost scales with nao (contracted), not nprim. CI: contracted
 grid-RI J and K match the analytic contracted coulomb_build / exchange_build
-(contracted.hpp) on an s+p general-contraction basis (suite 221/221). Next: real
-solid harmonics in the evaluator (spherical AOs, also free); a benchmark vs
-GTO-RI (and vs the analytic contracted engine for ANO); a Kokkos/streaming port.
+(contracted.hpp) on an s+p general-contraction basis (suite 221/221).
+SPHERICAL AOs added (2026-09-05): gridri.hpp has ao_values_on_grid_spherical /
+grid_coulomb_build_spherical / grid_exchange_build_spherical + nao_spherical. A
+spherical AO is chi_sph_m = sum_k c2s(l)[m][k] chi_cart_k evaluated pointwise
+(c2s.hpp; cart_index matches cart_comp, and c2s operates on the raw monomials =
+the library's unnormalized-Cartesian convention, so no extra normalization) --
+the c2s transform is FREE on the grid, in the compact 2l+1 space, no contaminant.
+grid_for_basis now raises the element order to 2*lmax+4 so the degree-2*lmax AO
+products of higher-l shells are resolved. CI: SphericalOrthogonality (isolated d
+shell has a diagonal grid overlap) and SphericalCoulombConsistentWithCartesian
+(J_sph(D_sph) == C J_cart(C^T D_sph C) C^T on the same grid, machine precision);
+suite 223/223. So grid-RI now spans Cartesian / spherical / contracted, all via
+the one pointwise evaluator. Next: a benchmark vs GTO-RI (and vs the analytic
+contracted engine for ANO); a Kokkos/streaming port; grid accuracy tuning for
+high l (the poly factor -- grid_for_basis currently sizes order, not element eps,
+to lmax).
 
 ORTHONORMAL / MO-BASIS grid-RI is viable (user, 2026-09-05). For J it is a non-
 issue by INVARIANCE: rho = sum D_uv chi_u chi_v is basis-independent, so V =

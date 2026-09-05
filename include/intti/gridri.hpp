@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "c2s.hpp"        // c2s_matrix (Cartesian -> real solid harmonic)
 #include "contracted.hpp" // ContractedBasis, detail::effective_coeff
 #include "fegrid.hpp"
 #include "fock.hpp" // ShellBasis
@@ -40,12 +41,18 @@ FEGrid1D<Real> grid_for_basis(const ShellBasis<Real> &basis, Real eps = Real(1e-
                               int pmin = 4, int pmax = 16) {
   std::vector<FEGaussian1D<Real>> ax;
   const auto &sh = basis.shells;
+  int lmax = 0;
+  for (const auto &s : sh) lmax = std::max(lmax, s.l);
   for (std::size_t i = 0; i < sh.size(); ++i)
     for (std::size_t j = 0; j < sh.size(); ++j) {
       const Real p = sh[i].alpha + sh[j].alpha;
       for (int d = 0; d < 3; ++d)
         ax.push_back({p, (sh[i].alpha * sh[i].center[d] + sh[j].alpha * sh[j].center[d]) / p});
     }
+  // AO products reach per-axis polynomial degree up to 2*lmax, so each element
+  // needs at least that many extra nodes on top of the Gaussian resolution.
+  pmin = std::max(pmin, 2 * lmax + 4);
+  pmax = std::max(pmax, pmin);
   return make_fegrid1d_hp(ax, eps, pmin, pmax);
 }
 
@@ -182,6 +189,70 @@ std::vector<Real> grid_exchange_build(const ShellBasis<Real> &basis, const Real 
                                        grid, tgrid, nv);
 }
 
+// ---- spherical AOs: the c2s transform is FREE on the grid -------------------
+// A real solid harmonic is a fixed linear combination of the Cartesian
+// monomials of its degree (c2s_matrix, c2s.hpp), and cart_index matches
+// cart_comp, so a spherical AO is evaluated pointwise as chi_sph_m = sum_k
+// c2s(l)[m][k] chi_cart_k -- no c2s contraction on the integrals, the compact
+// 2l+1 space, and no Cartesian contaminant. The grid-RI J/K then reuse the same
+// detail cores on the spherical AO values.
+
+/// Number of spherical AOs of a Cartesian ShellBasis (sum over shells of 2l+1).
+template <class Real> int nao_spherical(const ShellBasis<Real> &basis) {
+  int n = 0;
+  for (const auto &s : basis.shells) n += 2 * s.l + 1;
+  return n;
+}
+
+/// Evaluate every real-solid-harmonic (spherical) AO on the grid, shell-major
+/// with m = -l..+l within each shell: chi_sph = c2s(l) . chi_cart per shell.
+template <class Real>
+std::vector<std::vector<Real>> ao_values_on_grid_spherical(const ShellBasis<Real> &basis,
+                                                           const FEGrid1D<Real> &grid) {
+  const int N = grid.N;
+  const std::size_t N3 = static_cast<std::size_t>(N) * N * N;
+  auto cart = ao_values_on_grid(basis, grid);
+  std::vector<std::vector<Real>> sph(nao_spherical(basis), std::vector<Real>(N3, Real(0)));
+  const int ns = static_cast<int>(basis.shells.size());
+  int so = 0;
+  for (int s = 0; s < ns; ++s) {
+    const int l = basis.shells[s].l, nc = ncart(l), nm = 2 * l + 1;
+    const auto C = c2s_matrix<Real>(l); // (2l+1) x nc, row-major
+    const int co = basis.ao_off[s];
+    for (int m = 0; m < nm; ++m) {
+      Real *out = sph[so + m].data();
+      for (int k = 0; k < nc; ++k) {
+        const Real c = C[static_cast<std::size_t>(m) * nc + k];
+        if (c == Real(0)) continue;
+        const Real *cc = cart[co + k].data();
+        for (std::size_t g = 0; g < N3; ++g) out[g] += c * cc[g];
+      }
+    }
+    so += nm;
+  }
+  return sph;
+}
+
+/// Grid-RI Coulomb J over the SPHERICAL AOs of a Cartesian basis (D_sph and the
+/// returned J are nao_spherical x nao_spherical). Matches the c2s-transform of
+/// the exact Cartesian J.
+template <class Real>
+std::vector<Real> grid_coulomb_build_spherical(const ShellBasis<Real> &basis, const Real *D,
+                                               const FEGrid1D<Real> &grid,
+                                               const TGrid<Real> &tgrid, int nv = 24) {
+  return detail::grid_coulomb_from_ao(ao_values_on_grid_spherical(basis, grid),
+                                      nao_spherical(basis), D, grid, tgrid, nv);
+}
+
+/// Grid-RI exchange K over the SPHERICAL AOs (Cocc is nao_spherical x nocc).
+template <class Real>
+std::vector<Real> grid_exchange_build_spherical(const ShellBasis<Real> &basis, const Real *Cocc,
+                                                int nocc, const FEGrid1D<Real> &grid,
+                                                const TGrid<Real> &tgrid, int nv = 24) {
+  return detail::grid_exchange_from_ao(ao_values_on_grid_spherical(basis, grid),
+                                       nao_spherical(basis), Cocc, nocc, grid, tgrid, nv);
+}
+
 // ---- generally-contracted basis: contraction is FREE on the grid ------------
 // The AO enters only through its pointwise value, so a contracted AO is one sum
 // chi_a = sum_p ec(A,cA,p) x^lx y^ly z^lz e^{-alpha_p r^2} evaluated per point;
@@ -196,6 +267,8 @@ FEGrid1D<Real> grid_for_basis(const ContractedBasis<Real> &basis, Real eps = Rea
                               int pmin = 4, int pmax = 16) {
   std::vector<FEGaussian1D<Real>> ax;
   const auto &sh = basis.shells;
+  int lmax = 0;
+  for (const auto &s : sh) lmax = std::max(lmax, s.l);
   for (std::size_t A = 0; A < sh.size(); ++A)
     for (std::size_t B = 0; B < sh.size(); ++B)
       for (int p = 0; p < sh[A].nprim(); ++p)
@@ -205,6 +278,8 @@ FEGrid1D<Real> grid_for_basis(const ContractedBasis<Real> &basis, Real eps = Rea
             ax.push_back({pe, (sh[A].alpha[p] * sh[A].center[d] +
                                sh[B].alpha[q] * sh[B].center[d]) / pe});
         }
+  pmin = std::max(pmin, 2 * lmax + 4); // room for the degree-2*lmax AO products
+  pmax = std::max(pmax, pmin);
   return make_fegrid1d_hp(ax, eps, pmin, pmax);
 }
 
