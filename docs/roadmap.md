@@ -1344,9 +1344,16 @@ chi_u phi_i from occupied Cocc -> DAGE -> contract K). Matrix-level API (D /
 orbitals in, J / K out; never per-quartet). Host reference (precomputes AO values
 nao*N^3; Kokkos/streaming port is future). CI tests (tests/test_gridri.cpp):
 grid-RI J on an s+p basis and grid-RI K (rank-1 occ) both match the exact GTO
-coulomb_build / exchange_build (coarse grid, ~5s; suite 219/219). Next: real
-solid harmonics + contracted AOs in the evaluator (both free, per the notes
-below); a benchmark vs GTO-RI; and a Kokkos/streaming port.
+coulomb_build / exchange_build (coarse grid, ~5s; suite 219/219).
+CONTRACTED AOs added (2026-09-05): gridri.hpp now has ContractedBasis overloads
+of grid_for_basis / ao_values_on_grid / grid_coulomb_build / grid_exchange_build
+-- the contracted AO is evaluated pointwise as one sum (chi_a = sum_p ec(A,cA,p)
+x^l e^{-alpha_p r^2}, ec = coeff * cart_norm_pyscf), so contraction is FREE on
+the grid and the grid cost scales with nao (contracted), not nprim. CI: contracted
+grid-RI J and K match the analytic contracted coulomb_build / exchange_build
+(contracted.hpp) on an s+p general-contraction basis (suite 221/221). Next: real
+solid harmonics in the evaluator (spherical AOs, also free); a benchmark vs
+GTO-RI (and vs the analytic contracted engine for ANO); a Kokkos/streaming port.
 
 ORTHONORMAL / MO-BASIS grid-RI is viable (user, 2026-09-05). For J it is a non-
 issue by INVARIANCE: rho = sum D_uv chi_u chi_v is basis-independent, so V =

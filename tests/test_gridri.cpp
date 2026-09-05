@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include "intti/contracted.hpp"
 #include "intti/fock.hpp"
 #include "intti/gridri.hpp"
 #include "intti/gto.hpp"
@@ -73,6 +74,61 @@ TEST(GridRI, ExchangeMatchesGTO) {
     scale = std::max(scale, std::abs(Kref[k]));
   }
   EXPECT_LT(worst, 8e-2 * scale) << "grid-RI K vs GTO K, grid N=" << grid.N;
+}
+
+// A small generally-contracted s+p basis.
+intti::ContractedBasis<double> contracted_sp() {
+  intti::ContractedShell<double> s;
+  s.center[0] = 0; s.center[1] = 0; s.center[2] = 0;
+  s.l = 0; s.alpha = {2.0, 0.9}; s.coeff = {0.6, 0.5};
+  intti::ContractedShell<double> p;
+  p.center[0] = 0; p.center[1] = 0; p.center[2] = 1.2;
+  p.l = 1; p.alpha = {1.5, 0.8}; p.coeff = {0.55, 0.5};
+  return intti::make_contracted_basis<double>({s, p});
+}
+
+// grid-RI J over a generally-contracted basis matches the analytic contracted
+// coulomb_build -- contraction is absorbed into the pointwise AO evaluation.
+TEST(GridRI, ContractedCoulombMatchesGTO) {
+  auto cb = contracted_sp();
+  const int n = cb.nao; // 1 + 3 = 4
+  auto D = sym(n, 0.9);
+  auto grid = intti::grid_for_basis(cb, 5e-2);
+  intti::TGridSpec<double> spec; spec.n = 16;
+  auto Jg = intti::grid_coulomb_build(cb, D.data(), grid,
+                                      intti::make_tgrid(intti::coulomb(), spec), 14);
+  std::vector<double> Jref((std::size_t)n * n, 0.0);
+  intti::coulomb_build(cb, D.data(), intti::make_tgrid(intti::coulomb()), Jref.data());
+  double worst = 0, scale = 0;
+  for (std::size_t k = 0; k < Jref.size(); ++k) {
+    worst = std::max(worst, std::abs(Jg[k] - Jref[k]));
+    scale = std::max(scale, std::abs(Jref[k]));
+  }
+  EXPECT_LT(worst, 6e-2 * scale) << "contracted grid-RI J vs analytic, grid N=" << grid.N;
+}
+
+// grid-RI K over a generally-contracted basis matches the analytic contracted
+// exchange_build on D = Cocc Cocc^T.
+TEST(GridRI, ContractedExchangeMatchesGTO) {
+  auto cb = contracted_sp();
+  const int n = cb.nao, nocc = 1;
+  std::vector<double> C((std::size_t)n * nocc);
+  for (int u = 0; u < n; ++u) C[u] = 0.3 + 0.2 * std::sin(1.1 * u);
+  std::vector<double> D((std::size_t)n * n, 0.0);
+  for (int u = 0; u < n; ++u)
+    for (int v = 0; v < n; ++v) D[u * n + v] = C[u] * C[v];
+  auto grid = intti::grid_for_basis(cb, 5e-2);
+  intti::TGridSpec<double> spec; spec.n = 14;
+  auto Kg = intti::grid_exchange_build(cb, C.data(), nocc, grid,
+                                       intti::make_tgrid(intti::coulomb(), spec), 12);
+  std::vector<double> Kref((std::size_t)n * n, 0.0);
+  intti::exchange_build(cb, D.data(), intti::make_tgrid(intti::coulomb()), Kref.data(), 0.0);
+  double worst = 0, scale = 0;
+  for (std::size_t k = 0; k < Kref.size(); ++k) {
+    worst = std::max(worst, std::abs(Kg[k] - Kref[k]));
+    scale = std::max(scale, std::abs(Kref[k]));
+  }
+  EXPECT_LT(worst, 1.5e-1 * scale) << "contracted grid-RI K vs analytic, grid N=" << grid.N;
 }
 
 } // namespace
