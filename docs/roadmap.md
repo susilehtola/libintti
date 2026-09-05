@@ -1062,6 +1062,24 @@ per-axis FE interpolation (a fixed-grid 3D DAGE is infeasible at accuracy: the
 t_c <~ n/2L resolution limit forces prohibitive n). That is the step-3 build,
 alongside multi-centre bridging.
 
+**Step-3 (3D t-adapted DAGE) PROTOTYPED** (prototype/fe_dage3d.cpp, 2026-09-05):
+the Coulomb potential of a GENERAL 3D density on the tensorial FE grid,
+V(r1) = sum_t w_t int rho(r2) e^{-t^2|r1-r2|^2} dr2, done as three successive 1D
+convolutions along z,y,x (kernel factorizes per axis). Each 1D convolution uses
+the t-adapted substitution u2=u1-v/t and evaluates the FE function at the
+off-grid points u1-v/t by barycentric-Lagrange interpolation within the source
+element (far elements auto-screen via the clamped v-range) -- machine-exact per
+axis for all t, no delta tail. Because separability is in the KERNEL not the
+density, this handles NON-separable densities (the co-densities that broke the
+step-1/2 pair-density factorization). Validated on a non-separable density (sum
+of s-Gaussians) vs the analytic Coulomb: rel error 2.4e-5 at a coarse grid
+(5 elements x degree 7, N=40/axis) -- REPRESENTATION-limited (the t-adapted
+quadrature is machine-exact per steps 1-2), spectrally convergent under
+refinement. This is the engine that unlocks the single-3D-tensor co-density
+exchange (form g_qi once, one DAGE solve per (q,i)) and the grid SCF solver.
+Remaining: refine to production accuracy + screening/cost tuning; multi-centre
+bridging; wire into a co-density K build and the Helmholtz grid solver.
+
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
 A project-wide audit for loops whose cost scales with system size and could be
