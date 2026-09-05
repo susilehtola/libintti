@@ -1363,10 +1363,16 @@ products of higher-l shells are resolved. CI: SphericalOrthogonality (isolated d
 shell has a diagonal grid overlap) and SphericalCoulombConsistentWithCartesian
 (J_sph(D_sph) == C J_cart(C^T D_sph C) C^T on the same grid, machine precision);
 suite 223/223. So grid-RI now spans Cartesian / spherical / contracted, all via
-the one pointwise evaluator. Next: a benchmark vs GTO-RI (and vs the analytic
-contracted engine for ANO); a Kokkos/streaming port; grid accuracy tuning for
-high l (the poly factor -- grid_for_basis currently sizes order, not element eps,
-to lmax).
+the one pointwise evaluator.
+HIGH-l GRID ACCURACY fixed (2026-09-06): the hp mesh is now DEGREE-AWARE --
+fe_hp_elem_err / make_fegrid1d_hp take a pdeg and resolve (x-c)^d e^{-a(x-c)^2}
+for d=0..pdeg (each normalised by its peak), not just the Gaussian envelope, and
+widen the domain by the polynomial's reach. grid_for_basis passes pdeg = 2*lmax
+(the max per-axis AO-product degree). This makes grid-RI J for high-l shells
+match the EXACT GTO coulomb_build directly (new CI GridRI.HighLCoulombMatchesGTO:
+s+d, worst rel error < 4e-2 -- the check that previously failed at 0.2 with an
+envelope-only grid). Suite 224/224. Next: a benchmark vs GTO-RI (and vs the
+analytic contracted engine for ANO); a Kokkos/streaming port.
 
 ORTHONORMAL / MO-BASIS grid-RI is viable (user, 2026-09-05). For J it is a non-
 issue by INVARIANCE: rho = sum D_uv chi_u chi_v is basis-independent, so V =

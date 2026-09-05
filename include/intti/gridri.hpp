@@ -49,11 +49,9 @@ FEGrid1D<Real> grid_for_basis(const ShellBasis<Real> &basis, Real eps = Real(1e-
       for (int d = 0; d < 3; ++d)
         ax.push_back({p, (sh[i].alpha * sh[i].center[d] + sh[j].alpha * sh[j].center[d]) / p});
     }
-  // AO products reach per-axis polynomial degree up to 2*lmax, so each element
-  // needs at least that many extra nodes on top of the Gaussian resolution.
-  pmin = std::max(pmin, 2 * lmax + 4);
-  pmax = std::max(pmax, pmin);
-  return make_fegrid1d_hp(ax, eps, pmin, pmax);
+  // AO products reach per-axis polynomial degree up to 2*lmax; resolve that
+  // polynomial x Gaussian factor (not just the envelope) to eps.
+  return make_fegrid1d_hp(ax, eps, pmin, pmax, 2 * lmax);
 }
 
 namespace detail {
@@ -278,9 +276,8 @@ FEGrid1D<Real> grid_for_basis(const ContractedBasis<Real> &basis, Real eps = Rea
             ax.push_back({pe, (sh[A].alpha[p] * sh[A].center[d] +
                                sh[B].alpha[q] * sh[B].center[d]) / pe});
         }
-  pmin = std::max(pmin, 2 * lmax + 4); // room for the degree-2*lmax AO products
-  pmax = std::max(pmax, pmin);
-  return make_fegrid1d_hp(ax, eps, pmin, pmax);
+  // resolve the degree-up-to-2*lmax AO-product polynomial x Gaussian to eps.
+  return make_fegrid1d_hp(ax, eps, pmin, pmax, 2 * lmax);
 }
 
 /// Evaluate every contracted Cartesian AO on the grid (AO order = ao_off[A] +

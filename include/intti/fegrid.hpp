@@ -147,37 +147,48 @@ template <class Real> Real fe_lag(const FEGrid1D<Real> &g, int e, const Real *f,
   return num / den;
 }
 
-/// Worst absolute interpolation error of any Gaussian on [a,b] at order p
-/// (barycentric through p Gauss-Legendre nodes), probed at nprobe+1 points.
+/// Worst RELATIVE interpolation error, over every Gaussian and every polynomial
+/// degree 0..pdeg, of (x - centre)^d exp(-alpha (x-centre)^2) on [a,b] at order p
+/// (barycentric through p Gauss-Legendre nodes, nprobe+1 probes). pdeg > 0
+/// resolves the AO-PRODUCT factor (a degree-up-to-2l polynomial times the
+/// Gaussian), not just the envelope; each degree's error is normalised by that
+/// factor's global peak (d/(2 alpha))^{d/2} e^{-d/2}, so eps is a consistent
+/// relative tolerance across degrees.
 template <class Real>
 Real fe_hp_elem_err(const std::vector<FEGaussian1D<Real>> &gs, Real a, Real b, int p,
-                    int nprobe = 64) {
+                    int pdeg = 0, int nprobe = 64) {
   std::vector<Real> nodes, gw;
   fe_gauss_legendre<Real>(p, a, b, nodes, gw);
   std::vector<Real> w(p, Real(1));
   for (int k = 0; k < p; ++k)
     for (int j = 0; j < p; ++j)
       if (j != k) w[k] /= (nodes[k] - nodes[j]);
+  auto ipow = [](Real x, int n) { Real r = 1; for (int i = 0; i < n; ++i) r *= x; return r; };
   Real worst = 0;
   std::vector<Real> vals(p);
   for (const auto &gg : gs) {
-    for (int k = 0; k < p; ++k) {
-      const Real dx = nodes[k] - gg.center;
-      vals[k] = std::exp(-gg.alpha * dx * dx);
-    }
-    for (int m = 0; m <= nprobe; ++m) {
-      const Real xt = a + (b - a) * m / nprobe, dx = xt - gg.center;
-      Real num = 0, den = 0, interp = 0;
-      bool hit = false;
+    for (int d = 0; d <= pdeg; ++d) {
+      const Real peak = d == 0 ? Real(1)
+                               : std::pow(d / (2 * gg.alpha), Real(d) / 2) * std::exp(-Real(d) / 2);
       for (int k = 0; k < p; ++k) {
-        Real d = xt - nodes[k];
-        if (std::abs(d) < Real(1e-14)) { interp = vals[k]; hit = true; break; }
-        Real t = w[k] / d;
-        num += t * vals[k];
-        den += t;
+        const Real dx = nodes[k] - gg.center;
+        vals[k] = ipow(dx, d) * std::exp(-gg.alpha * dx * dx);
       }
-      if (!hit) interp = num / den;
-      worst = std::max(worst, std::abs(interp - std::exp(-gg.alpha * dx * dx)));
+      for (int m = 0; m <= nprobe; ++m) {
+        const Real xt = a + (b - a) * m / nprobe, dx = xt - gg.center;
+        const Real exact = ipow(dx, d) * std::exp(-gg.alpha * dx * dx);
+        Real num = 0, den = 0, interp = 0;
+        bool hit = false;
+        for (int k = 0; k < p; ++k) {
+          Real dd = xt - nodes[k];
+          if (std::abs(dd) < Real(1e-14)) { interp = vals[k]; hit = true; break; }
+          Real t = w[k] / dd;
+          num += t * vals[k];
+          den += t;
+        }
+        if (!hit) interp = num / den;
+        worst = std::max(worst, std::abs(interp - exact) / peak);
+      }
     }
   }
   return worst;
@@ -185,18 +196,19 @@ Real fe_hp_elem_err(const std::vector<FEGaussian1D<Real>> &gs, Real a, Real b, i
 
 /// Recursive hp refinement of [a,b]: try increasing order up to pmax; bisect (h)
 /// only when no order reaches eps. Appends (right boundary, order) per element.
+/// `pdeg` is the max AO-product polynomial degree to resolve (0 = envelope only).
 template <class Real>
 void fe_hp_refine(const std::vector<FEGaussian1D<Real>> &gs, Real a, Real b, Real eps,
-                  int pmin, int pmax, std::vector<Real> &bnd, std::vector<int> &ord) {
+                  int pmin, int pmax, int pdeg, std::vector<Real> &bnd, std::vector<int> &ord) {
   for (int p = pmin; p <= pmax; ++p)
-    if (fe_hp_elem_err(gs, a, b, p) <= eps) {
+    if (fe_hp_elem_err(gs, a, b, p, pdeg) <= eps) {
       bnd.push_back(b);
       ord.push_back(p);
       return;
     }
   const Real m = Real(0.5) * (a + b);
-  fe_hp_refine(gs, a, m, eps, pmin, pmax, bnd, ord);
-  fe_hp_refine(gs, m, b, eps, pmin, pmax, bnd, ord);
+  fe_hp_refine(gs, a, m, eps, pmin, pmax, pdeg, bnd, ord);
+  fe_hp_refine(gs, m, b, eps, pmin, pmax, pdeg, bnd, ord);
 }
 } // namespace detail
 
@@ -205,15 +217,21 @@ void fe_hp_refine(const std::vector<FEGaussian1D<Real>> &gs, Real a, Real b, Rea
 /// all Gaussians down to amplitude eps; element boundaries are seeded at the
 /// centres and then hp-refined (order up to pmax, bisecting only when needed).
 /// This is the cheap per-axis construction of the tensorial grid (roadmap M-FE).
+/// `pdeg` is the maximum AO-product polynomial degree per axis to resolve (0 =
+/// the Gaussian envelope only; 2*lmax for a basis of max angular momentum lmax).
 template <class Real>
 FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians,
-                                Real eps, int pmin = 4, int pmax = 16) {
+                                Real eps, int pmin = 4, int pmax = 16, int pdeg = 0) {
   Real xlo = gaussians.front().center, xhi = xlo;
   for (const auto &g : gaussians) {
-    const Real w = std::sqrt(-std::log(eps) / g.alpha);
+    // the product factor (x-c)^pdeg exp(-a(x-c)^2) extends a little past the
+    // pure-Gaussian eps radius; widen the domain by the polynomial's reach.
+    const Real w = std::sqrt((-std::log(eps) + pdeg) / g.alpha);
     xlo = std::min(xlo, g.center - w);
     xhi = std::max(xhi, g.center + w);
   }
+  pmin = std::max(pmin, pdeg + 2); // room to represent the degree-pdeg polynomial
+  pmax = std::max(pmax, pmin);
   std::vector<Real> seeds{xlo, xhi};
   for (const auto &g : gaussians)
     if (g.center > xlo && g.center < xhi) seeds.push_back(g.center);
@@ -222,7 +240,7 @@ FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians
   std::vector<Real> bnd{xlo};
   std::vector<int> ord;
   for (std::size_t s = 0; s + 1 < seeds.size(); ++s)
-    detail::fe_hp_refine(gaussians, seeds[s], seeds[s + 1], eps, pmin, pmax, bnd, ord);
+    detail::fe_hp_refine(gaussians, seeds[s], seeds[s + 1], eps, pmin, pmax, pdeg, bnd, ord);
   return detail::make_fegrid1d_elements(bnd, ord);
 }
 
