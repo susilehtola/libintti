@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "contracted.hpp" // ContractedBasis, detail::effective_coeff/contracted_prim
 #include "fock.hpp"
 #include "gto.hpp"
 #include "lkc.hpp"
@@ -157,6 +158,126 @@ std::vector<Real> coulomb_3c_auxblock(const ShellBasis<Real> &orb,
                       nauxblk +
                   Ploc] = v; // mu<->nu mirror
             }
+      }
+    }
+  return T;
+}
+
+// ---- generally-contracted RI n-center tensors -------------------------------
+// The contracted (P|Q) and (mu nu | P) reuse the primitive ghost-shell
+// eri_quartet on every primitive combination, accumulating it coefficient-
+// weighted (effective_coeff = basis-set coeff * cart_norm_pyscf) into the
+// contracted block -- each primitive quartet evaluated once, shared across the
+// contraction indices. AO order c*ncart(l)+k (matching contracted.hpp).
+
+/// Two-center Coulomb metric (P|Q) over a generally-contracted auxiliary basis
+/// (naux x naux, PySCF cart=True normalization).
+template <class Real>
+std::vector<Real> coulomb_2c(const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+  const int naux = aux.nao;
+  std::vector<Real> M(static_cast<std::size_t>(naux) * naux, Real(0));
+  const int ns = static_cast<int>(aux.shells.size());
+  for (int A = 0; A < ns; ++A)
+    for (int B = 0; B <= A; ++B) {
+      const auto &SA = aux.shells[A], &SB = aux.shells[B];
+      const int nP = ncart(SA.l), nQ = ncart(SB.l), nctA = SA.nctr(), nctB = SB.nctr();
+      const int rowB = nctB * nQ;
+      std::vector<Real> cblk(static_cast<std::size_t>(nctA) * nP * rowB, Real(0));
+      std::vector<Real> blk(static_cast<std::size_t>(nP) * nQ);
+      for (int pa = 0; pa < SA.nprim(); ++pa) {
+        auto bra = detail::ghost_pair(detail::contracted_prim(SA, pa));
+        for (int pb = 0; pb < SB.nprim(); ++pb) {
+          auto ket = detail::ghost_pair(detail::contracted_prim(SB, pb));
+          eri_quartet(bra, ket, grid, blk.data());
+          for (int cA = 0; cA < nctA; ++cA) {
+            const Real wa = detail::effective_coeff(SA, cA, pa);
+            if (wa == Real(0)) continue;
+            for (int cB = 0; cB < nctB; ++cB) {
+              const Real w = wa * detail::effective_coeff(SB, cB, pb);
+              for (int kP = 0; kP < nP; ++kP)
+                for (int kQ = 0; kQ < nQ; ++kQ)
+                  cblk[(static_cast<std::size_t>(cA) * nP + kP) * rowB + cB * nQ + kQ] +=
+                      w * blk[kP * nQ + kQ];
+            }
+          }
+        }
+      }
+      for (int cA = 0; cA < nctA; ++cA)
+        for (int kP = 0; kP < nP; ++kP) {
+          const std::size_t I = aux.ao_off[A] + static_cast<std::size_t>(cA) * nP + kP;
+          for (int cB = 0; cB < nctB; ++cB)
+            for (int kQ = 0; kQ < nQ; ++kQ) {
+              const std::size_t J = aux.ao_off[B] + static_cast<std::size_t>(cB) * nQ + kQ;
+              const Real v = cblk[(static_cast<std::size_t>(cA) * nP + kP) * rowB + cB * nQ + kQ];
+              M[I * naux + J] = v;
+              M[J * naux + I] = v;
+            }
+        }
+    }
+  return M;
+}
+
+/// Three-center Coulomb (mu nu | P) over generally-contracted orbital and
+/// auxiliary bases: row-major (mu, nu, P) tensor of size nao*nao*naux (PySCF
+/// cart=True normalization).
+template <class Real>
+std::vector<Real> coulomb_3c(const ContractedBasis<Real> &orb,
+                             const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+  const int nao = orb.nao, naux = aux.nao;
+  std::vector<Real> T(static_cast<std::size_t>(nao) * nao * naux, Real(0));
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  for (int Mi = 0; Mi < nso; ++Mi)
+    for (int Ni = 0; Ni <= Mi; ++Ni) {
+      const auto &SM = orb.shells[Mi], &SN = orb.shells[Ni];
+      const int nm = ncart(SM.l), nn = ncart(SN.l), nctM = SM.nctr(), nctN = SN.nctr();
+      for (int A = 0; A < nsa; ++A) {
+        const auto &SA = aux.shells[A];
+        const int nP = ncart(SA.l), nctA = SA.nctr();
+        // contracted block cblk[(cM*nm+km)][(cN*nn+kn)][(cA*nP+kP)]
+        const int dN = nctN * nn, dA = nctA * nP;
+        std::vector<Real> cblk(static_cast<std::size_t>(nctM) * nm * dN * dA, Real(0));
+        std::vector<Real> blk(static_cast<std::size_t>(nm) * nn * nP);
+        for (int pm = 0; pm < SM.nprim(); ++pm)
+          for (int pn = 0; pn < SN.nprim(); ++pn) {
+            auto bra = make_pair(detail::contracted_prim(SM, pm), detail::contracted_prim(SN, pn));
+            for (int pa = 0; pa < SA.nprim(); ++pa) {
+              auto ket = detail::ghost_pair(detail::contracted_prim(SA, pa));
+              eri_quartet(bra, ket, grid, blk.data());
+              for (int cM = 0; cM < nctM; ++cM) {
+                const Real wm = detail::effective_coeff(SM, cM, pm);
+                if (wm == Real(0)) continue;
+                for (int cN = 0; cN < nctN; ++cN) {
+                  const Real wmn = wm * detail::effective_coeff(SN, cN, pn);
+                  for (int cA = 0; cA < nctA; ++cA) {
+                    const Real w = wmn * detail::effective_coeff(SA, cA, pa);
+                    for (int km = 0; km < nm; ++km)
+                      for (int kn = 0; kn < nn; ++kn)
+                        for (int kP = 0; kP < nP; ++kP)
+                          cblk[(((static_cast<std::size_t>(cM) * nm + km) * dN + cN * nn + kn) * dA) +
+                               cA * nP + kP] += w * blk[(km * nn + kn) * nP + kP];
+                  }
+                }
+              }
+            }
+          }
+        const bool offdiag = (Mi != Ni);
+        for (int cM = 0; cM < nctM; ++cM)
+          for (int km = 0; km < nm; ++km) {
+            const std::size_t I = orb.ao_off[Mi] + static_cast<std::size_t>(cM) * nm + km;
+            for (int cN = 0; cN < nctN; ++cN)
+              for (int kn = 0; kn < nn; ++kn) {
+                const std::size_t Jn = orb.ao_off[Ni] + static_cast<std::size_t>(cN) * nn + kn;
+                for (int cA = 0; cA < nctA; ++cA)
+                  for (int kP = 0; kP < nP; ++kP) {
+                    const std::size_t P = aux.ao_off[A] + static_cast<std::size_t>(cA) * nP + kP;
+                    const Real v = cblk[(((static_cast<std::size_t>(cM) * nm + km) * dN + cN * nn + kn) * dA) +
+                                        cA * nP + kP];
+                    T[(I * nao + Jn) * naux + P] = v;
+                    if (offdiag) T[(Jn * nao + I) * naux + P] = v;
+                  }
+              }
+          }
       }
     }
   return T;

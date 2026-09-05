@@ -9,6 +9,7 @@
 #include "intti/contracted.hpp"
 #include "intti/fock.hpp"
 #include "intti/kernel.hpp"
+#include "intti/ncenter.hpp"
 #include "intti/normalization.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/oneel.hpp"
@@ -330,6 +331,76 @@ TEST(Contracted, SymmetricAndSized) {
     for (int j = 0; j < n; ++j)
       asym = std::max(asym, std::abs(S[i * n + j] - S[j * n + i]));
   EXPECT_LT(asym, 1e-14);
+}
+
+// A small contracted auxiliary basis (s + p, general contraction).
+ContractedBasis<double> aux_sp() {
+  ContractedShell<double> s;
+  s.center[0] = 0; s.center[1] = 0; s.center[2] = 0;
+  s.l = 0; s.alpha = {2.5, 1.0}; s.coeff = {0.6, 0.5};
+  ContractedShell<double> p;
+  p.center[0] = 0.3; p.center[1] = 0; p.center[2] = 0;
+  p.l = 1; p.alpha = {1.8, 0.9}; p.coeff = {0.55, 0.5};
+  return intti::make_contracted_basis<double>({s, p});
+}
+
+// Contracted 2-center Coulomb (P|Q) == C_aux (primitive (P|Q)) C_aux^T.
+TEST(Contracted, Coulomb2cVsDecontract) {
+  auto aux = aux_sp();
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  auto M = intti::coulomb_2c(aux, grid);
+  intti::ShellBasis<double> pb;
+  std::vector<double> C;
+  const int npao = decontract(aux, pb, C);
+  auto ref = conjugate(C, aux.nao, npao, intti::coulomb_2c(pb, grid));
+  ASSERT_EQ(M.size(), ref.size());
+  double worst = 0, scale = 0;
+  for (std::size_t i = 0; i < M.size(); ++i) {
+    worst = std::max(worst, std::abs(M[i] - ref[i]));
+    scale = std::max(scale, std::abs(ref[i]));
+  }
+  EXPECT_LT(worst, 1e-11 * scale) << "contracted (P|Q) != decontract/recontract";
+}
+
+// Contracted 3-center Coulomb (mu nu | P) == the C_orb x C_orb x C_aux transform
+// of the primitive (mu nu | P).
+TEST(Contracted, Coulomb3cVsDecontract) {
+  auto orb = aux_sp(); // s + p (orbital basis)
+  auto aux = aux_sp(); // s + p (auxiliary basis)
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  auto T = intti::coulomb_3c(orb, aux, grid);
+  const int no = orb.nao, na = aux.nao;
+  intti::ShellBasis<double> pbo, pba;
+  std::vector<double> Co, Ca;
+  const int npo = decontract(orb, pbo, Co); // Co: no x npo
+  const int npa = decontract(aux, pba, Ca); // Ca: na x npa
+  auto Tp = intti::coulomb_3c(pbo, pba, grid); // (npo, npo, npa)
+  // Tc[I][J][P] = sum_ijp Co[I][i] Co[J][j] Ca[P][p] Tp[i][j][p]
+  std::vector<double> ref((std::size_t)no * no * na, 0.0);
+  for (int I = 0; I < no; ++I)
+    for (int J = 0; J < no; ++J)
+      for (int P = 0; P < na; ++P) {
+        double s = 0;
+        for (int i = 0; i < npo; ++i) {
+          const double ci = Co[(std::size_t)I * npo + i];
+          if (ci == 0) continue;
+          for (int j = 0; j < npo; ++j) {
+            const double cij = ci * Co[(std::size_t)J * npo + j];
+            if (cij == 0) continue;
+            for (int p = 0; p < npa; ++p)
+              s += cij * Ca[(std::size_t)P * npa + p] *
+                   Tp[((std::size_t)i * npo + j) * npa + p];
+          }
+        }
+        ref[((std::size_t)I * no + J) * na + P] = s;
+      }
+  ASSERT_EQ(T.size(), ref.size());
+  double worst = 0, scale = 0;
+  for (std::size_t k = 0; k < T.size(); ++k) {
+    worst = std::max(worst, std::abs(T[k] - ref[k]));
+    scale = std::max(scale, std::abs(ref[k]));
+  }
+  EXPECT_LT(worst, 1e-11 * scale) << "contracted (mu nu|P) != decontract/recontract";
 }
 
 } // namespace

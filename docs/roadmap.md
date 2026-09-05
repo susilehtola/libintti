@@ -733,9 +733,18 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      once (shared-intermediate GC). J and K validated against the independent
      C (build(C^T D C)) C^T fused-engine references; suite 214/214. The native
      contracted Fock surface is now COMPLETE: S, T, V, J, K (+ multipoles).
-     Remaining: contracted-K screening (currently unscreened), n-center (RI)
-     contraction, and a PySCF cc-pVDZ cross-check of the whole native stack via
-     an intti_dump driver.
+     Contracted-K screening DONE (Schwarz x effective-density, 2026-09-05). RI
+     n-center DONE (2026-09-06, ncenter.hpp): contracted coulomb_2c ((P|Q)) and
+     coulomb_3c ((mu nu|P)) reuse the ghost-shell eri_quartet on each primitive
+     combination, accumulating it effective-coefficient-weighted into the
+     contracted block (each primitive quartet once, shared across contraction
+     indices). Validated vs decontract -> primitive -> recontract (C (P|Q)_prim
+     C^T; the C_orb x C_orb x C_aux transform of the primitive (mu nu|P)); suite
+     226/226. So the analytic contracted stack (Fock + RI n-center) is complete.
+     Remaining: a PySCF cc-pVDZ cross-check of the whole native stack via an
+     intti_dump driver (independent oracle; the transitive validation --
+     decontract/recontract composed with the PySCF-validated primitive engine --
+     already covers it, so this is a redundancy check).
 
   Note where we are AHEAD of SHARK and must not regress: range separation is a
   node-list (erf/erfc/Yukawa) with native position-dependent omega(r) for local
