@@ -38,6 +38,112 @@ template <class Real> struct PointCharge {
 
 namespace detail {
 
+/// Nuclear-attraction block of ONE primitive pair (sa, sb):
+///   acc[ka*ncb+kb] = sum_c weight_c <a_ka|1/|r-R_c||b_kb>,
+/// OVERWRITING acc (length ncart(sa.l)*ncart(sb.l)). tau > 0 enables the
+/// per-(pair,centre) decay screen; far_tau > 0 the FMM multipole far branch.
+/// The shared per-primitive-pair kernel of the primitive nuclear builder
+/// (attraction_accumulate) and the contracted one (contracted.hpp).
+template <class Real>
+void attraction_pair_block(const PrimitiveShell<Real> &sa,
+                           const PrimitiveShell<Real> &sb,
+                           const std::vector<PointCharge<Real>> &centers,
+                           const TGrid<Real> &grid, Real tau, Real far_tau,
+                           Real *acc) {
+  const int nt = grid.n();
+  const Real pi = pi_v<Real>();
+  const bool screen = tau > Real(0);
+  // FMM far-field: a centre well separated from the pair (p |P-c|^2 > far_cut)
+  // is a monopole seen through the exponent-free multipole tensor T_{tuv}(P-c);
+  // <a|1/r_c|b> = (pi/p)^{3/2} sum_tuv E^{ab}_tuv T_tuv, exact up to exp(-p R^2).
+  const bool far = far_tau > Real(0);
+  const Real far_cut = far ? -log_(far_tau) : Real(0);
+  const int la = sa.l, lb = sb.l, esz = (la + 1) * (lb + 1) * (la + lb + 1);
+  const Real p = sa.alpha + sb.alpha;
+  const Real mu = sa.alpha * sb.alpha / p;
+  Real Pd[3], expmu = 1;
+  std::vector<Real> E(static_cast<std::size_t>(3) * esz);
+  for (int d = 0; d < 3; ++d) {
+    Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
+    const Real ab = sa.center[d] - sb.center[d];
+    const Real Kd = exp_(-mu * ab * ab);
+    expmu *= Kd;
+    e_coeffs(la, lb, p, Pd[d] - sa.center[d], Pd[d] - sb.center[d], Kd,
+             E.data() + d * esz);
+  }
+  const Real pair_bound = (2 * pi / p) * expmu; // (2 pi/p) exp(-mu R_AB^2)
+  const int nca = ncart(la), ncb = ncart(lb);
+  for (int i = 0; i < nca * ncb; ++i) acc[i] = Real(0);
+  std::vector<Real> Bx(la + lb + 1), By(la + lb + 1), Bz(la + lb + 1), Tbuf;
+  const int n1 = la + lb + 1;
+  for (const auto &c : centers) {
+    Real d2 = 0;
+    if (screen || far)
+      for (int d = 0; d < 3; ++d)
+        d2 += (Pd[d] - c.R[d]) * (Pd[d] - c.R[d]);
+    if (screen) {
+      using std::sqrt;
+      const Real fb = d2 * p > Real(1) ? Real(0.5) * sqrt(pi / (p * d2)) : Real(1);
+      if (std::abs(c.weight) * pair_bound * fb < tau) continue;
+    }
+    if (far && p * d2 > far_cut) {
+      // multipole far branch: T_{tuv}(P - c), monopole charge (no ket sign)
+      const Real X[3] = {Pd[0] - c.R[0], Pd[1] - c.R[1], Pd[2] - c.R[2]};
+      const int Dt = la + lb + 1;
+      Tbuf.assign(static_cast<std::size_t>(Dt) * Dt * Dt, Real(0));
+      multipole_tensor(la + lb, X, Tbuf.data());
+      const Real pop = pi / p;
+      const Real wpref = c.weight * pop * sqrt_(pop); // (pi/p)^{3/2}
+      for (int ka = 0; ka < nca; ++ka) {
+        int a3[3];
+        cart_comp(la, ka, a3[0], a3[1], a3[2]);
+        for (int kb = 0; kb < ncb; ++kb) {
+          int b3[3];
+          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+          const Real *Ex = E.data() + 0 * esz + (a3[0] * (lb + 1) + b3[0]) * n1;
+          const Real *Ey = E.data() + 1 * esz + (a3[1] * (lb + 1) + b3[1]) * n1;
+          const Real *Ez = E.data() + 2 * esz + (a3[2] * (lb + 1) + b3[2]) * n1;
+          Real s = 0;
+          for (int tx = 0; tx <= a3[0] + b3[0]; ++tx)
+            for (int ty = 0; ty <= a3[1] + b3[1]; ++ty)
+              for (int tz = 0; tz <= a3[2] + b3[2]; ++tz)
+                s += Ex[tx] * Ey[ty] * Ez[tz] * Tbuf[(tx * Dt + ty) * Dt + tz];
+          acc[ka * ncb + kb] += wpref * s;
+        }
+      }
+      continue;
+    }
+    for (int it = 0; it < nt; ++it) {
+      const Real t = grid.t[it];
+      const Real denom = p + t * t;
+      const Real theta = p * t * t / denom;
+      const Real pref = sqrt_(pi / denom);
+      hermite_b(la + lb, theta, Pd[0] - c.R[0], Bx.data());
+      hermite_b(la + lb, theta, Pd[1] - c.R[1], By.data());
+      hermite_b(la + lb, theta, Pd[2] - c.R[2], Bz.data());
+      const Real wt = grid.w[it] * c.weight;
+      for (int ka = 0; ka < nca; ++ka) {
+        int a3[3];
+        cart_comp(la, ka, a3[0], a3[1], a3[2]);
+        for (int kb = 0; kb < ncb; ++kb) {
+          int b3[3];
+          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+          auto gd = [&](int d, const Real *B) {
+            const Real *Ed = E.data() + d * esz +
+                             (a3[d] * (lb + 1) + b3[d]) * (la + lb + 1);
+            Real s = 0;
+            for (int tau_ = 0; tau_ <= a3[d] + b3[d]; ++tau_)
+              s += Ed[tau_] * B[tau_];
+            return pref * s;
+          };
+          acc[ka * ncb + kb] += wt * gd(0, Bx.data()) * gd(1, By.data()) *
+                                gd(2, Bz.data());
+        }
+      }
+    }
+  }
+}
+
 /// Accumulate sum_c weight_c <a|1/|r-R_c||b> into V (nao x nao, row-major).
 /// tau > 0 enables a per-(pair,centre) Schwarz/decay screen.
 template <class Real>
@@ -46,104 +152,14 @@ void attraction_accumulate(const ShellBasis<Real> &basis,
                            const TGrid<Real> &grid, Real tau, Real *V,
                            Real far_tau = Real(0)) {
   const int nao = basis.nao;
-  const int nt = grid.n();
-  const Real pi = pi_v<Real>();
   const int ns = static_cast<int>(basis.shells.size());
-  const bool screen = tau > Real(0);
-  // FMM far-field: a centre well separated from the pair (p |P-c|^2 > far_cut)
-  // is a monopole seen through the exponent-free multipole tensor T_{tuv}(P-c);
-  // <a|1/r_c|b> = (pi/p)^{3/2} sum_tuv E^{ab}_tuv T_tuv, exact up to exp(-p R^2).
-  const bool far = far_tau > Real(0);
-  const Real far_cut = far ? -log_(far_tau) : Real(0);
-  std::vector<Real> Tbuf;
+  std::vector<Real> acc;
   for (int a = 0; a < ns; ++a)
     for (int b = 0; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
-      const int la = sa.l, lb = sb.l, esz = (la + 1) * (lb + 1) * (la + lb + 1);
-      const Real p = sa.alpha + sb.alpha;
-      const Real mu = sa.alpha * sb.alpha / p;
-      Real Pd[3], expmu = 1;
-      std::vector<Real> E(static_cast<std::size_t>(3) * esz);
-      for (int d = 0; d < 3; ++d) {
-        Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
-        const Real ab = sa.center[d] - sb.center[d];
-        const Real Kd = exp_(-mu * ab * ab);
-        expmu *= Kd;
-        e_coeffs(la, lb, p, Pd[d] - sa.center[d], Pd[d] - sb.center[d], Kd,
-                 E.data() + d * esz);
-      }
-      const Real pair_bound = (2 * pi / p) * expmu; // (2 pi/p) exp(-mu R_AB^2)
-      // per-component accumulation buffer
-      const int nca = ncart(la), ncb = ncart(lb);
-      std::vector<Real> acc(static_cast<std::size_t>(nca) * ncb, Real(0));
-      std::vector<Real> Bx(la + lb + 1), By(la + lb + 1), Bz(la + lb + 1);
-      const int n1 = la + lb + 1;
-      for (const auto &c : centers) {
-        Real d2 = 0;
-        if (screen || far)
-          for (int d = 0; d < 3; ++d)
-            d2 += (Pd[d] - c.R[d]) * (Pd[d] - c.R[d]);
-        if (screen) {
-          using std::sqrt;
-          const Real fb = d2 * p > Real(1) ? Real(0.5) * sqrt(pi / (p * d2)) : Real(1);
-          if (std::abs(c.weight) * pair_bound * fb < tau) continue;
-        }
-        if (far && p * d2 > far_cut) {
-          // multipole far branch: T_{tuv}(P - c), monopole charge (no ket sign)
-          const Real X[3] = {Pd[0] - c.R[0], Pd[1] - c.R[1], Pd[2] - c.R[2]};
-          const int Dt = la + lb + 1;
-          Tbuf.assign(static_cast<std::size_t>(Dt) * Dt * Dt, Real(0));
-          multipole_tensor(la + lb, X, Tbuf.data());
-          const Real pop = pi / p;
-          const Real wpref = c.weight * pop * sqrt_(pop); // (pi/p)^{3/2}
-          for (int ka = 0; ka < nca; ++ka) {
-            int a3[3];
-            cart_comp(la, ka, a3[0], a3[1], a3[2]);
-            for (int kb = 0; kb < ncb; ++kb) {
-              int b3[3];
-              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-              const Real *Ex = E.data() + 0 * esz + (a3[0] * (lb + 1) + b3[0]) * n1;
-              const Real *Ey = E.data() + 1 * esz + (a3[1] * (lb + 1) + b3[1]) * n1;
-              const Real *Ez = E.data() + 2 * esz + (a3[2] * (lb + 1) + b3[2]) * n1;
-              Real s = 0;
-              for (int tx = 0; tx <= a3[0] + b3[0]; ++tx)
-                for (int ty = 0; ty <= a3[1] + b3[1]; ++ty)
-                  for (int tz = 0; tz <= a3[2] + b3[2]; ++tz)
-                    s += Ex[tx] * Ey[ty] * Ez[tz] * Tbuf[(tx * Dt + ty) * Dt + tz];
-              acc[ka * ncb + kb] += wpref * s;
-            }
-          }
-          continue;
-        }
-        for (int it = 0; it < nt; ++it) {
-          const Real t = grid.t[it];
-          const Real denom = p + t * t;
-          const Real theta = p * t * t / denom;
-          const Real pref = sqrt_(pi / denom);
-          hermite_b(la + lb, theta, Pd[0] - c.R[0], Bx.data());
-          hermite_b(la + lb, theta, Pd[1] - c.R[1], By.data());
-          hermite_b(la + lb, theta, Pd[2] - c.R[2], Bz.data());
-          const Real wt = grid.w[it] * c.weight;
-          for (int ka = 0; ka < nca; ++ka) {
-            int a3[3];
-            cart_comp(la, ka, a3[0], a3[1], a3[2]);
-            for (int kb = 0; kb < ncb; ++kb) {
-              int b3[3];
-              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-              auto gd = [&](int d, const Real *B) {
-                const Real *Ed = E.data() + d * esz +
-                                 (a3[d] * (lb + 1) + b3[d]) * (la + lb + 1);
-                Real s = 0;
-                for (int tau_ = 0; tau_ <= a3[d] + b3[d]; ++tau_)
-                  s += Ed[tau_] * B[tau_];
-                return pref * s;
-              };
-              acc[ka * ncb + kb] += wt * gd(0, Bx.data()) * gd(1, By.data()) *
-                                    gd(2, Bz.data());
-            }
-          }
-        }
-      }
+      const int nca = ncart(sa.l), ncb = ncart(sb.l);
+      acc.assign(static_cast<std::size_t>(nca) * ncb, Real(0));
+      attraction_pair_block(sa, sb, centers, grid, tau, far_tau, acc.data());
       for (int ka = 0; ka < nca; ++ka)
         for (int kb = 0; kb < ncb; ++kb)
           V[(basis.ao_off[a] + ka) * nao + basis.ao_off[b] + kb] +=

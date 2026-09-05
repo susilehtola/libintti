@@ -8,8 +8,11 @@
 
 #include "intti/contracted.hpp"
 #include "intti/fock.hpp"
+#include "intti/kernel.hpp"
 #include "intti/normalization.hpp"
+#include "intti/nuclear.hpp"
 #include "intti/oneel.hpp"
+#include "intti/tgrid.hpp"
 
 // Contraction-aware 1e builders (M-SHARK #5): validated with (a) an independent
 // closed-form contracted-Gaussian overlap and (b) a decontract -> primitive ->
@@ -167,6 +170,24 @@ TEST(Contracted, MultipoleVsDecontractRecontract) {
     }
     EXPECT_LT(worst, 1e-12 * scale + 1e-14) << "multipole component " << ci;
   }
+}
+
+TEST(Contracted, NuclearVsDecontractRecontract) {
+  auto cb = test_basis();
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  std::vector<intti::PointCharge<double>> charges = {
+      {-3.0, {0.0, 0.0, 0.0}}, {-1.0, {0.0, 0.0, 1.3}}};
+  auto V = intti::nuclear_matrix(cb, charges, grid);
+  auto ref = contract_ref(cb, [&](const intti::ShellBasis<double> &b) {
+    return intti::nuclear_matrix(b, charges, grid);
+  });
+  ASSERT_EQ(V.size(), ref.size());
+  double worst = 0, scale = 0;
+  for (std::size_t i = 0; i < V.size(); ++i) {
+    worst = std::max(worst, std::abs(V[i] - ref[i]));
+    scale = std::max(scale, std::abs(ref[i]));
+  }
+  EXPECT_LT(worst, 1e-11 * scale) << "contracted nuclear != decontract/recontract";
 }
 
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum

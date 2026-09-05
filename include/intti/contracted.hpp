@@ -33,7 +33,9 @@
 
 #include "gto.hpp"
 #include "normalization.hpp"
+#include "nuclear.hpp"    // detail::attraction_pair_block, PointCharge
 #include "oneel.hpp" // detail::overlap_1d / kinetic_1d / multipole_1d, pair_gauss_prefactor
+#include "tgrid.hpp"
 
 namespace intti {
 
@@ -281,6 +283,23 @@ std::vector<std::vector<Real>> multipole_matrices(const ContractedBasis<Real> &b
           }
         }
       });
+}
+
+/// Nuclear-attraction matrix V_ab = sum_c weight_c <a|1/|r-R_c||b> over a
+/// generally-contracted basis (PySCF cart=True normalization; pass charges with
+/// weight = -Z, e.g. via nuclei_as_charges, to match int1e_nuc). far_tau > 0
+/// enables the FMM far branch; tau screens contracted primitive pairs.
+template <class Real>
+std::vector<Real> nuclear_matrix(const ContractedBasis<Real> &basis,
+                                 const std::vector<PointCharge<Real>> &charges,
+                                 const TGrid<Real> &grid, Real tau = Real(0),
+                                 Real far_tau = Real(0)) {
+  auto out = detail::contracted_1e_multi(
+      basis, 1, +1, tau,
+      [&](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        detail::attraction_pair_block(sa, sb, charges, grid, Real(0), far_tau, o);
+      });
+  return std::move(out[0]);
 }
 
 } // namespace intti
