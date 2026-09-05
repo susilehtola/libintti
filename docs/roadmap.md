@@ -1319,8 +1319,67 @@ primitive basis + density. Result (4 s-AOs, two centres, hp grid 56 nodes/axis):
 the full J matrix matches element-by-element, worst rel error 2.4e-4 -- with NO
 auxiliary fit and NO (P|Q)^{-1} metric inversion, just density-on-grid + DAGE.
 So the FE route reproduces the molecular Coulomb matrix, confirming grid-RI end
-to end. Next: co-density K the same way; p+ shells (the x^l factors on the grid);
-then library-ize as a grid-RI J/K builder and benchmark vs GTO-RI.
+to end.
+GRID-RI K (co-density exchange) PROTOTYPED (prototype/fe_gridri_k.cpp,
+2026-09-05): K_uv = sum_i (ui|vi) via co-densities g_vi = chi_v phi_i -- for each
+occupied orbital i (columns of M, D = M M^T), form g_vi on the grid, DAGE ->
+V_vi, contract K_uv = sum_i <g_ui | V_vi>. Validated vs the exact GTO
+exchange_build (4 s-AOs, rank-1 D, hp grid 32 nodes/axis): the K matrix matches
+element-by-element, worst rel error 6.4e-3 (coarse grid; improves with
+refinement). So BOTH grid-RI J and K reproduce the exact GTO Fock matrices via
+density-on-grid + DAGE. Next: p+ shells (the x^l factors / real solid harmonics
+on the grid); then library-ize as a grid-RI J/K builder and benchmark vs GTO-RI.
+
+**NUMERICAL STABILITY -- grid-RI evaluates in the contracted/orthonormal AO
+basis, avoiding the contraction cancellation** (user, 2026-09-05). The analytic
+route's transform (ij|kl) = sum C_ai C_bj C_ck C_dl (ab|cd) sums HUGE primitive
+integrals (tight-Gaussian normalizations) against SIGN-ALTERNATING contraction
+coefficients (near-orthogonal contracted functions / small overlap eigenvalues),
+so a small result is formed by catastrophic cancellation of large terms -- the
+ANO / near-linear-dependence pathology, worse the higher the linear dependence.
+The grid route mitigates this structurally: it NEVER forms the huge primitive
+integrals. It evaluates the contracted AO VALUE pointwise, chi_i(r) = sum_p C_pi
+g_p(r) -- a sum of modest FUNCTION VALUES, not of huge 4-index integrals -- and
+integrates the O(1) products on the grid. The cancellation moves from "huge
+integrals" to "function values," far better conditioned. Since any transform is
+free pointwise (the c2s/contraction-free property above), the natural extension
+is to evaluate DIRECTLY in the ORTHONORMAL AO basis (Lowdin / natural orbitals)
+on the grid, where the density's small-eigenvalue directions are handled stably
+-- grid-RI is the natural home for stable orthonormal-basis integral evaluation.
+(Honest caveat: pointwise chi_i still sums C_pi g_p(r) with primitive
+normalizations, so near-nucleus cancellation is reduced, not zero -- but it is
+the cancellation of a well-defined function value, and libintti's arbitrary
+precision can be applied cheaply to the local AO evaluation if needed.)
+
+**SPHERICAL AOs ON THE GRID -- c2s is free** (user, 2026-09-05). Spherical AOs
+are handled in the ANALYTIC route via c2s.hpp (c2s_matrix), normalization.hpp
+(sph_rescale) and the cint facade (build_sph_transform, int2e_sph) -- Cartesian
+integrals contracted with the c2s matrix. The GRID route needs none of that: a
+spherical AO is R_lm(x,y,z) e^{-alpha r^2} with R_lm a real solid harmonic
+(homogeneous degree-l polynomial), so it is evaluated DIRECTLY at the grid
+points -- the c2s "transform" is absorbed into pointwise AO evaluation, no matrix
+contraction. Consequences: (i) grid-RI works in the compact 2l+1 space (vs ncart:
+5 vs 6 for d, 7 vs 10 for f, 9 vs 15 for g) -> fewer co-densities/contractions;
+(ii) evaluating the PURE solid harmonic never introduces the Cartesian
+contaminant (the s in d-cart, p in f-...) that the analytic route forms and then
+projects out; (iii) grid-RI is AO-representation-agnostic -- Cartesian,
+spherical, or any contracted combination plugs into the SAME DAGE machinery,
+needing only a pointwise evaluator, whereas the analytic route needs a bespoke
+transform per representation. (For the analytic GTO-RI / coulomb_build route, c2s
+stays a matrix contraction -- the grid advantage is specific to grid-RI.) So the
+grid-RI AO evaluator should take real solid harmonics directly for l>=1.
+The SAME mechanism makes CONTRACTION free (user, 2026-09-05): a contracted AO
+chi_u = sum_p d_p g_p is evaluated pointwise as a single value, so on the grid
+the density / co-densities are built from the CONTRACTED AOs directly -- the grid
+cost scales with the number of final AOs (nao), NOT the primitive count (nprim)
+or the Cartesian count. Pointwise evaluation absorbs BOTH the c2s transform AND
+the contraction; the grid route is agnostic to HOW the AO is built (Cartesian or
+spherical, primitive or generally contracted) and only needs its value. This is
+a large win exactly where the analytic engine works hardest -- generally-
+contracted / ANO bases with nprim >> nao -- where the analytic route (even the
+shared-intermediate M-SHARK #5 path) still touches every primitive, while the
+grid route touches only the nao contracted AO values per point. Grid-RI is thus
+the natural home for heavily-contracted and spherical bases.
 GPU note (user Q, 2026-09-05): hp variation is NOT a load-balancing problem for
 the tensorial DAGE and is arguably good. The DAGE parallelism is over lines
 (N^2/axis) + t-nodes, and in a TENSOR-PRODUCT grid every line along an axis uses
