@@ -1412,10 +1412,26 @@ coefficient via a flattened (alpha, ec) primitive pool), and
 detail::ao_on_grid_spherical_dev evaluates the Cartesian AOs on device then
 applies the block-diagonal c2s as a device parallel_for (flattened
 (coeff, cart-index) pool). Validated: all grid-RI CI tests pass (226/226), device
-AO eval matches the host evaluators. Next: benchmark vs GTO-RI; validate on real
-GPU hardware (blocked on this Intel box). (CI note: the grid-RI tests use the
+AO eval matches the host evaluators. (CI note: the grid-RI tests use the
 OpenMP Kokkos backend, so ctest -j oversubscribes -- individual grid-RI tests
 are <= ~8s.)
+BENCHMARK vs the analytic engine (prototype/gridri_bench.cpp, 2026-09-06, OpenMP
+CPU): a line of atoms, each an s+p shell. Result (nao, gridN/axis, ratio
+grid/analytic, grid-RI rel err):
+  nat=1: nao=4,  N=20, J 327x, K 605x,  rel ~3e-3
+  nat=2: nao=8,  N=38, J 2447x, K 5429x, rel ~2e-3
+So on CPU grid-RI is 10^2-10^3x SLOWER than the screened analytic engine at these
+sizes, and the gap WIDENS with system size -- because the grid N grows with the
+molecule's spatial extent (20->38/axis) so the N^3 DAGE dominates, while the
+analytic per-quartet work is cheap and screened. Honest conclusion: grid-RI is
+NOT a CPU replacement for the analytic engine on ordinary molecules. Its value is
+(a) GPU (the N^3 work is massively parallel, all-lines-identical -- the code is
+now fully device-native), (b) high / arbitrary-precision (spectral hp
+convergence, where the analytic tail truncation or a Becke grid would plateau),
+and (c) regimes where the analytic formal cost bites (very high l, heavy /
+general contraction: grid cost is nao-linear in the AO, not nprim^4). The two
+pillars are complementary, as positioned. Next: real-GPU validation (blocked on
+this Intel box; code is backend-portable) to test claim (a); local hybrids (M14).
 DFT / local-hybrid scope decision (2026-09-06): xc quadrature reuses the grid-RI
 FE substrate (AO-on-grid + contraction) with libxc (MPL-2.0, compatible) as an
 OPTIONAL pointwise v_xc callback -- the core stays a dependency-free integrals
