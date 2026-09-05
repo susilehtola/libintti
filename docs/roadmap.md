@@ -1303,8 +1303,16 @@ two-Gaussian density on the hp grid matches the analytic double-sum oracle to
 1.95e-5 -- the hp mesh drives a correct DAGE end to end. (The DOF win is
 quantified at construction level above; a DAGE-level uniform comparison is
 impractical host-serial precisely because the uniform reference needs so many
-points -- which IS the hp advantage.) Next: library-ize the variable-order FE
-grid + the grid constructor, then grid-RI J/K on molecules.
+points -- which IS the hp advantage.)
+LIBRARY-IZED (fegrid.hpp, 2026-09-05): FEGrid1D generalized to per-element order
+(nps/noff + per-element ref nodes/bary weights); make_fegrid1d(ne,np,L) is now
+the uniform special case (byte-identical, existing tests pass) built via
+detail::make_fegrid1d_elements; and make_fegrid1d_hp(gaussians, eps, pmin, pmax)
+is the per-axis grid constructor (domain to amplitude eps, seed at centres, hp-
+refine). fe_conv1d/fe_dage3d/fe_inner consume variable order unchanged. CI:
+HpGridResolvesGaussian + HpDageCoulombSmoke (suite 217/217). Next: grid-RI J/K
+on a molecule -- build the molecular density on the hp grid, DAGE -> V, contract
+J = <pq|V> (and co-density K), compared to the GTO-RI path (ncenter/ri.hpp).
 GPU note (user Q, 2026-09-05): hp variation is NOT a load-balancing problem for
 the tensorial DAGE and is arguably good. The DAGE parallelism is over lines
 (N^2/axis) + t-nodes, and in a TENSOR-PRODUCT grid every line along an axis uses
