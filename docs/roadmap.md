@@ -996,6 +996,36 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
   Conclusion: the flag stays K-only; every other builder either already has its
   symmetry or gains it deterministically (2c/3c) -- "Symmetry::Full everywhere"
   would be no-ops or determinism-losing regressions elsewhere.
+- **GPU-memory tiling -- graceful degradation when the problem exceeds device
+  memory (2026-09-05).** GPUs are the main target, so builds must tile when the
+  working set does not fit. Fock builds are LINEAR, so an output tile is exact:
+  K = sum of output tiles, no approximation. This is the capacity axis; it is
+  ORTHOGONAL to the occupancy caveat (per-work-item local footprint of the
+  Sym8/deterministic kernels), which needs a team-scratch refactor and real GPU
+  hardware to tune -- tiling does not fix occupancy and vice versa.
+  * **exchange_build_tiled** DONE: computes K one output shell-row tile at a time
+    (tile_shells output shells/tile), bounding the device K allocation to
+    (tile rows) x nao instead of nao^2. Reuses the deterministic kernel body via
+    an output-range + tiled-output parameter (untiled path byte-for-byte
+    unchanged); the tiled path drops the K_ab=K_ba mirror for bounded,
+    tile-invariant memory. Correctness = tile-invariance: the result is
+    BIT-IDENTICAL across tile sizes (each element computed independently), tested
+    for tile_shells in {1,2,3,5}, and equals the untiled build to rounding. This
+    is the reusable pattern + the CPU-validatable proof methodology.
+  * **coulomb_build (J)** -- NEXT, same output-tiling pattern: keep phase-1 dq
+    (full ket Hermite density) shared, loop bra-pair output tiles for phases 2/3
+    with tile-local Hermite/prod offsets, dropping jp/Jv to tile size (~2x, the
+    output half; dq/Dv stay full). A real 3-phase restructure + far-field range
+    handling; modest gain. tc_gradu_grad_build is the same shape.
+  * **RI 3-index tensor (mu nu|P), nao^2 x naux** -- HIGHEST-VALUE target: by far
+    the largest object, and the real "too big for memory" case. But it is
+    currently a materialised host std::vector consumed whole by ri.hpp, so
+    tiling it is a PIPELINE change (stream P-blocks / mu nu-tiles through the fit
+    and J/K contraction), not a single-kernel edit. Do this for the RI path when
+    large-system RI is targeted.
+  * Only the output/K axis is tiled so far; D (density) and the pair E-tables are
+    still resident. Density streaming + E-table tiling are the further axes for
+    truly out-of-core problems.
 - **cholesky.hpp:256-260 rank update as scalar AXPYs** (O(naux^2 nprod)) -- really
   a GEMV/GEMM against the accumulated L block; float/double dispatch, scalar
   fallback for extended precision.
