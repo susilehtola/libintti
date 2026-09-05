@@ -1080,6 +1080,18 @@ psi <- -2 G_kappa V psi (the previously efficiency-gated M-HK capstone) is now
 an ASSEMBLY of these validated operators + convergence control (the cusped 1/r
 potential needs near-nucleus FE refinement / bubbles for accuracy).
 
+**Grid Helmholtz SOLVER STEP validated** (prototype/fe_helmholtz_solver.cpp,
+2026-09-05): the fixed-point identity psi = -2 G_kappa(V psi) for an EXACT
+eigenpair -- decisive test needing no SCF convergence control. On a shifted
+harmonic well V=2a^2 r^2 - C (smooth, no cusp; exact ground state e^{-a r^2},
+eps=3a-C<0), one grid Green's-function step (grid V-multiply + Yukawa-DAGE
+apply, psi_new = -(1/2pi) YukawaDAGE(V psi)) reproduces the exact eigenfunction
+to rel 1.2e-6 at 6 elem x deg 8 (N=54/axis). So the SOLVER core operator is
+correct; the full real-space SCF is now the iteration assembly (energy update
+e.g. Rayleigh/GF-power + damping/DIIS + near-nucleus refinement for cusped
+potentials), validated against a GTO-basis diagonalization reference. The M-HK
+capstone is unblocked: all its grid operators are built and validated.
+
 **Step-3 (3D t-adapted DAGE) PROTOTYPED** (prototype/fe_dage3d.cpp, 2026-09-05):
 the Coulomb potential of a GENERAL 3D density on the tensorial FE grid,
 V(r1) = sum_t w_t int rho(r2) e^{-t^2|r1-r2|^2} dr2, done as three successive 1D
