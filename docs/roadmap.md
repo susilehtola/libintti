@@ -1416,22 +1416,28 @@ AO eval matches the host evaluators. (CI note: the grid-RI tests use the
 OpenMP Kokkos backend, so ctest -j oversubscribes -- individual grid-RI tests
 are <= ~8s.)
 BENCHMARK vs the analytic engine (prototype/gridri_bench.cpp, 2026-09-06, OpenMP
-CPU): a line of atoms, each an s+p shell. Result (nao, gridN/axis, ratio
-grid/analytic, grid-RI rel err):
-  nat=1: nao=4,  N=20, J 327x, K 605x,  rel ~3e-3
-  nat=2: nao=8,  N=38, J 2447x, K 5429x, rel ~2e-3
-So on CPU grid-RI is 10^2-10^3x SLOWER than the screened analytic engine at these
-sizes, and the gap WIDENS with system size -- because the grid N grows with the
-molecule's spatial extent (20->38/axis) so the N^3 DAGE dominates, while the
-analytic per-quartet work is cheap and screened. Honest conclusion: grid-RI is
-NOT a CPU replacement for the analytic engine on ordinary molecules. Its value is
-(a) GPU (the N^3 work is massively parallel, all-lines-identical -- the code is
-now fully device-native), (b) high / arbitrary-precision (spectral hp
-convergence, where the analytic tail truncation or a Becke grid would plateau),
-and (c) regimes where the analytic formal cost bites (very high l, heavy /
-general contraction: grid cost is nao-linear in the AO, not nprim^4). The two
-pillars are complementary, as positioned. Next: real-GPU validation (blocked on
-this Intel box; code is backend-portable) to test claim (a); local hybrids (M14).
+CPU). The AXIS matters (user point): growing the MOLECULE grows the grid, hiding
+the RI advantage; the regime where RI wins is FIXED geometry + RICH basis, where
+the AO product space is massively linearly dependent and the analytic high-l cost
+explodes while the grid (set by the molecule's extent + exponent range) barely
+grows. Fixed 2-atom geometry, growing angular momentum (l = 0..3, two exponents
+per l), J only (nao, gridN, ratio grid/analytic):
+  maxl=0: nao=4,  N=36, 3275x    maxl=2: nao=40, N=60, 205x
+  maxl=1: nao=16, N=48, 1153x    maxl=3(f): nao=80, N=78, 85x
+So on the RIGHT axis the gap COLLAPSES: analytic J grows ~680x (0.0009->0.61s,
+the high-l quartet cost) while grid-RI grows ~18x (2.87->52.5s), the ratio
+dropping 3275->85, ~x3-4 per l-level. Extrapolating, the crossover is a few
+levels further (g/h, or full aug-diffuse augmentation + more atoms -- the
+aug-cc-pVTZ regime), and this is STILL on CPU; a GPU drops grid-RI's absolute
+time and moves the crossover much earlier. (An earlier run grew the molecule --
+the WRONG axis -- and saw the gap widen; that measured grid growth, not the RI
+regime.) grid-RI's value, confirmed by the trend: (a) rich / linearly-dependent
+bases (grid cost ~independent of the product-space redundancy; no (P|Q)^{-1}
+metric to regularise), (b) GPU (the N^3 work is massively parallel, all-lines-
+identical -- now fully device-native), (c) high / arbitrary precision (spectral
+hp convergence). Complementary to the analytic engine, which wins for small /
+modest bases on CPU. Next: real-GPU validation (blocked on this Intel box); a
+richer sweep toward the crossover; local hybrids (M14).
 DFT / local-hybrid scope decision (2026-09-06): xc quadrature reuses the grid-RI
 FE substrate (AO-on-grid + contraction) with libxc (MPL-2.0, compatible) as an
 OPTIONAL pointwise v_xc callback -- the core stays a dependency-free integrals
