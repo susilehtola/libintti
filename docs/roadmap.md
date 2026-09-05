@@ -1256,6 +1256,38 @@ the near-nucleus refinement / bubbles + multipole-far items above, and the
 efficient bridge between the RI pillar (ncenter/ri.hpp) and the FE pillar
 (fegrid.hpp).
 
+**GRID CONSTRUCTION -- tensorial per-axis hp-adaptive mesh** (user, 2026-09-05).
+Adaptive FEM suffices and converges rapidly BECAUSE the product set {chi_p chi_q}
+is massively linearly dependent (rank ~O(nao) vs O(nao^2) products), so resolving
+the PRIMITIVES resolves the whole product span -- convergence is set by the
+primitives, not the products. The cost worry is answered by the tensorial +
+separable structure: a Cartesian-product grid, and a Gaussian primitive
+factorizes per axis (exp(-a((x-X)^2+(y-Y)^2+(z-Z)^2)) = product of 1D Gaussians),
+so building the grid REDUCES TO THREE INDEPENDENT 1D PROBLEMS -- on each axis,
+place nodes so every 1D Gaussian {exp(-a (x-X)^2)} that appears (all (a, X_axis))
+is resolved to tolerance. O(nprim) 1D work, trivially fast, and it is EXACTLY the
+per-axis structure DAGE needs (kernel factorizes -> 1D convolutions), so the
+tensorial choice serves construction AND operator. hp-adaptive in the Gaussian
+case: a 1D Gaussian is entire, so barycentric-Lagrange interpolation on an
+element converges EXPONENTIALLY in the order p (spectral) -- the optimal 1D mesh
+is few elements at high p, chosen (h = element sizes around each centre/width,
+p = order) so each primitive is resolved with minimal DOFs; a classic, cheap 1D
+hp-mesh design solvable greedily per axis. Honest cost caveat: the tensor product
+of three fine 1D meshes creates fine cells across the whole (x-planes)x(y-planes)
+x(z-planes) lattice, including "phantom" fine cells far from any atom -- the known
+tensorial-vs-atom-centred overhead -- but DAGE's per-line 1D convolutions and the
+element-pair screening (clamped v-range) make even a large tensor grid affordable.
+SLATER densities (STOs): non-separable (r couples axes) and cusped, but the
+library's STO route already writes exp(-zeta r) as the Gaussian integral
+transform + delta-tail correction; each e^{-t^2 r^2} component IS separable, so
+the tensorial 1D construction applies per t-node (the Slater becomes a t-
+superposition of separable Gaussians), and the cusp is captured by the analytic
+delta-tail correction rather than the grid -- the same trick already used for STO
+integrals. So both GTO and STO grid construction stay 1D Gaussian-resolution
+problems. Concrete next prototype: a per-axis 1D hp-mesh generator over a set of
+(exponent, centre) 1D Gaussians to a target accuracy, feeding make_fegrid1d /
+fe_dage3d.
+
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
 A project-wide audit for loops whose cost scales with system size and could be
