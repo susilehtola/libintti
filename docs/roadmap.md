@@ -1109,6 +1109,25 @@ apparent divergence was a SIGN error in the Kalos/BSH energy update
 is demonstrated end to end on the grid; production robustness (finer grids,
 KAIN/Anderson acceleration) is a driver/application concern, not libintti's.
 
+**LIBRARY-IZATION started -- include/intti/fegrid.hpp** (2026-09-05): the first
+FE-engine library header, promoting the validated prototype machinery to
+templated, CI-tested code. Contents: `FEGrid1D<Real>` + `make_fegrid1d(ne,np,L)`
+(the tensorial FE grid -- ne elements x np Gauss-Legendre nodes per axis,
+barycentric-Lagrange local polynomials), `detail::fe_conv1d` (the t-adapted 1D
+convolution -- the core operator), `fe_dage3d(grid, tgrid, rho, nv, vmax)` (the
+general-density DAGE Coulomb/Yukawa potential, kernel selected by the TGrid so
+`make_tgrid(coulomb())` gives 1/r and `make_tgrid(yukawa(kappa))` the Helmholtz
+apply), and `fe_inner` (grid inner product). Matrix/grid-level only, no per-
+quartet surface. CI tests (tests/test_fegrid.cpp, ~1.8s, suite 206/206): grid
+quadrature exactness (1e-9), the t-adapted 1D convolution vs the analytic
+Gaussian-Gaussian convolution across t in {0.5..128} (1e-6, confirming t-
+uniformity), and a tiny 3D DAGE Coulomb self-energy smoke test (5e-2 at a small
+grid). Tight accuracy + spectral convergence stay in the prototypes (too slow
+host-serial for CI). This first version is host (serial); the tensor-at-a-time
+API is shaped for a later Kokkos/GPU port (team-scratch over lines). Next:
+promote the element-pair (pq|rs) / co-density K paths, wire the operators to the
+ShellBasis matrix API, and Kokkos-ize.
+
 **Step-3 (3D t-adapted DAGE) PROTOTYPED** (prototype/fe_dage3d.cpp, 2026-09-05):
 the Coulomb potential of a GENERAL 3D density on the tensorial FE grid,
 V(r1) = sum_t w_t int rho(r2) e^{-t^2|r1-r2|^2} dr2, done as three successive 1D
