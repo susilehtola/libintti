@@ -1295,8 +1295,28 @@ seeded at the atom centres. On a deliberately stiff set (24 Gaussians, exponents
 worst error 9.9e-9, versus 45856 DOFs for the uniform-order/uniform-element mesh
 of equal accuracy -- 75x fewer DOFs, confirming the hp/tensorial construction is
 both cheap (a 1D problem) and dramatically more compact than a uniform grid.
-Next: drive fe_dage3d from this per-axis mesh (variable order per element), then
-library-ize as the grid constructor.
+VARIABLE-ORDER DAGE PROTOTYPED (prototype/fe_hp_dage.cpp, 2026-09-05): a VGrid1D
+carrying a distinct GL order per element, with the t-adapted 1D convolution and
+3D DAGE generalized to it (the uniform FEGrid1D cannot express variable order),
+driven by the hp mesh. Validated: the Coulomb self-energy of a non-separable
+two-Gaussian density on the hp grid matches the analytic double-sum oracle to
+1.95e-5 -- the hp mesh drives a correct DAGE end to end. (The DOF win is
+quantified at construction level above; a DAGE-level uniform comparison is
+impractical host-serial precisely because the uniform reference needs so many
+points -- which IS the hp advantage.) Next: library-ize the variable-order FE
+grid + the grid constructor, then grid-RI J/K on molecules.
+GPU note (user Q, 2026-09-05): hp variation is NOT a load-balancing problem for
+the tensorial DAGE and is arguably good. The DAGE parallelism is over lines
+(N^2/axis) + t-nodes, and in a TENSOR-PRODUCT grid every line along an axis uses
+the IDENTICAL 1D mesh, so all parallel work-items do structurally identical work
+-- no cross-warp/team imbalance; the order variation is a fixed shared pattern
+inside each line's element loop (uniform occupancy). Compactness (75x fewer DOFs)
+directly aids occupancy and pushes back capacity-tiling. The nuance is the
+element-PAIR kernels (co-density exchange, near/far pair loops) where work ~
+p_i*p_j varies: handle by BUCKETING pairs by order (p in {4..16}, few buckets) --
+the standard mixed-order-FEM-on-GPU technique -- layered on the dynamic
+scheduling the screening (clamped-v near/far split) already requires. Varying
+element SIZE alone is a non-issue (work scales with p and pair count, not size).
 
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
