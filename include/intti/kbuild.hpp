@@ -296,7 +296,8 @@ void exchange_build_contracted_impl(
     const std::vector<int> &cprim, const std::vector<Real> &ecoef,
     const std::vector<int> &ecoff, const std::vector<int> &nprim_c,
     const std::vector<int> &nctr_c, const std::vector<int> &caoff, int naoc,
-    const Real *D, const TGrid<Real> &grid, const PairTable<Real> &tab, Real *K) {
+    const Real *D, const TGrid<Real> &grid, const PairTable<Real> &tab, Real tau,
+    const std::vector<Real> &Qex, const std::vector<Real> &maxDeff, Real *K) {
   static_assert(kokkos_scalar_v<Real>,
                 "exchange_build requires a builtin floating-point type");
   const int nps = static_cast<int>(prims.size());
@@ -320,6 +321,9 @@ void exchange_build_contracted_impl(
   auto nctrv = detail::to_device(nctr_c, "intti::kc::nctr");
   auto caov = detail::to_device(caoff, "intti::kc::cao");
   auto Dv = detail::to_device(D, static_cast<std::size_t>(naoc) * naoc, "intti::kc::D");
+  const bool screen = tau > Real(0);
+  auto Qv = detail::to_device(screen ? Qex : std::vector<Real>(1, Real(0)), "intti::kc::Q");
+  auto mDv = detail::to_device(screen ? maxDeff : std::vector<Real>(1, Real(0)), "intti::kc::mD");
   Kokkos::View<Real *> Kv("intti::kc::K", static_cast<std::size_t>(naoc) * naoc);
   Kokkos::deep_copy(Kv, Real(0));
   auto pv = tab.p;
@@ -373,6 +377,7 @@ void exchange_build_contracted_impl(
           for (int d = 0; d < nps; ++d) {
             const int Dsh = csv(d), pd = cpv(d), ld = lv(d), ncd = ncart(ld);
             const int q = b * nps + d;
+            if (screen && Qv(p) * Qv(q) * mDv(c * nps + d) < tau) continue;
             int d3s[KNC][3];
             for (int k = 0; k < ncd; ++k) cart_comp(ld, k, d3s[k][0], d3s[k][1], d3s[k][2]);
             // effective primitive ket density D_eff[kc][kd] (contracted D folded)

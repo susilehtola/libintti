@@ -434,14 +434,17 @@ void coulomb_build(const ContractedBasis<Real> &basis, const Real *D,
 /// normalization). Memory-lean: reuses the primitive exchange t-space core on
 /// the primitive pairs of the contracted basis, keeping D and K contracted (no
 /// nao_prim x nao_prim matrix); see detail::exchange_build_contracted_impl.
+/// tau > 0 enables Schwarz x effective-density screening of primitive ket pairs
+/// (Q(ac) Q(bd) max|D_eff(c,d)| < tau skipped); tau = 0 (default) is exact.
 template <class Real>
 void exchange_build(const ContractedBasis<Real> &basis, const Real *D,
-                    const TGrid<Real> &grid, Real *K) {
+                    const TGrid<Real> &grid, Real *K, Real tau = Real(0)) {
   std::vector<PrimitiveShell<Real>> prims;
   std::vector<int> cshell, cprim;
   detail::contracted_primitives(basis, prims, cshell, cprim);
   const int nps = static_cast<int>(prims.size());
   const int ncs = static_cast<int>(basis.shells.size());
+  const int naoc = basis.nao;
   // flat effective-coefficient pool: per shell A, [cA-major, prim-minor]
   std::vector<int> ecoff(ncs, 0), nprim_c(ncs), nctr_c(ncs);
   int etot = 0;
@@ -462,8 +465,36 @@ void exchange_build(const ContractedBasis<Real> &basis, const Real *D,
   for (int i = 0; i < nps; ++i)
     for (int c = 0; c < nps; ++c) plist.push_back(make_pair(prims[i], prims[c]));
   auto tab = make_pair_table(plist);
+  // screening data: Schwarz per primitive pair and the per-(c,d)-primitive-pair
+  // maximum of the effective (contracted) ket density.
+  std::vector<Real> Q, maxDeff;
+  if (tau > Real(0)) {
+    Q = schwarz(tab, plist, grid);
+    maxDeff.assign(static_cast<std::size_t>(nps) * nps, Real(0));
+    for (int c = 0; c < nps; ++c)
+      for (int d = 0; d < nps; ++d) {
+        const int C = cshell[c], pc = cprim[c], Dsh = cshell[d], pd = cprim[d];
+        const int ncc = ncart(prims[c].l), ncd = ncart(prims[d].l);
+        Real m = 0;
+        for (int kc = 0; kc < ncc; ++kc)
+          for (int kd = 0; kd < ncd; ++kd) {
+            Real s = 0;
+            for (int cC = 0; cC < nctr_c[C]; ++cC) {
+              const Real wc = ecoef[ecoff[C] + cC * nprim_c[C] + pc];
+              for (int cD = 0; cD < nctr_c[Dsh]; ++cD)
+                s += wc * ecoef[ecoff[Dsh] + cD * nprim_c[Dsh] + pd] *
+                     D[(basis.ao_off[C] + static_cast<std::size_t>(cC) * ncc + kc) * naoc +
+                       basis.ao_off[Dsh] + static_cast<std::size_t>(cD) * ncd + kd];
+            }
+            const Real a = s < 0 ? -s : s;
+            if (a > m) m = a;
+          }
+        maxDeff[static_cast<std::size_t>(c) * nps + d] = m;
+      }
+  }
   detail::exchange_build_contracted_impl(prims, cshell, cprim, ecoef, ecoff, nprim_c,
-                                         nctr_c, basis.ao_off, basis.nao, D, grid, tab, K);
+                                         nctr_c, basis.ao_off, naoc, D, grid, tab, tau, Q,
+                                         maxDeff, K);
 }
 
 } // namespace intti
