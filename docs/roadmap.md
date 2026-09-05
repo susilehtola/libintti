@@ -1072,10 +1072,11 @@ element (far elements auto-screen via the clamped v-range) -- machine-exact per
 axis for all t, no delta tail. Because separability is in the KERNEL not the
 density, this handles NON-separable densities (the co-densities that broke the
 step-1/2 pair-density factorization). Validated on a non-separable density (sum
-of s-Gaussians) vs the analytic Coulomb: rel error 2.4e-5 at a coarse grid
-(5 elements x degree 7, N=40/axis) -- REPRESENTATION-limited (the t-adapted
-quadrature is machine-exact per steps 1-2), spectrally convergent under
-refinement. This is the engine that unlocks the single-3D-tensor co-density
+of s-Gaussians) vs the analytic Coulomb, and SPECTRALLY CONVERGENT: rel error
+2.4e-5 at 5 elements x degree 7 (N=40/axis) -> 5.1e-8 at 7 elements x degree 8
+(N=63/axis), a ~460x drop for a modest refinement -- confirming the residual is
+REPRESENTATION-limited (the t-adapted quadrature is machine-exact per steps
+1-2). This is the engine that unlocks the single-3D-tensor co-density
 exchange (form g_qi once, one DAGE solve per (q,i)) and the grid SCF solver.
 Remaining: refine to production accuracy + screening/cost tuning; multi-centre
 bridging; wire into a co-density K build and the Helmholtz grid solver.
