@@ -817,6 +817,90 @@ analytic-Boys engines need new special functions. gen1int is 15 years mature
 on 1e response — treat its operator list and N-ary-tree derivative
 organization as the design target, its numbers as an oracle.
 
+## libcint parity — integral-type coverage gaps (2026-09-05)
+
+Where libintti stands against libcint's `intor` catalog. The nonrelativistic
+scalar spine is largely there; the relativistic layer is entirely absent, and a
+handful of nonrelativistic operators/derivatives are still missing. Matrix-level
+API only throughout (no per-quartet public surface); each new family lands with
+an independent oracle (PySCF `intor`, which wraps libcint, is the natural one).
+
+**HAVE (nonrelativistic scalar spine).** Overlap S, kinetic T, nuclear
+attraction V, arbitrary Cartesian multipoles, angular momentum <r x grad>;
+Coulomb J and exchange K (direct + Cholesky + RI); 2-/3-centre Coulomb and
+RI-J/K; GIAO first-order field derivatives of S/T/V/ERI; geometric gradients and
+Hessians of S/T/V/ERI. Cart->real-spherical via c2s. Beyond libcint's usual
+emphasis: range-separated erf/erfc/Yukawa ERIs native to the t-quadrature,
+Gaussian geminals / transcorrelated, 3-electron integrals, Helmholtz/Yukawa,
+local hybrids; all scalar-templated (real/complex/long double/__float128).
+
+**MISSING -- relativistic layer (the whole category; not yet in any milestone).**
+A dedicated Dirac/X2C integral layer. In rough dependency order:
+1. **Spinor c2s** -- j-adapted (kappa, m_j) complex spinor transform, the
+   analogue of c2s.hpp for the 2-component/4-component basis. The one genuinely
+   new piece of machinery (everything else reuses the MD substrate). Prereq for
+   all `_spinor` outputs.
+2. **Small-component sigma.p 1e families** -- `int1e_spsp` (<sigma.p|sigma.p> =
+   4 T for the kinetic-balance metric), `int1e_spnucsp` (<sigma.p|V|sigma.p>),
+   `int1e_sprinvsp`. sigma.p on a Gaussian is a raise/lower (derivative) pattern
+   we already compute; the new work is the Pauli 2x2 spin algebra + assembly.
+3. **Small-component 2e** -- `int2e_spsp1` (SL), `int2e_sp1sp2`, and
+   `int2e_spsp1spsp2` (SS|SS), i.e. the LL/SL/SS blocks of the Dirac-Coulomb ERI.
+4. **Gaunt** (`int2e_ssp1ssp2` ...) and **Breit** (+ gauge `int2e_gauge_*`)
+   two-electron interactions. Highest complexity; do last.
+   Oracle: PySCF/DIRAC spinor integrals; validate LL block reduces to the
+   nonrelativistic ERI and the sigma.p metric to 4T.
+
+**MISSING -- nonrelativistic operators libcint has and we do not.**
+- **Spin-orbit** (`INT_PSO`, 1e paramagnetic SO; 2e SOMF/Breit-Pauli) -- this is
+  milestone M17 (`soc.hpp`), planned, NOT started ("can slip"). Overlaps with
+  the sigma.p machinery above.
+- **ECP** (effective core potentials). Split by architectural fit:
+  * **Local part** `U_loc = sum_k d_k r^n e^{-zeta_k r^2}` -- GOOD fit: for even
+    n a Gaussian-times-polynomial on the ECP centre, i.e. a 3-centre
+    Gaussian-potential integral the MD substrate already does. Falls out of the
+    finite-nucleus / INT_GAUSSIAN_POT work essentially for free.
+  * **Semilocal projector part** `sum_l U_l(r)|lm><lm|` -- POOR fit, and the part
+    that makes ECP worth having for heavy elements. Standard evaluation projects
+    the Gaussians onto spherical harmonics about the ECP centre -> type-1/type-2
+    radial integrals over modified spherical Bessel functions + angular Gaunt
+    coefficients: a DISJOINT numerical method (Bessel radial quadrature + real-SH
+    angular algebra), not a t-quadrature/MD reuse. It would be a bolt-on engine
+    that breaks the "one t-quadrature MD engine" thesis. DECISION (2026-09-05):
+    not a parity target. For heavy elements prefer the architecture-consistent
+    all-electron relativistic (X2C/Dirac) route below -- sigma.p genuinely reuses
+    the MD derivative substrate, ECP-semilocal does not. Revisit only if a
+    concrete need arises where all-electron relativistic is too costly. (Same
+    principle as the NAO decision: keep what the transform justifies, not a
+    bolted-on disjoint method.)
+- **Momentum-operator 1e** -- `int1e_pnucp` (<grad.V grad>) and `int1e_pnucxp`
+  (<grad x V grad>, the PSO/SO seed). Used by X2C/DKH picture-change and SO.
+- **Finite-nucleus / Gaussian-charge potential** (`INT_GAUSSIAN_POT`) -- a
+  Gaussian nuclear charge model in place of the point charge. Small: swap the
+  point-charge t-node kernel for the finite-width one (the tail machinery
+  already handles a Gaussian smear).
+- **Spherical multipoles** (`INT_SPHER_MULTIPOLE`) -- have Cartesian; c2s
+  handles the transform, so this is a thin wrapper, not new integrals.
+
+**PARTIAL -- derivative cross-product.** libcint exposes a large combinatorial
+set of nabla (ip), GIAO (ig), and 1/r (rinv) derivative combinations
+(`int2e_ip1ip2`, `int1e_ipiprinv`, `int1e_ipipnuc`, `int2e_ig1ip2`, ...). We
+have geometric gradient + Hessian of S/T/V/ERI and GIAO first derivatives -- a
+solid subset but not the full cross-product. The gen1int N-ary-tree approach
+(arbitrary derivative order distributed over centres/fields) is the intended way
+to close this generatively rather than case by case; adopt it in the M16
+derivative layer so higher mixed orders come for free.
+
+**Suggested ordering.** The nonrelativistic gaps are the cheap, high-value wins
+and mostly reuse the existing substrate: finite-nucleus potential and spherical
+multipoles (thin) -- and the finite-nucleus work also delivers **local ECP** for
+free -- then `pnucp`/`pnucxp` + M17 spin-orbit (shared sigma.p algebra), then the
+derivative cross-product via the N-ary tree. The full relativistic Dirac/X2C
+layer is the one large standalone milestone: gated on the spinor c2s (item 1),
+best sequenced LL -> SL -> SS -> Gaunt/Breit, each oracle-checked against its
+nonrelativistic limit -- and it, not semilocal ECP, is libintti's heavy-element
+story (see the ECP decision above).
+
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
 A project-wide audit for loops whose cost scales with system size and could be
