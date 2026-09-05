@@ -1092,6 +1092,23 @@ e.g. Rayleigh/GF-power + damping/DIIS + near-nucleus refinement for cusped
 potentials), validated against a GTO-basis diagonalization reference. The M-HK
 capstone is unblocked: all its grid operators are built and validated.
 
+**Grid Helmholtz SCF driver -- TEST HARNESS, not library** (prototype/
+fe_scf_solver.cpp, 2026-09-05). SCOPE DECISION (user): libintti is an integrals
+library -- it ships the grid OPERATORS (DAGE Coulomb, co-density K, the Helmholtz
+apply G_kappa); the SCF DRIVER (the psi <- -2 G_kappa(V psi) loop, energy update,
+convergence control) is application-level and lives only as a test/oracle, never
+in a library header (like the RHF-via-libintti validation, never library code).
+Result: the self-consistent Green's-function power iteration on a shifted
+harmonic well (exact ground state e^{-r^2/2}, eps=-2.5), from a WRONG guess
+e^{-0.8 r^2}, converges MONOTONICALLY to eps=-2.49960 (diff 4.0e-4 at the coarse
+N=32/axis grid) with overlap^2 -> 0.9989, in 4 iterations, and stops at the grid
+limit. The Helmholtz integral iteration is well-behaved (as expected -- G_kappa
+is a bounded smoothing operator; no differential ill-conditioning); an earlier
+apparent divergence was a SIGN error in the Kalos/BSH energy update
+(eps += <V psi | psi~ - psi>/<psi~|psi~>), not the method. So the M-HK capstone
+is demonstrated end to end on the grid; production robustness (finer grids,
+KAIN/Anderson acceleration) is a driver/application concern, not libintti's.
+
 **Step-3 (3D t-adapted DAGE) PROTOTYPED** (prototype/fe_dage3d.cpp, 2026-09-05):
 the Coulomb potential of a GENERAL 3D density on the tensorial FE grid,
 V(r1) = sum_t w_t int rho(r2) e^{-t^2|r1-r2|^2} dr2, done as three successive 1D
