@@ -1010,11 +1010,26 @@ structure costs, for the factorization simplicity.
 - Confirmed en route: naive fixed-grid + leading delta-tail is only ~1/t_c^2
   (8e-4->5e-5); the t-adapted element-pair quadrature beats the naive one
   100-600x at large t (t=256: 1.3e-3 vs 0.20) on polynomial elements.
-Next: (i) the genuine element-subdivided piecewise-polynomial FE representation
-(makes the t-adapted branch t-uniform without the Gaussian-density split, and is
-what the grid SOLVER needs for cusps); (ii) multi-centre element-pair bridging
-(the far/near box split across nuclei); (iii) the Helmholtz grid solver on the
-same machinery.
+**Step-2 DONE: element-subdivided piecewise-polynomial FE representation**
+(prototype/fe_fem_onecenter.cpp). The axis is split into elements; on each the
+density factor is a local polynomial (barycentric Lagrange through the element
+Gauss-Legendre nodes). (pq|rs) is the ELEMENT-PAIR loop A_d(t) = sum_{eA,eB}
+int_eA int_eB P_eA e^{-t^2(x-x')^2} P_eB, and answers the two structural
+questions: NEAR pairs (same/adjacent elements, x,x' can come within ~1/t) use
+the t-adapted inner quadrature -- and because P_eB is a POLYNOMIAL it is smooth
+in v for ALL t, so a SINGLE t-adapted branch is machine-exact with no near/far
+t-split (the split was only an artifact of the Gaussian collocation); FAR pairs
+(well separated) have an empty clamped v-range and are auto-SCREENED (the
+"different element factorizes/screens" case). Validated vs eri_quartet: overlap
+9.7e-15, (ss|ss) 1.1e-14, (pp|pp) 1.1e-14 at 20 elements x degree 13, and
+spectrally convergent under refinement (12x9 -> 20x13 tightens ~1e-12 -> 1e-14).
+Element-pair census showed ~45% of pairs screened as far. NB the far pairs are
+merely screened here; the efficient treatment multipole-factorizes them (design
+point 4) -- the next optimization.
+Next: (i) multi-centre element-pair bridging (the far/near box split across
+nuclei, with multipole for far); (ii) the Helmholtz grid solver on the same FE
+machinery (the piecewise-polynomial elements also give the cusp resolution the
+solver needs).
 
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
