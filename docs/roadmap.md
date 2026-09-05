@@ -1050,6 +1050,17 @@ near-nucleus grid resolution (refinement / bubbles) is the accuracy pressure
 point -- exchange energy is more grid-sensitive than Coulomb. Fold into M-FE
 once multi-centre Coulomb is in place; validate one-centre K via co-densities
 against the analytic exchange_build.
+PROTOTYPED (prototype/fe_exchange_onecenter.cpp, 2026-09-05): the co-density /
+occupied-orbital ASSEMBLY K_pq = occ_scale sum_i (pi|qi), (pi|qi) = sum_rs C_ri
+C_si (pr|qs), driven through the per-orbital loop on the machine-precise
+separable grid (pr|qs) (step-1), reproduces exchange_build to 1.3e-15 (s-basis,
+one centre). This validates the co-density formulation + occupied-orbital
+assembly. STILL TO DO (the genuine seminumerical advantage): form g_qi = chi_q
+phi_i as a single 3D grid function and take ONE 3D DAGE Coulomb solve per (q,i)
+-- avoiding the O(Nbf^2) r,s expansion -- which needs the 3D t-adapted DAGE with
+per-axis FE interpolation (a fixed-grid 3D DAGE is infeasible at accuracy: the
+t_c <~ n/2L resolution limit forces prohibitive n). That is the step-3 build,
+alongside multi-centre bridging.
 
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
