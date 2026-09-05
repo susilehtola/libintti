@@ -653,7 +653,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      Deliberately NOT applied to the FUSED J/K engines (jbuild/kbuild) or the
      n^6 threeel builder: their density digestion is fused into the coupling
      and a generic consumer would de-fuse the hot path (= the #3 conclusion).
-     Next: extend the consumer to ncenter (2c/3c tensor writes) and nuclear.
+     Extended to ncenter's coulomb_2c (the (P|Q) symmetric block scatter is the
+     same pattern; byte-exact). The remaining explicit-integral writes -- the
+     3-center (mu nu|P) 3-index tensor (mu<->nu mirror, extra P stride) and the
+     nuclear-attraction accumulate (+=, not =) -- need a tensor-stride and an
+     accumulate variant of the consumer; low duplication (1-2 sites each), so
+     deferred unless a third caller appears. The pervasive-duplication win
+     (oneel, 11 sites) is captured; #2 as a clean non-regressing refactor is
+     essentially complete. The remaining SHARK lever with real payoff is #5
+     (general contraction, needed for def2/ANO), assessed next.
   3. **Digestion / permutational-redundancy** (SHARK Sec 3.6, Eq 29-37) --
      ANALYSED, DOES NOT APPLY to our J-engine. SHARK's digestion redundancy
      de-duplicates EXPLICIT integrals; jbuild is a J-engine that never forms

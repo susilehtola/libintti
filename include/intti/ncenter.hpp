@@ -15,6 +15,7 @@
 
 #include "fock.hpp"
 #include "gto.hpp"
+#include "lkc.hpp"
 #include "math.hpp"
 #include "multipole.hpp"
 #include "quartet.hpp"
@@ -59,13 +60,9 @@ std::vector<Real> coulomb_2c(const ShellBasis<Real> &aux, const TGrid<Real> &gri
       const int nP = ncart(aux.shells[a].l), nQ = ncart(aux.shells[b].l);
       std::vector<Real> blk(static_cast<std::size_t>(nP) * nQ);
       eri_quartet(bra, ket, grid, blk.data());
-      for (int kP = 0; kP < nP; ++kP)
-        for (int kQ = 0; kQ < nQ; ++kQ) {
-          const Real v = blk[kP * nQ + kQ];
-          M[(aux.ao_off[a] + kP) * naux + aux.ao_off[b] + kQ] = v;
-          if (a != b)
-            M[(aux.ao_off[b] + kQ) * naux + aux.ao_off[a] + kP] = v; // transpose mirror
-        }
+      // LKC consumer: symmetric block scatter of the precomputed (P|Q) block.
+      detail::scatter_pair(M, aux, a, b, +1,
+          [&](int kP, const int *, int kQ, const int *) { return blk[kP * nQ + kQ]; });
     }
   return M;
 }
