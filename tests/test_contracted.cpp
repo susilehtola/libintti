@@ -25,15 +25,13 @@ namespace {
 using intti::ContractedBasis;
 using intti::ContractedShell;
 
-// C S_prim C^T reference: decontract the basis into one primitive shell per
-// Gaussian, build the primitive matrix with the primitive-ShellBasis builder,
-// and contract it with C[contracted AO][primitive AO] = d_{cp} *
-// cart_norm_pyscf(l, alpha_p) (same Cartesian component). This reuses the
-// independently validated primitive builders and tests only the contraction.
-template <class Builder>
-std::vector<double> contract_ref(const ContractedBasis<double> &cb, Builder prim_builder) {
+// Decontract a contracted basis into one primitive shell per Gaussian, and
+// build the contraction map C[contracted AO][primitive AO] = d_{cp} *
+// cart_norm_pyscf(l, alpha_p) (same Cartesian component). Returns npao; fills
+// pbasis and the dense (ncao x npao) C.
+int decontract(const ContractedBasis<double> &cb, intti::ShellBasis<double> &pbasis,
+               std::vector<double> &C) {
   std::vector<intti::PrimitiveShell<double>> prims;
-  // primbase[a][p] = primitive-AO offset of shell a's primitive p
   std::vector<std::vector<int>> primbase(cb.shells.size());
   int po = 0;
   for (std::size_t a = 0; a < cb.shells.size(); ++a) {
@@ -46,42 +44,73 @@ std::vector<double> contract_ref(const ContractedBasis<double> &cb, Builder prim
       po += intti::ncart(A.l);
     }
   }
-  auto pbasis = intti::make_basis(prims);
+  pbasis = intti::make_basis(prims);
   const int npao = pbasis.nao, ncao = cb.nao;
-  const std::vector<double> Sp = prim_builder(pbasis);
-  // dense C (ncao x npao)
-  std::vector<double> C(static_cast<std::size_t>(ncao) * npao, 0.0);
+  C.assign(static_cast<std::size_t>(ncao) * npao, 0.0);
   for (std::size_t a = 0; a < cb.shells.size(); ++a) {
     const auto &A = cb.shells[a];
     const int nc = intti::ncart(A.l);
     for (int cA = 0; cA < A.nctr(); ++cA)
       for (int p = 0; p < A.nprim(); ++p) {
         const double w = A.coeff[cA * A.nprim() + p] * intti::cart_norm_pyscf(A.l, A.alpha[p]);
-        for (int k = 0; k < nc; ++k) {
-          const int I = cb.ao_off[a] + cA * nc + k;
-          const int P = primbase[a][p] + k;
-          C[static_cast<std::size_t>(I) * npao + P] = w;
-        }
+        for (int k = 0; k < nc; ++k)
+          C[static_cast<std::size_t>(cb.ao_off[a] + cA * nc + k) * npao + primbase[a][p] + k] = w;
       }
   }
-  // S_c = C Sp C^T
-  std::vector<double> CSp(static_cast<std::size_t>(ncao) * npao, 0.0);
+  return npao;
+}
+
+// C M_prim C^T (ncao x ncao) from a primitive matrix M_prim (npao x npao).
+std::vector<double> conjugate(const std::vector<double> &C, int ncao, int npao,
+                             const std::vector<double> &M) {
+  std::vector<double> CM(static_cast<std::size_t>(ncao) * npao, 0.0);
   for (int I = 0; I < ncao; ++I)
     for (int P = 0; P < npao; ++P) {
       double s = 0;
       for (int Q = 0; Q < npao; ++Q)
-        s += C[static_cast<std::size_t>(I) * npao + Q] * Sp[static_cast<std::size_t>(Q) * npao + P];
-      CSp[static_cast<std::size_t>(I) * npao + P] = s;
+        s += C[static_cast<std::size_t>(I) * npao + Q] * M[static_cast<std::size_t>(Q) * npao + P];
+      CM[static_cast<std::size_t>(I) * npao + P] = s;
     }
-  std::vector<double> Sc(static_cast<std::size_t>(ncao) * ncao, 0.0);
+  std::vector<double> out(static_cast<std::size_t>(ncao) * ncao, 0.0);
   for (int I = 0; I < ncao; ++I)
     for (int J = 0; J < ncao; ++J) {
       double s = 0;
       for (int P = 0; P < npao; ++P)
-        s += CSp[static_cast<std::size_t>(I) * npao + P] * C[static_cast<std::size_t>(J) * npao + P];
-      Sc[static_cast<std::size_t>(I) * ncao + J] = s;
+        s += CM[static_cast<std::size_t>(I) * npao + P] * C[static_cast<std::size_t>(J) * npao + P];
+      out[static_cast<std::size_t>(I) * ncao + J] = s;
     }
-  return Sc;
+  return out;
+}
+
+// C^T M_contr C (npao x npao) from a contracted matrix M_contr (ncao x ncao).
+std::vector<double> pushdown(const std::vector<double> &C, int ncao, int npao,
+                            const std::vector<double> &M) {
+  std::vector<double> MC(static_cast<std::size_t>(ncao) * npao, 0.0); // M C  (ncao x npao)
+  for (int I = 0; I < ncao; ++I)
+    for (int P = 0; P < npao; ++P) {
+      double s = 0;
+      for (int J = 0; J < ncao; ++J)
+        s += M[static_cast<std::size_t>(I) * ncao + J] * C[static_cast<std::size_t>(J) * npao + P];
+      MC[static_cast<std::size_t>(I) * npao + P] = s;
+    }
+  std::vector<double> out(static_cast<std::size_t>(npao) * npao, 0.0);
+  for (int P = 0; P < npao; ++P)
+    for (int Q = 0; Q < npao; ++Q) {
+      double s = 0;
+      for (int I = 0; I < ncao; ++I)
+        s += C[static_cast<std::size_t>(I) * npao + P] * MC[static_cast<std::size_t>(I) * npao + Q];
+      out[static_cast<std::size_t>(P) * npao + Q] = s;
+    }
+  return out;
+}
+
+// C M_prim C^T reference for a symmetric 1e operator built by prim_builder.
+template <class Builder>
+std::vector<double> contract_ref(const ContractedBasis<double> &cb, Builder prim_builder) {
+  intti::ShellBasis<double> pbasis;
+  std::vector<double> C;
+  const int npao = decontract(cb, pbasis, C);
+  return conjugate(C, cb.nao, npao, prim_builder(pbasis));
 }
 
 // A small generally-contracted test basis: an s shell with 3 primitives and
@@ -188,6 +217,37 @@ TEST(Contracted, NuclearVsDecontractRecontract) {
     scale = std::max(scale, std::abs(ref[i]));
   }
   EXPECT_LT(worst, 1e-11 * scale) << "contracted nuclear != decontract/recontract";
+}
+
+TEST(Contracted, CoulombVsDecontractRecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  // a symmetric test density over the contracted AOs
+  std::vector<double> D(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = 0.1 + 0.3 * std::sin(0.7 * i + 1.3 * j);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) {
+      const double a = 0.5 * (D[i * n + j] + D[j * n + i]);
+      D[i * n + j] = D[j * n + i] = a;
+    }
+  std::vector<double> J(static_cast<std::size_t>(n) * n, 0.0);
+  intti::coulomb_build(cb, D.data(), grid, J.data());
+  // reference: D_eff = C^T D C; J_eff = primitive coulomb_build; J = C J_eff C^T
+  intti::ShellBasis<double> pbasis;
+  std::vector<double> C;
+  const int npao = decontract(cb, pbasis, C);
+  auto Deff = pushdown(C, n, npao, D);
+  std::vector<double> Jeff(static_cast<std::size_t>(npao) * npao, 0.0);
+  intti::coulomb_build(pbasis, Deff.data(), grid, Jeff.data());
+  auto ref = conjugate(C, n, npao, Jeff);
+  double worst = 0, scale = 0;
+  for (std::size_t i = 0; i < J.size(); ++i) {
+    worst = std::max(worst, std::abs(J[i] - ref[i]));
+    scale = std::max(scale, std::abs(ref[i]));
+  }
+  EXPECT_LT(worst, 1e-11 * scale) << "contracted J != decontract/recontract";
 }
 
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum

@@ -85,6 +85,34 @@ PrimitiveShell<Real> contracted_prim(const ContractedShell<Real> &s, int p) {
   return PrimitiveShell<Real>{s.alpha[p], {s.center[0], s.center[1], s.center[2]}, s.l};
 }
 
+/// Effective coefficient of primitive p in contracted function c of a shell:
+/// the basis-set coefficient times the primitive's PySCF cart=True
+/// normalization -- the weight on the engine's UNNORMALIZED primitive.
+template <class Real>
+Real effective_coeff(const ContractedShell<Real> &s, int c, int p) {
+  return s.coeff[c * s.nprim() + p] * cart_norm_pyscf(s.l, s.alpha[p]);
+}
+
+/// Expand a contracted basis into its primitive shells, recording for each
+/// primitive shell its origin (contracted shell index, primitive index). This
+/// is the primitive pair space the fused J/K engines run on; the contraction
+/// enters only in the density-fold and output-gather, never as an nprim x nprim
+/// matrix.
+template <class Real>
+void contracted_primitives(const ContractedBasis<Real> &basis,
+                           std::vector<PrimitiveShell<Real>> &prims,
+                           std::vector<int> &cshell, std::vector<int> &cprim) {
+  prims.clear();
+  cshell.clear();
+  cprim.clear();
+  for (int a = 0; a < static_cast<int>(basis.shells.size()); ++a)
+    for (int p = 0; p < basis.shells[a].nprim(); ++p) {
+      prims.push_back(contracted_prim(basis.shells[a], p));
+      cshell.push_back(a);
+      cprim.push_back(p);
+    }
+}
+
 /// LKC-style contracted scatter: write a contracted shell-pair block `cblk`
 /// (row-major over (cA*nca+ka, cB*ncb+kb)) into the AO matrix `M` with the
 /// contracted-AO offsets and a transpose mirror (mirror: +1 sym, -1 antisym,
@@ -300,6 +328,105 @@ std::vector<Real> nuclear_matrix(const ContractedBasis<Real> &basis,
         detail::attraction_pair_block(sa, sb, charges, grid, Real(0), far_tau, o);
       });
   return std::move(out[0]);
+}
+
+/// Coulomb matrix J = sum_{KL} D_{KL} (IJ|KL) over a generally-contracted basis
+/// (D, J are nao x nao row-major contracted-AO matrices; PySCF cart=True
+/// normalization). Reuses the fused primitive J-engine (jbuild.hpp) on the
+/// PRIMITIVE pairs of the contracted basis: the contraction enters only in the
+/// density fold (contracted D -> per-primitive-pair effective density,
+/// D_eff = C^T D C applied block-by-block) and the output gather (per-primitive-
+/// pair J -> contracted J = C J_eff C^T), so no nao_prim x nao_prim matrix is
+/// ever materialized. tau screens primitive pairs (Schwarz x density bound).
+template <class Real>
+void coulomb_build(const ContractedBasis<Real> &basis, const Real *D,
+                   const TGrid<Real> &grid, Real *J, Real tau = Real(0),
+                   int rank = 0, int nranks = 1) {
+  const std::size_t nao = static_cast<std::size_t>(basis.nao);
+  std::vector<PrimitiveShell<Real>> prims;
+  std::vector<int> cs, cp;
+  detail::contracted_primitives(basis, prims, cs, cp);
+  const int nps = static_cast<int>(prims.size());
+  std::vector<ShellPair<Real>> plist;
+  std::vector<std::pair<int, int>> pshell;
+  for (int i = 0; i < nps; ++i)
+    for (int j = i; j < nps; ++j) {
+      plist.push_back(make_pair(prims[i], prims[j]));
+      pshell.push_back({i, j});
+    }
+  auto tab = make_pair_table(plist);
+  const int npair = tab.npair;
+  std::vector<int> off(npair + 1, 0);
+  for (int p = 0; p < npair; ++p)
+    off[p + 1] = off[p] + ncart(plist[p].la) * ncart(plist[p].lb);
+  std::vector<Real> Dp(off[npair], Real(0)), Jp(off[npair], Real(0));
+  // density fold: Dp[p] = C^T D C on this primitive pair, with the D_ij+D_ji
+  // symmetry fold for distinct primitive shells (matching the engine).
+  for (int p = 0; p < npair; ++p) {
+    const int i = pshell[p].first, j = pshell[p].second;
+    const int A = cs[i], B = cs[j], pa = cp[i], pb = cp[j];
+    const int nca = ncart(plist[p].la), ncb = ncart(plist[p].lb);
+    const int nctA = basis.shells[A].nctr(), nctB = basis.shells[B].nctr();
+    const bool diag = (i == j);
+    for (int ka = 0; ka < nca; ++ka)
+      for (int kb = 0; kb < ncb; ++kb) {
+        Real s = 0;
+        for (int cA = 0; cA < nctA; ++cA) {
+          const Real wA = detail::effective_coeff(basis.shells[A], cA, pa);
+          if (wA == Real(0)) continue;
+          const std::size_t I = basis.ao_off[A] + static_cast<std::size_t>(cA) * nca + ka;
+          for (int cB = 0; cB < nctB; ++cB) {
+            const std::size_t Jc = basis.ao_off[B] + static_cast<std::size_t>(cB) * ncb + kb;
+            const Real dval = diag ? D[I * nao + Jc] : D[I * nao + Jc] + D[Jc * nao + I];
+            s += wA * detail::effective_coeff(basis.shells[B], cB, pb) * dval;
+          }
+        }
+        Dp[off[p] + ka * ncb + kb] = s;
+      }
+  }
+  std::vector<Real> Q, bound;
+  const Real *Qp = nullptr, *bp = nullptr;
+  if (tau > Real(0)) {
+    Q = schwarz(tab, plist, grid);
+    bound.resize(npair);
+    for (int p = 0; p < npair; ++p) {
+      Real dmax = 0;
+      for (int c = off[p]; c < off[p + 1]; ++c) {
+        const Real a = Dp[c] < 0 ? -Dp[c] : Dp[c];
+        if (a > dmax) dmax = a;
+      }
+      bound[p] = Q[p] * dmax;
+    }
+    Qp = Q.data();
+    bp = bound.data();
+  }
+  coulomb_build(tab, Dp.data(), grid, Jp.data(), Qp, bp, tau, rank, nranks);
+  // output gather: J = C J_eff C^T, accumulated per primitive pair (many
+  // primitive pairs contribute to each contracted block).
+  for (std::size_t i = 0; i < nao * nao; ++i) J[i] = Real(0);
+  for (int p = 0; p < npair; ++p) {
+    const int i = pshell[p].first, j = pshell[p].second;
+    const int A = cs[i], B = cs[j], pa = cp[i], pb = cp[j];
+    const int nca = ncart(plist[p].la), ncb = ncart(plist[p].lb);
+    const int nctA = basis.shells[A].nctr(), nctB = basis.shells[B].nctr();
+    const bool offdiag = (i != j);
+    for (int ka = 0; ka < nca; ++ka)
+      for (int kb = 0; kb < ncb; ++kb) {
+        const Real jval = Jp[off[p] + ka * ncb + kb];
+        if (jval == Real(0)) continue;
+        for (int cA = 0; cA < nctA; ++cA) {
+          const Real wA = detail::effective_coeff(basis.shells[A], cA, pa);
+          if (wA == Real(0)) continue;
+          const std::size_t I = basis.ao_off[A] + static_cast<std::size_t>(cA) * nca + ka;
+          for (int cB = 0; cB < nctB; ++cB) {
+            const std::size_t Jc = basis.ao_off[B] + static_cast<std::size_t>(cB) * ncb + kb;
+            const Real add = wA * detail::effective_coeff(basis.shells[B], cB, pb) * jval;
+            J[I * nao + Jc] += add;
+            if (offdiag) J[Jc * nao + I] += add;
+          }
+        }
+      }
+  }
 }
 
 } // namespace intti
