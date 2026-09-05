@@ -20,9 +20,16 @@
 //     Full build matches the None build only to rounding (~1e-13, not byte-for-
 //     byte) and is not bit-reproducible across runs or rank counts.
 //
-// The flag is shared so the same opt-in applies uniformly across builds that
-// support it (exchange today; the 3-electron builds are the next adopters).
-// None is always the default, preserving the deterministic guarantees.
+// The flag is shared so the same opt-in can apply uniformly across builds that
+// support it. In practice it is a win only where an expensive, UN-folded
+// integral evaluation is duplicated across output blocks -- i.e. the exchange
+// build. Builders whose density is pre-folded (Coulomb J, the geminal tc build)
+// gain almost nothing from it (the pair-pair symmetry saves only cheap setup,
+// not the density-folded contraction), and builders whose symmetry is a plain
+// output-block mirror (1e S/T/V, the RI 2-/3-centre tensors) exploit it
+// DETERMINISTICALLY without atomics and so do not use this flag at all. See the
+// cross-builder symmetry audit in docs/roadmap.md. None is always the default,
+// preserving the deterministic guarantees.
 
 namespace intti {
 

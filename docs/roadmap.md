@@ -961,7 +961,8 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
 - **kbuild.hpp exchange full 8-fold** DONE (opt-in behind a shared symmetry
   flag). The deterministic per-output-block build (K_ab=K_ba 2x, no atomics,
   byte-for-byte MPI-reproducible) stays the DEFAULT. New Symmetry::Full
-  (symmetry.hpp -- a library-wide flag, next adopters the 3-electron builds)
+  (symmetry.hpp -- a library-wide flag; see the cross-builder audit below for
+  why it stays K-only in practice)
   evaluates each unique quartet (bra pair a<=c, ket pair b<=d, bra idx >= ket
   idx) ONCE: it accumulates the four symmetry-distinct density contractions
   (Acc1 K_ab<-D_cd, Acc2 K_cb<-D_ad, Acc3 K_ad<-D_cb, Acc4 K_cd<-D_ab) over the
@@ -975,6 +976,26 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
   vs exact dense K (1e-11) and vs the deterministic build (1e-11), screened and
   unscreened. GPU caveat: the four KNC*KNC accumulators + g tables are a large
   per-work-item local footprint (fine on CPU/OpenMP; may hurt GPU occupancy).
+- **Symmetry across all builders -- audit (2026-09-05).** Question: should the
+  atomic-scatter Symmetry::Full apply to every builder? Finding: NO -- it is a
+  K-specific win. It pays only where an expensive, UN-folded integral evaluation
+  is duplicated across output blocks (K). Builder by builder:
+  * K (exchange): the one true beneficiary; atomic 8-fold above (~4x). DONE.
+  * J (coulomb_build) and tc (tc_gradu_grad_build): density is PRE-FOLDED into
+    Hermite space, so the pair-pair symmetry (p|q)=(q|p) would save only the
+    cheap hermite_b setup, not the dominant density-folded contraction (each
+    direction folds a different density d^q vs d^p) -- ~1.1-1.3x for a loss of
+    determinism. NOT worth it; leave deterministic.
+  * coulomb_2c (P|Q) and coulomb_3c (mu nu|P): had an unexploited 2x, but it is
+    a plain output-block mirror (transpose / bra-swap) -- free and DETERMINISTIC,
+    no atomics needed. DONE unconditionally (a>=b / m>=n triangle + mirror),
+    bit-exact, validated vs the PySCF int2c2e/int3c2e oracles. No flag: the
+    Symmetry flag is reserved for the determinism-trading atomic case (K).
+  * oneel/nuclear (1e), threeel_ri (P<->Q 2x), erigrad/erihess/giao2e (8-fold):
+    already exploit their full symmetry, deterministically.
+  Conclusion: the flag stays K-only; every other builder either already has its
+  symmetry or gains it deterministically (2c/3c) -- "Symmetry::Full everywhere"
+  would be no-ops or determinism-losing regressions elsewhere.
 - **cholesky.hpp:256-260 rank update as scalar AXPYs** (O(naux^2 nprod)) -- really
   a GEMV/GEMM against the accumulated L block; float/double dispatch, scalar
   fallback for extended precision.

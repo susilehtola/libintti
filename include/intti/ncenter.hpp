@@ -51,16 +51,21 @@ std::vector<Real> coulomb_2c(const ShellBasis<Real> &aux, const TGrid<Real> &gri
   const int naux = aux.nao;
   std::vector<Real> M(static_cast<std::size_t>(naux) * naux, Real(0));
   const int ns = static_cast<int>(aux.shells.size());
+  // (P|Q) = (Q|P): compute the a >= b triangle once and mirror the transpose.
   for (int a = 0; a < ns; ++a)
-    for (int b = 0; b < ns; ++b) {
+    for (int b = 0; b <= a; ++b) {
       auto bra = detail::ghost_pair(aux.shells[a]);
       auto ket = detail::ghost_pair(aux.shells[b]);
       const int nP = ncart(aux.shells[a].l), nQ = ncart(aux.shells[b].l);
       std::vector<Real> blk(static_cast<std::size_t>(nP) * nQ);
       eri_quartet(bra, ket, grid, blk.data());
       for (int kP = 0; kP < nP; ++kP)
-        for (int kQ = 0; kQ < nQ; ++kQ)
-          M[(aux.ao_off[a] + kP) * naux + aux.ao_off[b] + kQ] = blk[kP * nQ + kQ];
+        for (int kQ = 0; kQ < nQ; ++kQ) {
+          const Real v = blk[kP * nQ + kQ];
+          M[(aux.ao_off[a] + kP) * naux + aux.ao_off[b] + kQ] = v;
+          if (a != b)
+            M[(aux.ao_off[b] + kQ) * naux + aux.ao_off[a] + kP] = v; // transpose mirror
+        }
     }
   return M;
 }
@@ -82,8 +87,9 @@ std::vector<Real> coulomb_3c(const ShellBasis<Real> &orb,
   const int nsa = static_cast<int>(aux.shells.size());
   const bool far = far_tau > Real(0);
   const Real far_cut = far ? -log_(far_tau) : Real(0);
+  // (mu nu | P) = (nu mu | P): compute the m >= n triangle once and mirror.
   for (int m = 0; m < nso; ++m)
-    for (int n = 0; n < nso; ++n) {
+    for (int n = 0; n <= m; ++n) {
       auto bra = make_pair(orb.shells[m], orb.shells[n]);
       const int nm = ncart(orb.shells[m].l), nn = ncart(orb.shells[n].l);
       for (int a = 0; a < nsa; ++a) {
@@ -96,11 +102,18 @@ std::vector<Real> coulomb_3c(const ShellBasis<Real> &orb,
           eri_quartet(bra, ket, grid, blk.data());
         for (int km = 0; km < nm; ++km)
           for (int kn = 0; kn < nn; ++kn)
-            for (int kP = 0; kP < nP; ++kP)
+            for (int kP = 0; kP < nP; ++kP) {
+              const Real v = blk[(km * nn + kn) * nP + kP];
               T[((static_cast<std::size_t>(orb.ao_off[m] + km) * nao +
                   orb.ao_off[n] + kn) *
                  naux) +
-                aux.ao_off[a] + kP] = blk[(km * nn + kn) * nP + kP];
+                aux.ao_off[a] + kP] = v;
+              if (m != n)
+                T[((static_cast<std::size_t>(orb.ao_off[n] + kn) * nao +
+                    orb.ao_off[m] + km) *
+                   naux) +
+                  aux.ao_off[a] + kP] = v; // mu<->nu mirror
+            }
       }
     }
   return T;
