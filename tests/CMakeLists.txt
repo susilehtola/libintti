@@ -27,6 +27,7 @@ add_executable(intti_tests
   test_cdjk.cpp
   test_giao.cpp
   test_oneel.cpp
+  test_contracted.cpp
   test_nuclear.cpp
   test_ncenter.cpp
   test_localhybrid.cpp

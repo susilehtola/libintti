@@ -697,8 +697,29 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      geometry-optimisation throughput becomes a priority.
   5. **General & partial-general contraction** (SHARK Sec 3.3-3.4): "giant"
      E-matrices per atom+angular-momentum GEMM-contracted; PGC via
-     decontract -> recontract. Needed for efficiency on real def2/ANO basis sets
-     (we have no contraction strategy yet).
+     decontract -> recontract. Needed for efficiency on real def2/ANO basis sets.
+     STARTED (2026-09-05, include/intti/contracted.hpp). User decision: make the
+     native matrix API NATIVELY generally contracted via CONTRACTION-AWARE
+     BUILDERS (shared primitive intermediates), NOT a decontract/recontract
+     C^T M C wrapper (which would forfeit the GC efficiency it exists to give).
+     New representation: `ContractedShell` (nprim exponents + nprim x nctr
+     coefficient block, one shell = many contracted functions sharing the
+     primitive set) and `ContractedBasis` + `make_contracted_basis`. AO layout
+     within a shell is contracted-outer, Cartesian-inner (c*ncart(l)+k, matching
+     the libcint facade). Normalization convention (pinned to PySCF cart=True so
+     the matrices compare directly to int1e_*_cart): the weight on the engine's
+     UNNORMALIZED primitive is d_{cp} * cart_norm_pyscf(l, alpha_p). The builder
+     evaluates each primitive-pair 1D table ONCE and reuses it across every
+     contracted-function/Cartesian pair -- the shared-intermediate GC path.
+     Increment 1: contraction-aware overlap_matrix + kinetic_matrix, validated
+     (tests/test_contracted.cpp, suite 210/210) against (a) an independent
+     closed-form contracted-Gaussian self-overlap and (b) a decontract ->
+     primitive -> recontract reference off the analytically-validated primitive
+     builders (isolating the contraction+normalization layer); the test basis
+     uses a genuinely general contraction (s shell, 3 primitives -> 2 contracted
+     functions). Next increments: contracted multipole/nuclear (1e), then the
+     contracted J/K and n-center builders (the 2e payoff), then a PySCF
+     cross-check on a real contracted basis (cc-pVDZ) via an intti_dump driver.
 
   Note where we are AHEAD of SHARK and must not regress: range separation is a
   node-list (erf/erfc/Yukawa) with native position-dependent omega(r) for local
