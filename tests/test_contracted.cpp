@@ -113,9 +113,11 @@ std::vector<double> contract_ref(const ContractedBasis<double> &cb, Builder prim
   return conjugate(C, cb.nao, npao, prim_builder(pbasis));
 }
 
-// A small generally-contracted test basis: an s shell with 3 primitives and
-// TWO contracted functions (general contraction), plus a p shell with 2
-// primitives and 1 contracted function on a second center.
+// A small generally-contracted test basis exercising l = 0, 1, 2 and general
+// contraction (nctr > 1): an s shell (3 primitives -> 2 contracted functions),
+// a p shell (2 primitives -> 1) on a second center, and a d shell (2 primitives
+// -> 2 contracted functions) -- the d shell tests the l >= 2 contraction
+// bookkeeping (ncart = 6 and the cart_norm_pyscf sqrt(4 pi/(2l+1)) factor).
 ContractedBasis<double> test_basis() {
   ContractedShell<double> s;
   s.center[0] = 0; s.center[1] = 0; s.center[2] = 0;
@@ -128,7 +130,13 @@ ContractedBasis<double> test_basis() {
   p.l = 1;
   p.alpha = {1.0, 0.35};
   p.coeff = {0.6, 0.5};
-  return intti::make_contracted_basis<double>({s, p});
+  ContractedShell<double> d;
+  d.center[0] = 0; d.center[1] = 0.2; d.center[2] = 0.5;
+  d.l = 2;
+  d.alpha = {1.5, 0.5};
+  d.coeff = {0.7, 0.4,   // contracted function 0
+             0.2, 0.9};  // contracted function 1
+  return intti::make_contracted_basis<double>({s, p, d});
 }
 
 // Closed-form self-overlap of a single contracted s function:
@@ -315,7 +323,7 @@ TEST(Contracted, ExchangeVsDecontractRecontract) {
 TEST(Contracted, SymmetricAndSized) {
   auto cb = test_basis();
   auto S = intti::overlap_matrix(cb);
-  EXPECT_EQ(cb.nao, 2 * 1 + 1 * 3); // 2 s-contractions + 1 p-contraction (3 cart)
+  EXPECT_EQ(cb.nao, 2 * 1 + 1 * 3 + 2 * 6); // s(2x1) + p(1x3) + d(2x6) = 17
   const int n = cb.nao;
   double asym = 0;
   for (int i = 0; i < n; ++i)
