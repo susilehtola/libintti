@@ -1078,8 +1078,23 @@ of s-Gaussians) vs the analytic Coulomb, and SPECTRALLY CONVERGENT: rel error
 REPRESENTATION-limited (the t-adapted quadrature is machine-exact per steps
 1-2). This is the engine that unlocks the single-3D-tensor co-density
 exchange (form g_qi once, one DAGE solve per (q,i)) and the grid SCF solver.
-Remaining: refine to production accuracy + screening/cost tuning; multi-centre
-bridging; wire into a co-density K build and the Helmholtz grid solver.
+
+**Multi-centre 3D DAGE validated** (prototype/fe_dage_multicenter.cpp,
+2026-09-05): the SAME 3D DAGE on a GLOBAL tensorial box grid covering two nuclei,
+applied to a non-separable TWO-CENTRE density, reproduces the analytic
+two-centre Coulomb -- CROSS-CENTRE term included (Boys F0) -- to rel 9.5e-8 at
+6 elements x degree 8 (N=54/axis), bond separation 1.4. The machinery is
+unchanged (separability is in the kernel); the molecular case is just a bigger
+box and a multi-centre density, and far element pairs auto-screen in the 1D
+convolution. This is the user's chosen tensorial (global-grid) route -- it
+accepts over-resolution in the far regions for the Cartesian-factorization
+simplicity. So multi-centre Coulomb for general densities is de-risked; the
+multipole far-field (design point 4) remains the EFFICIENCY layer for large
+separations (replace the auto-screened far element pairs with a multipole
+interaction) rather than a correctness need.
+Remaining: refine to production accuracy + multipole-far efficiency + screening/
+cost tuning; wire the 3D DAGE into a real co-density K build (molecular) and the
+Helmholtz grid solver; turn the prototypes into library code.
 
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
