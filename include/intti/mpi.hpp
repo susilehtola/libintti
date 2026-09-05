@@ -81,10 +81,10 @@ void coulomb_build_mpi(const ShellBasis<Real> &basis, const Real *D,
 template <class Real>
 void exchange_build_mpi(const ShellBasis<Real> &basis, const Real *D,
                         const TGrid<Real> &grid, Real *K, MPI_Comm comm,
-                        Real tau = Real(1e-12)) {
+                        Real tau = Real(1e-12), Symmetry sym = Symmetry::None) {
   const int rank = mpi_rank(comm);
   const int nranks = mpi_size(comm);
-  exchange_build(basis, D, grid, K, tau, rank, nranks);
+  exchange_build(basis, D, grid, K, tau, rank, nranks, sym);
   mpi_allreduce_sum(K, basis.nao * basis.nao, comm);
 }
 

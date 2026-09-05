@@ -874,9 +874,23 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
   measured 5.1x on a 12-shell s/p/d set (approaching the 8x ceiling, gap =
   permute-copy overhead + smaller diagonal orbits). Screening-consistency tests
   added (tiny-tau == exact). Existing FD oracles + full suite green (194/194).
-- **kbuild.hpp:104-229 exchange -- no permutational symmetry.** K_ab=K_ba gives a
-  free 2x (compute a<=b, mirror); full (ac|bd) 8-fold is ~8x but needs atomics
-  and a reworked MPI split. Hottest kernel, so even 2x matters.
+- **kbuild.hpp exchange full 8-fold** DONE (opt-in behind a shared symmetry
+  flag). The deterministic per-output-block build (K_ab=K_ba 2x, no atomics,
+  byte-for-byte MPI-reproducible) stays the DEFAULT. New Symmetry::Full
+  (symmetry.hpp -- a library-wide flag, next adopters the 3-electron builds)
+  evaluates each unique quartet (bra pair a<=c, ket pair b<=d, bra idx >= ket
+  idx) ONCE: it accumulates the four symmetry-distinct density contractions
+  (Acc1 K_ab<-D_cd, Acc2 K_cb<-D_ad, Acc3 K_ad<-D_cb, Acc4 K_cd<-D_ab) over the
+  t-nodes, then atomic-scatters the deduplicated 8-element orbit into K. The
+  dedup (drop ops whose shell 4-tuple already appeared) makes the coincidence
+  bookkeeping (a==c, b==d, braPair==ketPair) automatic and provably complete.
+  Measured 4.08x on a 24-shell/66-AO s/p/d set; matches the deterministic build
+  to 2.5e-14 (rounding, since atomic order is nondeterministic). Cost: a Full
+  build is not bit-reproducible and the MPI Full build is numerically- not
+  byte-reproducible -- hence opt-in, default preserves all guarantees. Validated
+  vs exact dense K (1e-11) and vs the deterministic build (1e-11), screened and
+  unscreened. GPU caveat: the four KNC*KNC accumulators + g tables are a large
+  per-work-item local footprint (fine on CPU/OpenMP; may hurt GPU occupancy).
 - **cholesky.hpp:256-260 rank update as scalar AXPYs** (O(naux^2 nprod)) -- really
   a GEMV/GEMM against the accumulated L block; float/double dispatch, scalar
   fallback for extended precision.

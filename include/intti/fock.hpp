@@ -179,7 +179,7 @@ void coulomb_build(const ShellBasis<Real> &basis, const Real *D,
 template <class Real>
 void exchange_build(const ShellBasis<Real> &basis, const Real *D,
                     const TGrid<Real> &grid, Real *K, Real tau, int rank,
-                    int nranks) {
+                    int nranks, Symmetry sym) {
   const int ns = static_cast<int>(basis.shells.size());
   // full rectangular (a, c) pair set: the density index straddles the pairs
   std::vector<ShellPair<Real>> plist;
@@ -190,7 +190,7 @@ void exchange_build(const ShellBasis<Real> &basis, const Real *D,
   auto tab = make_pair_table(plist);
   auto Q = schwarz(tab, plist, grid);
   detail::exchange_build_impl(basis.shells, basis.ao_off, basis.nao, D, grid, K,
-                              tau, Q, tab, rank, nranks);
+                              tau, Q, tab, rank, nranks, sym);
 }
 
 } // namespace intti

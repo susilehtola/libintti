@@ -144,4 +144,37 @@ TEST(Fock, SymmetricDensityGivesSymmetricJK) {
   EXPECT_LT(asymK, 1e-12 * max_abs(K));
 }
 
+// The opt-in Symmetry::Full exchange build (atomic 8-fold scatter) must match
+// both the exact dense K and the default deterministic build (to rounding).
+TEST(Fock, ExchangeSym8MatchesDenseAndDeterministic) {
+  auto b = test_basis();
+  auto D = random_symmetric(b.nao, 19);
+  const std::size_t n2 = static_cast<std::size_t>(b.nao) * b.nao;
+  for (bool linlog : {false, true}) {
+    intti::TGridSpec<double> spec;
+    if (linlog) spec.mapping = intti::TMapping::LinLog;
+    auto grid = intti::make_tgrid(intti::coulomb(), spec);
+    std::vector<double> Kdet(n2), Ksym(n2), Jref, Kref;
+    intti::exchange_build(b, D.data(), grid, Kdet.data(), 0.0);
+    intti::exchange_build(b, D.data(), grid, Ksym.data(), 0.0, 0, 1,
+                          intti::Symmetry::Full);
+    dense_jk(b, D, grid, Jref, Kref);
+    EXPECT_LT(max_abs_diff(Ksym, Kref), 1e-11 * max_abs(Kref)) << "linlog=" << linlog;
+    EXPECT_LT(max_abs_diff(Ksym, Kdet), 1e-11 * max_abs(Kdet)) << "linlog=" << linlog;
+  }
+}
+
+// Sym8 must remain correct with screening on (compared to exact dense, within
+// the screening tolerance).
+TEST(Fock, ExchangeSym8Screened) {
+  auto b = test_basis();
+  auto D = random_symmetric(b.nao, 23);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const std::size_t n2 = static_cast<std::size_t>(b.nao) * b.nao;
+  std::vector<double> Ksym(n2), Jref, Kref;
+  intti::exchange_build(b, D.data(), grid, Ksym.data(), 1e-10, 0, 1, intti::Symmetry::Full);
+  dense_jk(b, D, grid, Jref, Kref);
+  EXPECT_LT(max_abs_diff(Ksym, Kref), 1e-7 * max_abs(Kref));
+}
+
 } // namespace
