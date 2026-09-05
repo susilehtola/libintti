@@ -94,6 +94,56 @@ TEST(LocalHybrid, RangeSeparatedIntegratesToShortRangeExchange) {
   EXPECT_LT(std::abs(le.energy), std::abs(Ex) + 1.0); // sanity
 }
 
+// LRSH with a per-point omega that includes every t-node reduces exactly to the
+// full-range local_exchange on the same base grid (validates the per-point
+// truncation plumbing).
+TEST(LocalHybrid, LrshFullOmegaMatchesGlobal) {
+  auto bas = basis();
+  const int nao = bas.nao;
+  auto base = intti::make_tgrid(intti::coulomb());
+  std::vector<double> C(nao, 1.0);
+  auto Sm = intti::overlap_matrix(bas);
+  double norm = 0;
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) norm += C[i] * Sm[i * nao + j] * C[j];
+  for (auto &c : C) c /= std::sqrt(norm);
+  std::vector<std::array<double, 3>> pts;
+  std::vector<double> w;
+  gl_box(7.0, 20, pts, w);
+  auto full = intti::local_exchange(bas, C.data(), 1, pts, w, base);
+  double tmax = 0;
+  for (double t : base.t) tmax = std::max(tmax, t);
+  std::vector<double> om(pts.size(), tmax + 1.0); // every node kept
+  auto lrsh = intti::local_exchange_lrsh(bas, C.data(), 1, pts, w, om, base);
+  EXPECT_NEAR(lrsh.energy, full.energy, 1e-10 * std::abs(full.energy));
+}
+
+// The exchange magnitude grows monotonically as the per-point omega admits more
+// of the t-range (short-range -> full): |E(omega small)| < |E(mid)| < |E(full)|.
+TEST(LocalHybrid, LrshOmegaMonotone) {
+  auto bas = basis();
+  const int nao = bas.nao;
+  auto base = intti::make_tgrid(intti::coulomb());
+  std::vector<double> C(nao, 1.0);
+  auto Sm = intti::overlap_matrix(bas);
+  double norm = 0;
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) norm += C[i] * Sm[i * nao + j] * C[j];
+  for (auto &c : C) c /= std::sqrt(norm);
+  std::vector<std::array<double, 3>> pts;
+  std::vector<double> w;
+  gl_box(7.0, 20, pts, w);
+  double tmax = 0;
+  for (double t : base.t) tmax = std::max(tmax, t);
+  auto en = [&](double omega) {
+    std::vector<double> o(pts.size(), omega);
+    return intti::local_exchange_lrsh(bas, C.data(), 1, pts, w, o, base).energy;
+  };
+  const double sr = en(0.5), mid = en(1.5), full = en(tmax + 1.0);
+  EXPECT_LT(std::abs(sr), std::abs(mid)) << "sr=" << sr << " mid=" << mid;
+  EXPECT_LT(std::abs(mid), std::abs(full)) << "mid=" << mid << " full=" << full;
+}
+
 TEST(LocalHybrid, AOValuesMatchDefinition) {
   auto bas = basis();
   std::vector<std::array<double, 3>> pts{{0.1, -0.2, 0.3}};

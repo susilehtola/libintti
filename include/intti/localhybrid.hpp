@@ -30,6 +30,7 @@
 
 #include "fock.hpp"
 #include "gto.hpp"
+#include "kernel.hpp" // erf_rs (position-dependent range separation)
 #include "math.hpp"
 #include "nuclear.hpp"
 #include "tgrid.hpp"
@@ -105,6 +106,67 @@ LocalExchange<Real> local_exchange(const ShellBasis<Real> &basis, const Real *C,
     // eps = -1/2 sum_ij psi_i psi_j (C^T V C)_ij collapses (sum over i,j first):
     //     = -1/2 sum_{mu nu} V_{mu nu} u_mu u_nu,  u_mu = sum_i C_{mu i} psi_i.
     // This drops the occupied index -- O(nao^2 nocc)+O(nocc^2 nao) -> O(nao^2).
+    for (int mu = 0; mu < nao; ++mu) {
+      Real s = 0;
+      for (int i = 0; i < nocc; ++i) s += C[mu * nocc + i] * psi[i];
+      u[mu] = s;
+    }
+    Real e = 0;
+    for (int mu = 0; mu < nao; ++mu) {
+      Real row = 0;
+      for (int nu = 0; nu < nao; ++nu) row += V[mu * nao + nu] * u[nu];
+      e += u[mu] * row;
+    }
+    out.eps[g] = Real(-0.5) * e;
+  }
+  if (!weights.empty()) {
+    Real E = 0;
+    for (int g = 0; g < np; ++g) E += weights[g] * out.eps[g];
+    out.energy = E;
+  }
+  return out;
+}
+
+/// Locally range-separated exchange energy density: like local_exchange, but the
+/// range-separation parameter is POSITION-DEPENDENT. At grid point r_g the
+/// short-range exact-exchange kernel is the shared t-grid TRUNCATED at
+/// t = omega_g -- i.e. erf(omega_g r)/r to the base grid's resolution, since
+/// erf(w r)/r = (2/sqrt(pi)) int_0^w e^{-t^2 r^2} dt uses exactly the t-nodes
+/// with t <= w. This per-point truncation of the SAME nodes (no per-point grid
+/// build, no new kernel) is the distinctive t-quadrature capability -- analytic
+/// Boys-function codes cannot vary omega per point cheaply. `omega` holds one
+/// value per grid point; `base` is the full t-grid (e.g. make_tgrid(coulomb())).
+/// With omega_g >= max node this reduces exactly to local_exchange(base) (full-
+/// range eps_x^HF); smaller omega_g keeps only the short-range part.
+template <class Real>
+LocalExchange<Real> local_exchange_lrsh(const ShellBasis<Real> &basis, const Real *C,
+                                        int nocc,
+                                        const std::vector<std::array<Real, 3>> &points,
+                                        const std::vector<Real> &weights,
+                                        const std::vector<Real> &omega,
+                                        const TGrid<Real> &base) {
+  const int nao = basis.nao;
+  const int np = static_cast<int>(points.size());
+  auto phi = ao_values(basis, points);
+  LocalExchange<Real> out;
+  out.eps.assign(np, Real(0));
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  std::vector<Real> V(n2), psi(nocc), u(nao);
+  TGrid<Real> tg; // host-only sub-grid (base nodes with t <= omega_g), reused
+  for (int g = 0; g < np; ++g) {
+    tg.t.clear();
+    tg.w.clear();
+    for (int k = 0; k < base.n(); ++k)
+      if (base.t[k] <= omega[g]) { tg.t.push_back(base.t[k]); tg.w.push_back(base.w[k]); }
+    std::fill(V.begin(), V.end(), Real(0));
+    std::vector<PointCharge<Real>> one{{Real(1), {points[g][0], points[g][1], points[g][2]}}};
+    detail::attraction_accumulate(basis, one, tg, Real(0), V.data());
+    const Real *phg = &phi[static_cast<std::size_t>(g) * nao];
+    for (int i = 0; i < nocc; ++i) {
+      Real s = 0;
+      for (int mu = 0; mu < nao; ++mu) s += phg[mu] * C[mu * nocc + i];
+      psi[i] = s;
+    }
     for (int mu = 0; mu < nao; ++mu) {
       Real s = 0;
       for (int i = 0; i < nocc; ++i) s += C[mu * nocc + i] * psi[i];

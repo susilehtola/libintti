@@ -12,6 +12,13 @@ approved plan) is under way and mostly delivered:
 - **M12 done** — 2-/3-center Coulomb (ghost-shell), `ncenter.hpp`.
 - **M13 done** — RI J/K + occupation-driven RI-K, `ri.hpp`.
 - **M14 done** — local & locally range-separated exchange energy density, `localhybrid.hpp`.
+  Now includes POSITION-DEPENDENT omega(r): `local_exchange_lrsh` truncates the
+  shared t-grid at t = omega_g per grid point (erf(omega_g r)/r to the base grid's
+  resolution -- the distinctive t-quadrature capability; analytic-Boys codes can't
+  vary omega per point). Validated (2026-09-06): full-omega reduces to the global
+  local_exchange at machine precision, and |E_x| grows monotonically as omega
+  admits more of the t-range (suite 228/228). Remaining M14: the KS potential
+  (Fock-like) matrix from the local-hybrid energy (a(r)-weighted K), for SCF.
 - **M16 (in progress)** — derivative integrals, `deriv.hpp`: one-electron
   gradient set complete (overlap/kinetic/nuclear, vs PySCF `int1e_ip*` and
   finite difference); two-electron gradient (`erigrad.hpp`) and arbitrary-order
