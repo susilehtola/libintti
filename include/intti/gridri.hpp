@@ -103,66 +103,139 @@ std::vector<std::vector<Real>> ao_values_on_grid(const ShellBasis<Real> &basis,
 }
 
 namespace detail {
-/// Grid-RI Coulomb from precomputed AO values (n AOs, each an N^3 tensor).
+/// AO values on the DEVICE: ao(a, g) for AO a and row-major grid point g
+/// (g = (ix*N+iy)*N+iz). Cartesian primitive shells evaluated directly on the
+/// device (per-AO exponent/centre/Cartesian powers staged as Views).
 template <class Real>
-std::vector<Real> grid_coulomb_from_ao(const std::vector<std::vector<Real>> &ao, int n,
-                                       const Real *D, const FEGrid1D<Real> &grid,
-                                       const TGrid<Real> &tgrid, int nv) {
+Kokkos::View<Real **> ao_on_grid_dev(const ShellBasis<Real> &basis, const FEGrid1D<Real> &grid) {
+  const int nao = basis.nao, N = grid.N;
+  const std::size_t N3 = static_cast<std::size_t>(N) * N * N;
+  std::vector<Real> al(nao), cx(nao), cy(nao), cz(nao);
+  std::vector<int> lx(nao), ly(nao), lz(nao);
+  for (int s = 0; s < static_cast<int>(basis.shells.size()); ++s) {
+    const auto &sh = basis.shells[s];
+    for (int k = 0; k < ncart(sh.l); ++k) {
+      int a3[3];
+      cart_comp(sh.l, k, a3[0], a3[1], a3[2]);
+      const int a = basis.ao_off[s] + k;
+      al[a] = sh.alpha; cx[a] = sh.center[0]; cy[a] = sh.center[1]; cz[a] = sh.center[2];
+      lx[a] = a3[0]; ly[a] = a3[1]; lz[a] = a3[2];
+    }
+  }
+  auto Av = to_device(al, "gr::al"), Cx = to_device(cx, "gr::cx"),
+       Cy = to_device(cy, "gr::cy"), Cz = to_device(cz, "gr::cz");
+  auto Lx = to_device(lx, "gr::lx"), Ly = to_device(ly, "gr::ly"), Lz = to_device(lz, "gr::lz");
+  auto xn = to_device(grid.xnode, "gr::xn");
+  Kokkos::View<Real **> ao("gr::ao", nao, N3);
+  Kokkos::parallel_for(
+      "gr::aoeval", Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {nao, static_cast<int>(N3)}),
+      KOKKOS_LAMBDA(int a, int g) {
+        const int ix = g / (N * N), iy = (g / N) % N, iz = g % N;
+        const Real dx = xn(ix) - Cx(a), dy = xn(iy) - Cy(a), dz = xn(iz) - Cz(a);
+        Real v = Kokkos::exp(-Av(a) * (dx * dx + dy * dy + dz * dz));
+        for (int i = 0; i < Lx(a); ++i) v *= dx;
+        for (int i = 0; i < Ly(a); ++i) v *= dy;
+        for (int i = 0; i < Lz(a); ++i) v *= dz;
+        ao(a, g) = v;
+      });
+  return ao;
+}
+
+/// Copy host AO values (the contracted / spherical evaluators) to a device View.
+template <class Real>
+Kokkos::View<Real **> ao_host_to_dev(const std::vector<std::vector<Real>> &ao, std::size_t N3) {
+  const int nao = static_cast<int>(ao.size());
+  Kokkos::View<Real **> d("gr::aoh", nao, N3);
+  auto h = Kokkos::create_mirror_view(d);
+  for (int a = 0; a < nao; ++a)
+    for (std::size_t g = 0; g < N3; ++g) h(a, g) = ao[a][g];
+  Kokkos::deep_copy(d, h);
+  return d;
+}
+
+/// Grid-RI Coulomb entirely on the device from a device AO View: rho(g) =
+/// sum_ab D_ab ao(a,g) ao(b,g); V = DAGE(rho); J_ab = sum_g w(g) ao(a,g)
+/// ao(b,g) V(g). Returns the host J matrix.
+template <class Real>
+std::vector<Real> grid_coulomb_dev(const Kokkos::View<Real **> &ao, int nao,
+                                   const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
+                                   const Real *D, int nv) {
   const int N = grid.N;
   const std::size_t N3 = static_cast<std::size_t>(N) * N * N;
-  std::vector<Real> rho(N3, Real(0));
-  for (int i = 0; i < n; ++i)
-    for (int j = 0; j < n; ++j) {
-      const Real d = D[i * n + j];
-      if (d == Real(0)) continue;
-      const Real *ci = ao[i].data();
-      const Real *cj = ao[j].data();
-      for (std::size_t g = 0; g < N3; ++g) rho[g] += d * ci[g] * cj[g];
-    }
-  auto V = fe_dage3d(grid, tgrid, rho, nv);
-  std::vector<Real> J(static_cast<std::size_t>(n) * n, Real(0));
-  std::vector<Real> prod(N3);
-  for (int i = 0; i < n; ++i)
-    for (int j = i; j < n; ++j) {
-      const Real *ci = ao[i].data();
-      const Real *cj = ao[j].data();
-      for (std::size_t g = 0; g < N3; ++g) prod[g] = ci[g] * cj[g];
-      const Real v = fe_inner(grid, prod, V);
-      J[i * n + j] = J[j * n + i] = v;
-    }
+  auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "gr::D");
+  Kokkos::View<Real *> rho("gr::rho", N3);
+  Kokkos::parallel_for(
+      "gr::rho", N3, KOKKOS_LAMBDA(std::size_t g) {
+        Real r = 0;
+        for (int a = 0; a < nao; ++a) {
+          Real sa = 0;
+          for (int b = 0; b < nao; ++b) sa += Dd(a * nao + b) * ao(b, g);
+          r += ao(a, g) * sa;
+        }
+        rho(g) = r;
+      });
+  auto V = fe_dage3d_dev(grid, tgrid, rho, nv, Real(8));
+  auto xw = to_device(grid.xw, "gr::xw");
+  Kokkos::View<Real **> Jd("gr::Jd", nao, nao);
+  Kokkos::parallel_for(
+      "gr::contractJ", Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {nao, nao}),
+      KOKKOS_LAMBDA(int a, int b) {
+        if (b < a) return;
+        Real s = 0;
+        for (std::size_t g = 0; g < N3; ++g) {
+          const int ix = g / (N * N), iy = (g / N) % N, iz = g % N;
+          s += xw(ix) * xw(iy) * xw(iz) * ao(a, g) * ao(b, g) * V(g);
+        }
+        Jd(a, b) = s;
+        Jd(b, a) = s;
+      });
+  auto hJ = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Jd);
+  std::vector<Real> J(static_cast<std::size_t>(nao) * nao);
+  for (int a = 0; a < nao; ++a)
+    for (int b = 0; b < nao; ++b) J[a * nao + b] = hJ(a, b);
   return J;
 }
 
-/// Grid-RI exchange from precomputed AO values.
+/// Grid-RI exchange entirely on the device from a device AO View: for each
+/// occupied orbital c, phi = sum_u Cocc_uc ao(u); for each v, V_v = DAGE(ao(v)
+/// phi); K_uv += sum_g w(g) ao(u,g) phi(g) V_v(g). Returns the host K matrix.
 template <class Real>
-std::vector<Real> grid_exchange_from_ao(const std::vector<std::vector<Real>> &ao, int n,
-                                        const Real *Cocc, int nocc, const FEGrid1D<Real> &grid,
-                                        const TGrid<Real> &tgrid, int nv) {
+std::vector<Real> grid_exchange_dev(const Kokkos::View<Real **> &ao, int nao,
+                                    const Real *Cocc, int nocc, const FEGrid1D<Real> &grid,
+                                    const TGrid<Real> &tgrid, int nv) {
   const int N = grid.N;
   const std::size_t N3 = static_cast<std::size_t>(N) * N * N;
-  std::vector<Real> K(static_cast<std::size_t>(n) * n, Real(0));
-  std::vector<Real> phi(N3);
+  auto Cd = to_device(Cocc, static_cast<std::size_t>(nao) * nocc, "gr::C");
+  auto xw = to_device(grid.xw, "gr::xw");
+  Kokkos::View<Real **> Kd("gr::Kd", nao, nao);
+  Kokkos::deep_copy(Kd, Real(0));
+  Kokkos::View<Real *> phi("gr::phi", N3), gco("gr::gco", N3);
   for (int c = 0; c < nocc; ++c) {
-    for (std::size_t g = 0; g < N3; ++g) phi[g] = Real(0);
-    for (int u = 0; u < n; ++u) {
-      const Real m = Cocc[u * nocc + c];
-      if (m == Real(0)) continue;
-      const Real *cu = ao[u].data();
-      for (std::size_t g = 0; g < N3; ++g) phi[g] += m * cu[g];
+    Kokkos::parallel_for(
+        "gr::phi", N3, KOKKOS_LAMBDA(std::size_t g) {
+          Real p = 0;
+          for (int u = 0; u < nao; ++u) p += Cd(u * nocc + c) * ao(u, g);
+          phi(g) = p;
+        });
+    for (int v = 0; v < nao; ++v) {
+      Kokkos::parallel_for(
+          "gr::gco", N3, KOKKOS_LAMBDA(std::size_t g) { gco(g) = ao(v, g) * phi(g); });
+      auto Vv = fe_dage3d_dev(grid, tgrid, gco, nv, Real(8));
+      Kokkos::parallel_for(
+          "gr::contractK", nao, KOKKOS_LAMBDA(int u) {
+            Real s = 0;
+            for (std::size_t g = 0; g < N3; ++g) {
+              const int ix = g / (N * N), iy = (g / N) % N, iz = g % N;
+              s += xw(ix) * xw(iy) * xw(iz) * ao(u, g) * phi(g) * Vv(g);
+            }
+            Kd(u, v) += s;
+          });
     }
-    std::vector<std::vector<Real>> gco(n, std::vector<Real>(N3)), Vco(n);
-    for (int v = 0; v < n; ++v) {
-      const Real *cv = ao[v].data();
-      for (std::size_t g = 0; g < N3; ++g) gco[v][g] = cv[g] * phi[g];
-      Vco[v] = fe_dage3d(grid, tgrid, gco[v], nv);
-    }
-    for (int u = 0; u < n; ++u)
-      for (int v = u; v < n; ++v) {
-        const Real kv = fe_inner(grid, gco[u], Vco[v]);
-        K[u * n + v] += kv;
-        if (u != v) K[v * n + u] += kv;
-      }
   }
+  auto hK = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Kd);
+  std::vector<Real> K(static_cast<std::size_t>(nao) * nao);
+  for (int a = 0; a < nao; ++a)
+    for (int b = 0; b < nao; ++b) K[a * nao + b] = hK(a, b);
   return K;
 }
 } // namespace detail
@@ -173,7 +246,7 @@ template <class Real>
 std::vector<Real> grid_coulomb_build(const ShellBasis<Real> &basis, const Real *D,
                                      const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
                                      int nv = 24) {
-  return detail::grid_coulomb_from_ao(ao_values_on_grid(basis, grid), basis.nao, D, grid, tgrid, nv);
+  return detail::grid_coulomb_dev(detail::ao_on_grid_dev(basis, grid), basis.nao, grid, tgrid, D, nv);
 }
 
 /// Grid-RI exchange matrix K over a primitive Cartesian basis, via co-densities
@@ -183,8 +256,8 @@ template <class Real>
 std::vector<Real> grid_exchange_build(const ShellBasis<Real> &basis, const Real *Cocc,
                                       int nocc, const FEGrid1D<Real> &grid,
                                       const TGrid<Real> &tgrid, int nv = 24) {
-  return detail::grid_exchange_from_ao(ao_values_on_grid(basis, grid), basis.nao, Cocc, nocc,
-                                       grid, tgrid, nv);
+  return detail::grid_exchange_dev(detail::ao_on_grid_dev(basis, grid), basis.nao, Cocc, nocc,
+                                   grid, tgrid, nv);
 }
 
 // ---- spherical AOs: the c2s transform is FREE on the grid -------------------
@@ -238,8 +311,9 @@ template <class Real>
 std::vector<Real> grid_coulomb_build_spherical(const ShellBasis<Real> &basis, const Real *D,
                                                const FEGrid1D<Real> &grid,
                                                const TGrid<Real> &tgrid, int nv = 24) {
-  return detail::grid_coulomb_from_ao(ao_values_on_grid_spherical(basis, grid),
-                                      nao_spherical(basis), D, grid, tgrid, nv);
+  const std::size_t N3 = static_cast<std::size_t>(grid.N) * grid.N * grid.N;
+  return detail::grid_coulomb_dev(detail::ao_host_to_dev(ao_values_on_grid_spherical(basis, grid), N3),
+                                  nao_spherical(basis), grid, tgrid, D, nv);
 }
 
 /// Grid-RI exchange K over the SPHERICAL AOs (Cocc is nao_spherical x nocc).
@@ -247,8 +321,9 @@ template <class Real>
 std::vector<Real> grid_exchange_build_spherical(const ShellBasis<Real> &basis, const Real *Cocc,
                                                 int nocc, const FEGrid1D<Real> &grid,
                                                 const TGrid<Real> &tgrid, int nv = 24) {
-  return detail::grid_exchange_from_ao(ao_values_on_grid_spherical(basis, grid),
-                                       nao_spherical(basis), Cocc, nocc, grid, tgrid, nv);
+  const std::size_t N3 = static_cast<std::size_t>(grid.N) * grid.N * grid.N;
+  return detail::grid_exchange_dev(detail::ao_host_to_dev(ao_values_on_grid_spherical(basis, grid), N3),
+                                   nao_spherical(basis), Cocc, nocc, grid, tgrid, nv);
 }
 
 // ---- generally-contracted basis: contraction is FREE on the grid ------------
@@ -336,7 +411,9 @@ template <class Real>
 std::vector<Real> grid_coulomb_build(const ContractedBasis<Real> &basis, const Real *D,
                                      const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
                                      int nv = 24) {
-  return detail::grid_coulomb_from_ao(ao_values_on_grid(basis, grid), basis.nao, D, grid, tgrid, nv);
+  const std::size_t N3 = static_cast<std::size_t>(grid.N) * grid.N * grid.N;
+  return detail::grid_coulomb_dev(detail::ao_host_to_dev(ao_values_on_grid(basis, grid), N3),
+                                  basis.nao, grid, tgrid, D, nv);
 }
 
 /// Grid-RI exchange K over a generally-contracted basis (matches
@@ -345,8 +422,9 @@ template <class Real>
 std::vector<Real> grid_exchange_build(const ContractedBasis<Real> &basis, const Real *Cocc,
                                       int nocc, const FEGrid1D<Real> &grid,
                                       const TGrid<Real> &tgrid, int nv = 24) {
-  return detail::grid_exchange_from_ao(ao_values_on_grid(basis, grid), basis.nao, Cocc, nocc,
-                                       grid, tgrid, nv);
+  const std::size_t N3 = static_cast<std::size_t>(grid.N) * grid.N * grid.N;
+  return detail::grid_exchange_dev(detail::ao_host_to_dev(ao_values_on_grid(basis, grid), N3),
+                                   basis.nao, Cocc, nocc, grid, tgrid, nv);
 }
 
 } // namespace intti

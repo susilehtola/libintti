@@ -289,22 +289,25 @@ void fe_conv1d(const FEGrid1D<Real> &g, const std::vector<Real> &vg,
 /// the per-node math is identical to the serial reference. In the tensor-product
 /// grid every line shares the same 1D mesh, so all work-items do identical work
 /// (see the roadmap M-FE GPU note).
+namespace detail {
+/// Device core of fe_dage3d: the density R and the returned potential V are
+/// device Views (the grid is staged internally). Lets a caller chain the whole
+/// grid-RI pipeline on the device without a host round-trip.
 template <class Real>
-std::vector<Real> fe_dage3d(const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
-                            const std::vector<Real> &rho, int nv = 32, Real vmax = Real(8)) {
+Kokkos::View<Real *> fe_dage3d_dev(const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
+                                   const Kokkos::View<Real *> &R, int nv, Real vmax) {
   const int N = grid.N, ne = grid.ne;
   const std::size_t N3 = static_cast<std::size_t>(N) * N * N;
   std::vector<Real> vgh, vwh;
-  detail::fe_gauss_legendre<Real>(nv, Real(-1), Real(1), vgh, vwh);
-  auto xnode = detail::to_device(grid.xnode, "fe::xnode");
-  auto be = detail::to_device(grid.be, "fe::be");
-  auto nps = detail::to_device(grid.nps, "fe::nps");
-  auto noff = detail::to_device(grid.noff, "fe::noff");
-  auto rn = detail::to_device(grid.rn, "fe::rn");
-  auto bw = detail::to_device(grid.bw, "fe::bw");
-  auto vg = detail::to_device(vgh, "fe::vg");
-  auto vw = detail::to_device(vwh, "fe::vw");
-  auto R = detail::to_device(rho, "fe::rho");
+  fe_gauss_legendre<Real>(nv, Real(-1), Real(1), vgh, vwh);
+  auto xnode = to_device(grid.xnode, "fe::xnode");
+  auto be = to_device(grid.be, "fe::be");
+  auto nps = to_device(grid.nps, "fe::nps");
+  auto noff = to_device(grid.noff, "fe::noff");
+  auto rn = to_device(grid.rn, "fe::rn");
+  auto bw = to_device(grid.bw, "fe::bw");
+  auto vg = to_device(vgh, "fe::vg");
+  auto vw = to_device(vwh, "fe::vw");
   Kokkos::View<Real *> A("fe::A", N3), B("fe::B", N3), V("fe::V", N3);
   Kokkos::deep_copy(V, Real(0));
   const int nline = N * N;
@@ -362,6 +365,18 @@ std::vector<Real> fe_dage3d(const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid
     Kokkos::parallel_for(
         "fe::dage::acc", N3, KOKKOS_LAMBDA(std::size_t k) { V(k) += wt * B(k); });
   }
+  return V;
+}
+} // namespace detail
+
+/// DAGE Coulomb-family potential (host wrapper around detail::fe_dage3d_dev):
+/// density vector in, potential vector out.
+template <class Real>
+std::vector<Real> fe_dage3d(const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
+                            const std::vector<Real> &rho, int nv = 32, Real vmax = Real(8)) {
+  auto R = detail::to_device(rho, "fe::rho");
+  auto V = detail::fe_dage3d_dev(grid, tgrid, R, nv, vmax);
+  const std::size_t N3 = static_cast<std::size_t>(grid.N) * grid.N * grid.N;
   auto hV = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, V);
   std::vector<Real> Vout(N3);
   for (std::size_t k = 0; k < N3; ++k) Vout[k] = hV(k);

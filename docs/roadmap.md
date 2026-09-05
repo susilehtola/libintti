@@ -1390,10 +1390,23 @@ unchanged). Big OpenMP speedup on the DAGE-heavy tests: ContractedExchange
 18.6s->3.7s (~5x), CoulombMatchesGTO 3.0s->0.3s. In the tensor-product grid
 every line shares the same 1D mesh, so all work-items do identical work -- the
 favourable GPU case (M-FE GPU note). Suite 226/226. Since all grid-RI builders
-call fe_dage3d, they all inherit the parallelism. Next: benchmark vs GTO-RI;
-validate on real GPU hardware (blocked on this Intel box); optionally push the
-AO evaluation + contraction (ao_values_on_grid / fe_inner) onto the device too
-to avoid the host round-trip.
+call fe_dage3d, they all inherit the parallelism.
+FULL DEVICE PIPELINE (2026-09-06): the grid-RI builders now run end to end on
+the device with no host round-trip. fe_dage3d split into a device-View core
+(detail::fe_dage3d_dev: rho View in -> V View out) + a host wrapper. gridri.hpp
+gained detail::ao_on_grid_dev (Cartesian AO evaluation on device, per-AO
+exponent/centre/powers as Views), detail::ao_host_to_dev (bridge for the
+contracted/spherical host evaluators), and detail::grid_coulomb_dev /
+grid_exchange_dev (density/co-density build, DAGE, and the <pq|V> contraction all
+as parallel_for over grid points / AO pairs). So AO-eval -> density -> DAGE ->
+contraction stay on the device; the N^3 tensors (rho, V) never round-trip to
+host. Validated: all FEGrid/GridRI tests pass (226/226). On the small CI cases
+the extra kernel launches are a wash on OpenMP; the win is GPU-readiness (no
+host<->device transfer of the N^3 tensors) and removing the host-serial
+O(nao^2 N^3) contraction bottleneck at scale. The Cartesian path is fully
+device-native; contracted/spherical still evaluate AOs on host then bridge (a
+future full-device AO eval for those would complete it). Next: benchmark vs
+GTO-RI; validate on real GPU hardware (blocked on this Intel box).
 DFT / local-hybrid scope decision (2026-09-06): xc quadrature reuses the grid-RI
 FE substrate (AO-on-grid + contraction) with libxc (MPL-2.0, compatible) as an
 OPTIONAL pointwise v_xc callback -- the core stays a dependency-free integrals
