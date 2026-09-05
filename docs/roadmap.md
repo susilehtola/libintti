@@ -717,9 +717,25 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      primitive -> recontract reference off the analytically-validated primitive
      builders (isolating the contraction+normalization layer); the test basis
      uses a genuinely general contraction (s shell, 3 primitives -> 2 contracted
-     functions). Next increments: contracted multipole/nuclear (1e), then the
-     contracted J/K and n-center builders (the 2e payoff), then a PySCF
-     cross-check on a real contracted basis (cc-pVDZ) via an intti_dump driver.
+     functions). DONE: contracted multipole and nuclear (1e), then contracted J
+     and K (the 2e payoff). J reuses the fused primitive J-engine on the
+     contracted basis's primitive pairs, injecting contraction only in the
+     density fold (D_eff = C^T D C, block-by-block, symmetry-folded) and the
+     output gather (C J_eff C^T, accumulated) -- no nao_prim^2 matrix. K is
+     MEMORY-LEAN too (user decision over a decontract/recontract wrapper):
+     detail::exchange_build_contracted_impl runs the SAME per-primitive-quartet
+     t-space core as exchange_build_impl on the contracted primitive pairs, but
+     reads the ket density as an on-the-fly effective primitive density (summed
+     over the two ket shells' contraction indices, never materialized) and
+     atomic-scatters the primitive K block into the contracted K with the bra
+     coefficients; the full primitive (a,b) loop + atomic accumulate gives the
+     symmetric contracted K with no mirror, each primitive quartet evaluated
+     once (shared-intermediate GC). J and K validated against the independent
+     C (build(C^T D C)) C^T fused-engine references; suite 214/214. The native
+     contracted Fock surface is now COMPLETE: S, T, V, J, K (+ multipoles).
+     Remaining: contracted-K screening (currently unscreened), n-center (RI)
+     contraction, and a PySCF cc-pVDZ cross-check of the whole native stack via
+     an intti_dump driver.
 
   Note where we are AHEAD of SHARK and must not regress: range separation is a
   node-list (erf/erfc/Yukawa) with native position-dependent omega(r) for local

@@ -250,6 +250,36 @@ TEST(Contracted, CoulombVsDecontractRecontract) {
   EXPECT_LT(worst, 1e-11 * scale) << "contracted J != decontract/recontract";
 }
 
+TEST(Contracted, ExchangeVsDecontractRecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  std::vector<double> D(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = 0.1 + 0.3 * std::sin(0.7 * i + 1.3 * j);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) {
+      const double a = 0.5 * (D[i * n + j] + D[j * n + i]);
+      D[i * n + j] = D[j * n + i] = a;
+    }
+  std::vector<double> K(static_cast<std::size_t>(n) * n, 0.0);
+  intti::exchange_build(cb, D.data(), grid, K.data());
+  // reference: D_eff = C^T D C; K_eff = primitive exchange (tau=0); K = C K_eff C^T
+  intti::ShellBasis<double> pbasis;
+  std::vector<double> C;
+  const int npao = decontract(cb, pbasis, C);
+  auto Deff = pushdown(C, n, npao, D);
+  std::vector<double> Keff(static_cast<std::size_t>(npao) * npao, 0.0);
+  intti::exchange_build(pbasis, Deff.data(), grid, Keff.data(), 0.0);
+  auto ref = conjugate(C, n, npao, Keff);
+  double worst = 0, scale = 0;
+  for (std::size_t i = 0; i < K.size(); ++i) {
+    worst = std::max(worst, std::abs(K[i] - ref[i]));
+    scale = std::max(scale, std::abs(ref[i]));
+  }
+  EXPECT_LT(worst, 1e-11 * scale) << "contracted K != decontract/recontract";
+}
+
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum
 // of nctr*ncart(l) over shells.
 TEST(Contracted, SymmetricAndSized) {

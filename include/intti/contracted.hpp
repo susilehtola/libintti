@@ -429,4 +429,41 @@ void coulomb_build(const ContractedBasis<Real> &basis, const Real *D,
   }
 }
 
+/// Exchange matrix K_{IJ} = sum_{KL} D_{KL} (IK|JL) over a generally-contracted
+/// basis (D, K are nao x nao row-major contracted-AO matrices; PySCF cart=True
+/// normalization). Memory-lean: reuses the primitive exchange t-space core on
+/// the primitive pairs of the contracted basis, keeping D and K contracted (no
+/// nao_prim x nao_prim matrix); see detail::exchange_build_contracted_impl.
+template <class Real>
+void exchange_build(const ContractedBasis<Real> &basis, const Real *D,
+                    const TGrid<Real> &grid, Real *K) {
+  std::vector<PrimitiveShell<Real>> prims;
+  std::vector<int> cshell, cprim;
+  detail::contracted_primitives(basis, prims, cshell, cprim);
+  const int nps = static_cast<int>(prims.size());
+  const int ncs = static_cast<int>(basis.shells.size());
+  // flat effective-coefficient pool: per shell A, [cA-major, prim-minor]
+  std::vector<int> ecoff(ncs, 0), nprim_c(ncs), nctr_c(ncs);
+  int etot = 0;
+  for (int A = 0; A < ncs; ++A) {
+    ecoff[A] = etot;
+    nprim_c[A] = basis.shells[A].nprim();
+    nctr_c[A] = basis.shells[A].nctr();
+    etot += nprim_c[A] * nctr_c[A];
+  }
+  std::vector<Real> ecoef(etot);
+  for (int A = 0; A < ncs; ++A)
+    for (int cA = 0; cA < nctr_c[A]; ++cA)
+      for (int p = 0; p < nprim_c[A]; ++p)
+        ecoef[ecoff[A] + cA * nprim_c[A] + p] = detail::effective_coeff(basis.shells[A], cA, p);
+  // rectangular primitive (i, c) pair table: pair index p = i*nps + c
+  std::vector<ShellPair<Real>> plist;
+  plist.reserve(static_cast<std::size_t>(nps) * nps);
+  for (int i = 0; i < nps; ++i)
+    for (int c = 0; c < nps; ++c) plist.push_back(make_pair(prims[i], prims[c]));
+  auto tab = make_pair_table(plist);
+  detail::exchange_build_contracted_impl(prims, cshell, cprim, ecoef, ecoff, nprim_c,
+                                         nctr_c, basis.ao_off, basis.nao, D, grid, tab, K);
+}
+
 } // namespace intti
