@@ -26,7 +26,9 @@
 // src/cint.cpp). The native API stays matrix-level: a whole nao x nao AO
 // matrix per call, never individual shell blocks.
 
+#include <array>
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 #include "gto.hpp"
@@ -109,6 +111,69 @@ void scatter_contracted(std::vector<Real> &M, const ContractedBasis<Real> &basis
     }
 }
 
+/// Generic contraction driver for symmetric 1e operators with `ncomp` matrix
+/// components. `block(sa, sb, out)` fills the UNNORMALIZED primitive block of a
+/// single primitive pair (sa, sb) as component-major out[(comp*nca+ka)*ncb+kb]
+/// (nca=ncart(sa.l), ncb=ncart(sb.l)). The driver evaluates that block ONCE per
+/// primitive pair and accumulates it, weighted by d_{cp} cart_norm_pyscf, into
+/// every contracted-function pair -- the shared-intermediate general-contraction
+/// path. Returns `ncomp` nao x nao matrices; `mirror` sets the transpose sign
+/// (+1 symmetric, -1 antisymmetric). A pair whose Gaussian prefactor is <= tau
+/// is skipped (tau=0 skips only exactly-zero blocks).
+template <class Real, class BlockFn>
+std::vector<std::vector<Real>>
+contracted_1e_multi(const ContractedBasis<Real> &basis, int ncomp, int mirror,
+                    Real tau, BlockFn block) {
+  const int nao = basis.nao;
+  std::vector<std::vector<Real>> out(
+      ncomp, std::vector<Real>(static_cast<std::size_t>(nao) * nao, Real(0)));
+  const int ns = static_cast<int>(basis.shells.size());
+  std::vector<Real> pblk, cblk;
+  for (int a = 0; a < ns; ++a)
+    for (int b = a; b < ns; ++b) {
+      const auto &A = basis.shells[a], &B = basis.shells[b];
+      const int la = A.l, lb = B.l, nca = ncart(la), ncb = ncart(lb);
+      const int npa = A.nprim(), npb = B.nprim(), nctA = A.nctr(), nctB = B.nctr();
+      const int rowB = nctB * ncb;
+      const std::size_t pstride = static_cast<std::size_t>(nca) * ncb;
+      const std::size_t cstride = static_cast<std::size_t>(nctA) * nca * rowB;
+      pblk.assign(static_cast<std::size_t>(ncomp) * pstride, Real(0));
+      cblk.assign(static_cast<std::size_t>(ncomp) * cstride, Real(0));
+      for (int pa = 0; pa < npa; ++pa) {
+        const Real na = cart_norm_pyscf(la, A.alpha[pa]);
+        const auto spa = detail::contracted_prim(A, pa);
+        for (int pb = 0; pb < npb; ++pb) {
+          const auto spb = detail::contracted_prim(B, pb);
+          if (detail::pair_gauss_prefactor(spa, spb) <= tau) continue;
+          const Real nb = cart_norm_pyscf(lb, B.alpha[pb]);
+          block(spa, spb, pblk.data());
+          for (int cA = 0; cA < nctA; ++cA) {
+            const Real wa = A.coeff[cA * npa + pa] * na;
+            if (wa == Real(0)) continue;
+            for (int cB = 0; cB < nctB; ++cB) {
+              const Real w = wa * B.coeff[cB * npb + pb] * nb;
+              if (w == Real(0)) continue;
+              for (int comp = 0; comp < ncomp; ++comp) {
+                const Real *pb_c = pblk.data() + comp * pstride;
+                Real *cb_c = cblk.data() + comp * cstride;
+                for (int ka = 0; ka < nca; ++ka)
+                  for (int kb = 0; kb < ncb; ++kb)
+                    cb_c[(static_cast<std::size_t>(cA) * nca + ka) * rowB + cB * ncb + kb] +=
+                        w * pb_c[ka * ncb + kb];
+              }
+            }
+          }
+        }
+      }
+      for (int comp = 0; comp < ncomp; ++comp) {
+        std::vector<Real> cslice(cblk.begin() + static_cast<std::ptrdiff_t>(comp) * cstride,
+                                 cblk.begin() + static_cast<std::ptrdiff_t>(comp + 1) * cstride);
+        detail::scatter_contracted(out[comp], basis, a, b, mirror, cslice);
+      }
+    }
+  return out;
+}
+
 } // namespace detail
 
 /// Overlap matrix S over a generally-contracted basis (nao x nao, row-major,
@@ -117,53 +182,28 @@ void scatter_contracted(std::vector<Real> &M, const ContractedBasis<Real> &basis
 template <class Real>
 std::vector<Real> overlap_matrix(const ContractedBasis<Real> &basis,
                                  Real tau = Real(0)) {
-  const int nao = basis.nao;
-  std::vector<Real> S(static_cast<std::size_t>(nao) * nao, Real(0));
-  const int ns = static_cast<int>(basis.shells.size());
-  for (int a = 0; a < ns; ++a)
-    for (int b = a; b < ns; ++b) {
-      const auto &A = basis.shells[a], &B = basis.shells[b];
-      const int la = A.l, lb = B.l, nca = ncart(la), ncb = ncart(lb);
-      const int npa = A.nprim(), npb = B.nprim(), nctA = A.nctr(), nctB = B.nctr();
-      const int rowB = nctB * ncb;
-      std::vector<Real> cblk(static_cast<std::size_t>(nctA) * nca * rowB, Real(0));
-      for (int pa = 0; pa < npa; ++pa) {
-        const Real na = cart_norm_pyscf(la, A.alpha[pa]);
-        for (int pb = 0; pb < npb; ++pb) {
-          if (detail::pair_gauss_prefactor(detail::contracted_prim(A, pa),
-                                           detail::contracted_prim(B, pb)) <= tau)
-            continue;
-          const Real nb = cart_norm_pyscf(lb, B.alpha[pb]);
-          std::vector<Real> sx, sy, sz;
-          int lbx;
-          detail::overlap_1d(A.alpha[pa], A.center[0], B.alpha[pb], B.center[0], la, lb, 0, 0, sx, lbx);
-          detail::overlap_1d(A.alpha[pa], A.center[1], B.alpha[pb], B.center[1], la, lb, 0, 0, sy, lbx);
-          detail::overlap_1d(A.alpha[pa], A.center[2], B.alpha[pb], B.center[2], la, lb, 0, 0, sz, lbx);
-          for (int ka = 0; ka < nca; ++ka) {
-            int a3[3];
-            cart_comp(la, ka, a3[0], a3[1], a3[2]);
-            for (int kb = 0; kb < ncb; ++kb) {
-              int b3[3];
-              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-              const Real prim = sx[a3[0] * (lbx + 1) + b3[0]] *
-                                sy[a3[1] * (lbx + 1) + b3[1]] *
-                                sz[a3[2] * (lbx + 1) + b3[2]];
-              for (int cA = 0; cA < nctA; ++cA) {
-                const Real wa = A.coeff[cA * npa + pa] * na;
-                if (wa == Real(0)) continue;
-                for (int cB = 0; cB < nctB; ++cB) {
-                  const Real wb = B.coeff[cB * npb + pb] * nb;
-                  cblk[(static_cast<std::size_t>(cA) * nca + ka) * rowB + cB * ncb + kb] +=
-                      wa * wb * prim;
-                }
-              }
-            }
+  auto out = detail::contracted_1e_multi(
+      basis, 1, +1, tau,
+      [](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        const int la = sa.l, lb = sb.l, ncb = ncart(lb);
+        std::vector<Real> sx, sy, sz;
+        int lbx;
+        detail::overlap_1d(sa.alpha, sa.center[0], sb.alpha, sb.center[0], la, lb, 0, 0, sx, lbx);
+        detail::overlap_1d(sa.alpha, sa.center[1], sb.alpha, sb.center[1], la, lb, 0, 0, sy, lbx);
+        detail::overlap_1d(sa.alpha, sa.center[2], sb.alpha, sb.center[2], la, lb, 0, 0, sz, lbx);
+        for (int ka = 0; ka < ncart(la); ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncb; ++kb) {
+            int b3[3];
+            cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+            o[ka * ncb + kb] = sx[a3[0] * (lbx + 1) + b3[0]] *
+                               sy[a3[1] * (lbx + 1) + b3[1]] *
+                               sz[a3[2] * (lbx + 1) + b3[2]];
           }
         }
-      }
-      detail::scatter_contracted(S, basis, a, b, +1, cblk);
-    }
-  return S;
+      });
+  return std::move(out[0]);
 }
 
 /// Kinetic-energy matrix T = -1/2 <a|nabla^2|b> over a generally-contracted
@@ -171,60 +211,76 @@ std::vector<Real> overlap_matrix(const ContractedBasis<Real> &basis,
 template <class Real>
 std::vector<Real> kinetic_matrix(const ContractedBasis<Real> &basis,
                                  Real tau = Real(0)) {
-  const int nao = basis.nao;
-  std::vector<Real> T(static_cast<std::size_t>(nao) * nao, Real(0));
-  const int ns = static_cast<int>(basis.shells.size());
-  for (int a = 0; a < ns; ++a)
-    for (int b = a; b < ns; ++b) {
-      const auto &A = basis.shells[a], &B = basis.shells[b];
-      const int la = A.l, lb = B.l, nca = ncart(la), ncb = ncart(lb), lb1 = lb + 1;
-      const int npa = A.nprim(), npb = B.nprim(), nctA = A.nctr(), nctB = B.nctr();
-      const int rowB = nctB * ncb;
-      std::vector<Real> cblk(static_cast<std::size_t>(nctA) * nca * rowB, Real(0));
-      for (int pa = 0; pa < npa; ++pa) {
-        const Real na = cart_norm_pyscf(la, A.alpha[pa]);
-        for (int pb = 0; pb < npb; ++pb) {
-          if (detail::pair_gauss_prefactor(detail::contracted_prim(A, pa),
-                                           detail::contracted_prim(B, pb)) <= tau)
-            continue;
-          const Real nb = cart_norm_pyscf(lb, B.alpha[pb]);
-          std::vector<Real> sx, sy, sz, tx, ty, tz;
-          int lbx;
-          detail::overlap_1d(A.alpha[pa], A.center[0], B.alpha[pb], B.center[0], la, lb, 0, 2, sx, lbx);
-          detail::kinetic_1d(sx, lbx, la, lb, B.alpha[pb], tx);
-          detail::overlap_1d(A.alpha[pa], A.center[1], B.alpha[pb], B.center[1], la, lb, 0, 2, sy, lbx);
-          detail::kinetic_1d(sy, lbx, la, lb, B.alpha[pb], ty);
-          detail::overlap_1d(A.alpha[pa], A.center[2], B.alpha[pb], B.center[2], la, lb, 0, 2, sz, lbx);
-          detail::kinetic_1d(sz, lbx, la, lb, B.alpha[pb], tz);
-          auto Sx = [&](int i, int j) { return sx[i * (lbx + 1) + j]; };
-          auto Sy = [&](int i, int j) { return sy[i * (lbx + 1) + j]; };
-          auto Sz = [&](int i, int j) { return sz[i * (lbx + 1) + j]; };
+  auto out = detail::contracted_1e_multi(
+      basis, 1, +1, tau,
+      [](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        const int la = sa.l, lb = sb.l, ncb = ncart(lb), lb1 = lb + 1;
+        std::vector<Real> sx, sy, sz, tx, ty, tz;
+        int lbx;
+        detail::overlap_1d(sa.alpha, sa.center[0], sb.alpha, sb.center[0], la, lb, 0, 2, sx, lbx);
+        detail::kinetic_1d(sx, lbx, la, lb, sb.alpha, tx);
+        detail::overlap_1d(sa.alpha, sa.center[1], sb.alpha, sb.center[1], la, lb, 0, 2, sy, lbx);
+        detail::kinetic_1d(sy, lbx, la, lb, sb.alpha, ty);
+        detail::overlap_1d(sa.alpha, sa.center[2], sb.alpha, sb.center[2], la, lb, 0, 2, sz, lbx);
+        detail::kinetic_1d(sz, lbx, la, lb, sb.alpha, tz);
+        auto Sx = [&](int i, int j) { return sx[i * (lbx + 1) + j]; };
+        auto Sy = [&](int i, int j) { return sy[i * (lbx + 1) + j]; };
+        auto Sz = [&](int i, int j) { return sz[i * (lbx + 1) + j]; };
+        for (int ka = 0; ka < ncart(la); ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncb; ++kb) {
+            int b3[3];
+            cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+            o[ka * ncb + kb] =
+                tx[a3[0] * lb1 + b3[0]] * Sy(a3[1], b3[1]) * Sz(a3[2], b3[2]) +
+                Sx(a3[0], b3[0]) * ty[a3[1] * lb1 + b3[1]] * Sz(a3[2], b3[2]) +
+                Sx(a3[0], b3[0]) * Sy(a3[1], b3[1]) * tz[a3[2] * lb1 + b3[2]];
+          }
+        }
+      });
+  return std::move(out[0]);
+}
+
+/// Cartesian multipole matrices <a|(x-O)^ex (y-O)^ey (z-O)^ez|b> over a
+/// generally-contracted basis, one per (ex,ey,ez) with total order <= max_order
+/// in the same component order as multipole_labels() (order 0 = overlap). PySCF
+/// cart=True normalization.
+template <class Real>
+std::vector<std::vector<Real>> multipole_matrices(const ContractedBasis<Real> &basis,
+                                                  int max_order, const Real origin[3],
+                                                  Real tau = Real(0)) {
+  const auto comps = multipole_labels(max_order);
+  const int ncomp = static_cast<int>(comps.size());
+  return detail::contracted_1e_multi(
+      basis, ncomp, +1, tau,
+      [&](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        const int la = sa.l, lb = sb.l, nca = ncart(la), ncb = ncart(lb);
+        std::vector<Real> s[3], m[3];
+        int lbx;
+        for (int d = 0; d < 3; ++d) {
+          detail::overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb,
+                             max_order, 0, s[d], lbx);
+          detail::multipole_1d(s[d], lbx, la, lb, sa.center[d], origin[d], max_order, m[d]);
+        }
+        auto M = [&](int d, int e, int i, int j) {
+          return m[d][(static_cast<std::size_t>(e) * (la + 1) + i) * (lb + 1) + j];
+        };
+        for (int ci = 0; ci < ncomp; ++ci) {
+          const auto &e = comps[ci];
+          Real *oc = o + static_cast<std::size_t>(ci) * nca * ncb;
           for (int ka = 0; ka < nca; ++ka) {
             int a3[3];
             cart_comp(la, ka, a3[0], a3[1], a3[2]);
             for (int kb = 0; kb < ncb; ++kb) {
               int b3[3];
               cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-              const Real prim =
-                  tx[a3[0] * lb1 + b3[0]] * Sy(a3[1], b3[1]) * Sz(a3[2], b3[2]) +
-                  Sx(a3[0], b3[0]) * ty[a3[1] * lb1 + b3[1]] * Sz(a3[2], b3[2]) +
-                  Sx(a3[0], b3[0]) * Sy(a3[1], b3[1]) * tz[a3[2] * lb1 + b3[2]];
-              for (int cA = 0; cA < nctA; ++cA) {
-                const Real wa = A.coeff[cA * npa + pa] * na;
-                if (wa == Real(0)) continue;
-                for (int cB = 0; cB < nctB; ++cB) {
-                  const Real wb = B.coeff[cB * npb + pb] * nb;
-                  cblk[(static_cast<std::size_t>(cA) * nca + ka) * rowB + cB * ncb + kb] +=
-                      wa * wb * prim;
-                }
-              }
+              oc[ka * ncb + kb] = M(0, e[0], a3[0], b3[0]) * M(1, e[1], a3[1], b3[1]) *
+                                  M(2, e[2], a3[2], b3[2]);
             }
           }
         }
-      }
-      detail::scatter_contracted(T, basis, a, b, +1, cblk);
-    }
-  return T;
+      });
 }
 
 } // namespace intti

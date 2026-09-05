@@ -150,6 +150,25 @@ TEST(Contracted, KineticVsDecontractRecontract) {
   EXPECT_LT(worst, 1e-13 * scale) << "contracted kinetic != decontract/recontract";
 }
 
+TEST(Contracted, MultipoleVsDecontractRecontract) {
+  auto cb = test_basis();
+  const double origin[3] = {0.1, -0.2, 0.3};
+  const int mo = 2;
+  auto Mc = intti::multipole_matrices(cb, mo, origin);
+  const int ncomp = static_cast<int>(Mc.size());
+  for (int ci = 0; ci < ncomp; ++ci) {
+    auto ref = contract_ref(cb, [ci, &origin, mo](const intti::ShellBasis<double> &b) {
+      return intti::multipole_matrices(b, mo, origin)[ci];
+    });
+    double worst = 0, scale = 0;
+    for (std::size_t i = 0; i < Mc[ci].size(); ++i) {
+      worst = std::max(worst, std::abs(Mc[ci][i] - ref[i]));
+      scale = std::max(scale, std::abs(ref[i]));
+    }
+    EXPECT_LT(worst, 1e-12 * scale + 1e-14) << "multipole component " << ci;
+  }
+}
+
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum
 // of nctr*ncart(l) over shells.
 TEST(Contracted, SymmetricAndSized) {
