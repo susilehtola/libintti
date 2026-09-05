@@ -1031,6 +1031,26 @@ nuclei, with multipole for far); (ii) the Helmholtz grid solver on the same FE
 machinery (the piecewise-polynomial elements also give the cusp resolution the
 solver needs).
 
+**Exchange on the FE grid = co-density Coulomb builds (user, 2026-09-05).** There
+is no cheap "exchange kernel" on a grid, but with D = occ_scale sum_i C_i C_i^T,
+  K_pq = sum_rs (pr|qs) D_rs = occ_scale sum_i (p phi_i | q phi_i),
+i.e. K is a SUM OVER OCCUPIED ORBITALS of Coulomb interactions between the
+co-densities g_pi(r) = chi_p(r) phi_i(r): K_pq = occ_scale sum_i (g_pi | g_qi).
+So exchange = nocc cheap grid-Coulomb builds, each producing an Nbf x Nbf matrix
+(fits memory; accumulate over i). Screening: g_pi is confined to where chi_p
+lives (local even though phi_i is delocalized), so negligible (p,i) co-densities
+drop and the element-pair near/far split screens the grid Coulomb -- linear
+scaling, best with LOCALIZED occupied orbitals. This is exactly seminumerical
+exchange (Friesner pseudospectral / Neese chain-of-spheres COSX, one electron
+numerical; here both via DAGE on the full grid) and the real-space twin of the
+occ-driven ri_k_occ already in the library (K = sum_i W_i W_i^T). Caveats: cost
+is nocc Coulomb builds (payoff = generality/scaling, not beating analytic K on
+small GTO systems); and the co-densities inherit phi_i's NUCLEAR CUSP, so
+near-nucleus grid resolution (refinement / bubbles) is the accuracy pressure
+point -- exchange energy is more grid-sensitive than Coulomb. Fold into M-FE
+once multi-centre Coulomb is in place; validate one-centre K via co-densities
+against the analytic exchange_build.
+
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
 A project-wide audit for loops whose cost scales with system size and could be
