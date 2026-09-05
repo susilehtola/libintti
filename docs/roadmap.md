@@ -1287,6 +1287,16 @@ integrals. So both GTO and STO grid construction stay 1D Gaussian-resolution
 problems. Concrete next prototype: a per-axis 1D hp-mesh generator over a set of
 (exponent, centre) 1D Gaussians to a target accuracy, feeding make_fegrid1d /
 fe_dage3d.
+PROTOTYPED (prototype/fe_hp_mesh.cpp, 2026-09-05): the per-axis 1D hp-mesh
+generator -- recursive element refinement that tries increasing order p (Gauss-
+Legendre + barycentric) up to pmax and bisects (h) only when no p reaches eps,
+seeded at the atom centres. On a deliberately stiff set (24 Gaussians, exponents
+1e-2..1e4 over 3 centres) to eps=1e-8 it builds a 48-element / 610-DOF mesh at
+worst error 9.9e-9, versus 45856 DOFs for the uniform-order/uniform-element mesh
+of equal accuracy -- 75x fewer DOFs, confirming the hp/tensorial construction is
+both cheap (a 1D problem) and dramatically more compact than a uniform grid.
+Next: drive fe_dage3d from this per-axis mesh (variable order per element), then
+library-ize as the grid constructor.
 
 ## M-PERF -- high-rank loop / BLAS audit (2026-09-04)
 
