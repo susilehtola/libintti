@@ -1403,10 +1403,19 @@ contraction stay on the device; the N^3 tensors (rho, V) never round-trip to
 host. Validated: all FEGrid/GridRI tests pass (226/226). On the small CI cases
 the extra kernel launches are a wash on OpenMP; the win is GPU-readiness (no
 host<->device transfer of the N^3 tensors) and removing the host-serial
-O(nao^2 N^3) contraction bottleneck at scale. The Cartesian path is fully
-device-native; contracted/spherical still evaluate AOs on host then bridge (a
-future full-device AO eval for those would complete it). Next: benchmark vs
-GTO-RI; validate on real GPU hardware (blocked on this Intel box).
+O(nao^2 N^3) contraction bottleneck at scale.
+DEVICE AO EVAL for ALL bases (2026-09-06): the contracted and spherical AO
+evaluators are now on the device too, so every grid-RI builder is fully device-
+native (no host AO step, no host<->device bridge). detail::ao_on_grid_dev gained
+a ContractedBasis overload (sums the shell's primitives with the effective
+coefficient via a flattened (alpha, ec) primitive pool), and
+detail::ao_on_grid_spherical_dev evaluates the Cartesian AOs on device then
+applies the block-diagonal c2s as a device parallel_for (flattened
+(coeff, cart-index) pool). Validated: all grid-RI CI tests pass (226/226), device
+AO eval matches the host evaluators. Next: benchmark vs GTO-RI; validate on real
+GPU hardware (blocked on this Intel box). (CI note: the grid-RI tests use the
+OpenMP Kokkos backend, so ctest -j oversubscribes -- individual grid-RI tests
+are <= ~8s.)
 DFT / local-hybrid scope decision (2026-09-06): xc quadrature reuses the grid-RI
 FE substrate (AO-on-grid + contraction) with libxc (MPL-2.0, compatible) as an
 OPTIONAL pointwise v_xc callback -- the core stays a dependency-free integrals
