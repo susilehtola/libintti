@@ -127,6 +127,37 @@ TEST(RI, JKAssemblyMatchesTensorContraction) {
   EXPECT_LT(eK, 1e-11 * sc);
 }
 
+// Memory-lean tiled RI-J never materialises the full 3-index tensor. It must
+// match the untiled ri_jk J, and be tile-size-independent (to rounding).
+TEST(RI, TiledJMatchesUntiled) {
+  auto orb = orb_basis(), aux = aux_basis();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto fit = intti::ri_fit(orb, aux, grid);
+  const int nao = orb.nao;
+  const int nsa = static_cast<int>(aux.shells.size());
+  auto D = rand_sym(nao, 17);
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  std::vector<double> Jref(n2), Kref(n2);
+  intti::ri_jk(fit, D.data(), Jref.data(), Kref.data());
+  double sc = 0;
+  for (double v : Jref) sc = std::max(sc, std::abs(v));
+
+  std::vector<double> Jprev;
+  for (int ts : {1, 2, 3, nsa}) {
+    std::vector<double> Jt(n2);
+    intti::ri_j_tiled(orb, aux, grid, D.data(), Jt.data(), ts);
+    double eU = 0;
+    for (std::size_t i = 0; i < n2; ++i) eU = std::max(eU, std::abs(Jt[i] - Jref[i]));
+    EXPECT_LT(eU, 1e-10 * sc) << "tiled RI-J != untiled, tile=" << ts;
+    if (!Jprev.empty()) {
+      double eT = 0;
+      for (std::size_t i = 0; i < n2; ++i) eT = std::max(eT, std::abs(Jt[i] - Jprev[i]));
+      EXPECT_LT(eT, 1e-10 * sc) << "tiled RI-J not tile-size-independent, tile=" << ts;
+    }
+    Jprev = Jt;
+  }
+}
+
 TEST(RI, ApproximatesExactJK) {
   // with a rich aux, RI-J/K should be close to the exact builds
   auto orb = orb_basis(), aux = aux_basis();

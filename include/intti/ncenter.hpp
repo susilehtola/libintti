@@ -119,4 +119,50 @@ std::vector<Real> coulomb_3c(const ShellBasis<Real> &orb,
   return T;
 }
 
+/// Three-center Coulomb (mu nu | P) for the auxiliary SHELLS [sa0, sa1) only:
+/// a row-major (mu, nu, Plocal) tensor of size nao*nao*nauxblk, where nauxblk is
+/// the number of auxiliary AOs in the range. Lets the RI pipeline stream one
+/// auxiliary block at a time instead of materialising the whole nao^2 x naux
+/// tensor (memory-lean / out-of-core RI). far_tau as in coulomb_3c.
+template <class Real>
+std::vector<Real> coulomb_3c_auxblock(const ShellBasis<Real> &orb,
+                                      const ShellBasis<Real> &aux, const TGrid<Real> &grid,
+                                      int sa0, int sa1, Real far_tau = Real(0)) {
+  const int nao = orb.nao;
+  const int p0 = aux.ao_off[sa0], p1 = aux.ao_off[sa1];
+  const int nauxblk = p1 - p0;
+  std::vector<Real> T(static_cast<std::size_t>(nao) * nao * nauxblk, Real(0));
+  const int nso = static_cast<int>(orb.shells.size());
+  const bool far = far_tau > Real(0);
+  const Real far_cut = far ? -log_(far_tau) : Real(0);
+  for (int m = 0; m < nso; ++m)
+    for (int n = 0; n <= m; ++n) {
+      auto bra = make_pair(orb.shells[m], orb.shells[n]);
+      const int nm = ncart(orb.shells[m].l), nn = ncart(orb.shells[n].l);
+      for (int a = sa0; a < sa1; ++a) {
+        auto ket = detail::ghost_pair(aux.shells[a]);
+        const int nP = ncart(aux.shells[a].l);
+        std::vector<Real> blk(static_cast<std::size_t>(nm) * nn * nP);
+        if (far && detail::pair_far(bra, ket, far_cut))
+          eri_quartet_farfield(bra, ket, blk.data());
+        else
+          eri_quartet(bra, ket, grid, blk.data());
+        for (int km = 0; km < nm; ++km)
+          for (int kn = 0; kn < nn; ++kn)
+            for (int kP = 0; kP < nP; ++kP) {
+              const Real v = blk[(km * nn + kn) * nP + kP];
+              const int Ploc = aux.ao_off[a] - p0 + kP;
+              T[(static_cast<std::size_t>(orb.ao_off[m] + km) * nao + orb.ao_off[n] + kn) *
+                    nauxblk +
+                Ploc] = v;
+              if (m != n)
+                T[(static_cast<std::size_t>(orb.ao_off[n] + kn) * nao + orb.ao_off[m] + km) *
+                      nauxblk +
+                  Ploc] = v; // mu<->nu mirror
+            }
+      }
+    }
+  return T;
+}
+
 } // namespace intti

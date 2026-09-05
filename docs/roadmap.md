@@ -1017,12 +1017,21 @@ GEMM dispatch stays portable and extended-precision-safe. Ranked by leverage:
     with tile-local Hermite/prod offsets, dropping jp/Jv to tile size (~2x, the
     output half; dq/Dv stay full). A real 3-phase restructure + far-field range
     handling; modest gain. tc_gradu_grad_build is the same shape.
-  * **RI 3-index tensor (mu nu|P), nao^2 x naux** -- HIGHEST-VALUE target: by far
-    the largest object, and the real "too big for memory" case. But it is
-    currently a materialised host std::vector consumed whole by ri.hpp, so
-    tiling it is a PIPELINE change (stream P-blocks / mu nu-tiles through the fit
-    and J/K contraction), not a single-kernel edit. Do this for the RI path when
-    large-system RI is targeted.
+  * **RI-J via the 3-index tensor (mu nu|P), nao^2 x naux** DONE (ri_j_tiled):
+    the largest object and the real "too big for memory" case. RI-J is a sum over
+    the auxiliary index, so it factors into two aux passes -- gamma_Q = sum_munu
+    (munu|Q) D, then J = sum_P (munu|P) (M^{-1} gamma)_P -- each needing only ONE
+    3-center block live (new coulomb_3c_auxblock builds (munu|P) for an aux shell
+    range). Peak 3-center memory nao^2 x (tile aux AOs) instead of nao^2 x naux;
+    never materialises the full tensor or the fit vectors B. Matches the untiled
+    ri_jk J and is tile-size-independent to rounding (the per-tile GEMM regroups
+    the P-sum, so not bit-exact -- unlike the exchange row-tiling where each
+    element is fully computed in one tile). Validated (RI.TiledJMatchesUntiled).
+  * **RI-K tiling** -- the harder follow-on: RI-K collapses to a single P-sum
+    only through the fitted B = T M^{-1/2}, whose M^{-1/2} mixes ALL auxiliaries,
+    so a per-P-block build still needs the full 3-center tensor. Tiling it needs
+    either full B resident, a two-pass/disk scheme, or the O(naux^2) double-aux
+    form K = sum_QR M^{-1}_QR (T^Q D T^R) (block-pair recompute). Deferred.
   * Only the output/K axis is tiled so far; D (density) and the pair E-tables are
     still resident. Density streaming + E-table tiling are the further axes for
     truly out-of-core problems.

@@ -14,6 +14,7 @@
 // The auxiliary basis may be an external RI set or one generated in-library by
 // two_step_cholesky (cholesky.hpp) -- both are just ShellBasis inputs here.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
@@ -71,6 +72,71 @@ RIFit<Real> ri_fit(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
   detail::gemm('N', 'N', static_cast<int>(N), naux, naux, Real(1), T.data(),
                naux, Mhalf.data(), naux, Real(0), fit.B.data(), naux);
   return fit;
+}
+
+/// Memory-lean tiled RI-J that never materialises the nao^2 x naux 3-index
+/// tensor (nor the fit vectors B): the largest RI object, and the real
+/// "too big for GPU/device memory" case. RI-J is a sum over the auxiliary index,
+///   J_{mu nu} = sum_P (mu nu|P) d_P,   d = M^{-1} gamma,
+///   gamma_Q = sum_{mu nu} (mu nu|Q) D_{mu nu},   M_{PQ} = (P|Q),
+/// so it factors into two auxiliary passes that each need only ONE 3-center
+/// block (mu nu|P-tile) live at a time (aux_tile_shells auxiliary shells per
+/// tile), plus O(naux) intermediates and the naux x naux metric. Peak 3-center
+/// memory is nao^2 x (tile aux AOs) instead of nao^2 x naux. Mathematically
+/// identical to ri_jk's J (B M^{-1/2} contraction gives the same M^{-1});
+/// the per-tile GEMM grouping changes the P-summation grouping, so the result
+/// matches the untiled build and is tile-size-independent to rounding (not
+/// bit-exact, unlike the exchange row-tiling). tau_lin drops metric eigenvalues
+/// below tau_lin*max (linear dependence), as in ri_fit.
+template <class Real>
+void ri_j_tiled(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                const TGrid<Real> &grid, const Real *D, Real *J,
+                int aux_tile_shells, Real tau_lin = Real(1e-10)) {
+  static_assert(std::is_same_v<Real, double> || std::is_same_v<Real, float>,
+                "ri_j_tiled requires float or double (LAPACK)");
+  const int nao = orb.nao, naux = aux.nao;
+  const int nsa = static_cast<int>(aux.shells.size());
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  // metric pseudo-inverse M^{-1} = V^T diag(1/e) V with an eigenvalue cutoff
+  auto M = coulomb_2c(aux, grid);
+  std::vector<Real> eval(naux);
+  detail::syevd(naux, M.data(), eval.data()); // M now holds eigenvectors (rows)
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Vs(M.begin(), M.end());
+  for (int k = 0; k < naux; ++k) {
+    const Real s = (eval[k] <= tau_lin * emax) ? Real(0) : Real(1) / eval[k];
+    for (int P = 0; P < naux; ++P) Vs[k * naux + P] *= s;
+  }
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  detail::gemm('T', 'N', naux, naux, naux, Real(1), M.data(), naux, Vs.data(), naux, Real(0),
+               Minv.data(), naux);
+
+  // pass 1: gamma_P = sum_{mu nu} (mu nu|P) D_{mu nu}, one aux tile at a time
+  std::vector<Real> gamma(naux, Real(0));
+  for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa);
+    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+    auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1); // N x blk
+    // gamma_blk[blk] = Tblk^T . D
+    detail::gemm('T', 'N', blk, 1, static_cast<int>(N), Real(1), Tblk.data(), blk, D, 1,
+                 Real(0), gamma.data() + p0, 1);
+  }
+  // d = M^{-1} gamma
+  std::vector<Real> d(naux, Real(0));
+  detail::gemm('N', 'N', naux, 1, naux, Real(1), Minv.data(), naux, gamma.data(), 1, Real(0),
+               d.data(), 1);
+  // pass 2: J_{mu nu} = sum_P (mu nu|P) d_P, one aux tile at a time
+  for (std::size_t i = 0; i < N; ++i) J[i] = 0;
+  for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa);
+    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+    auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1); // N x blk
+    // J += Tblk . d_blk
+    detail::gemm('N', 'N', static_cast<int>(N), 1, blk, Real(1), Tblk.data(), blk, d.data() + p0,
+                 1, Real(1), J, 1);
+  }
 }
 
 /// RI Coulomb and/or exchange from a symmetric density D (nao x nao,
