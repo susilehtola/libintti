@@ -21,6 +21,7 @@
 #include "fock.hpp"
 #include "gto.hpp"
 #include "hermite1d.hpp"
+#include "lkc.hpp"
 #include "math.hpp"
 
 namespace intti {
@@ -125,19 +126,11 @@ std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis, Real tau = Real(
       detail::overlap_1d(sa.alpha, sa.center[0], sb.alpha, sb.center[0], sa.l, sb.l, 0, 0, sx, lbx);
       detail::overlap_1d(sa.alpha, sa.center[1], sb.alpha, sb.center[1], sa.l, sb.l, 0, 0, sy, lbx);
       detail::overlap_1d(sa.alpha, sa.center[2], sb.alpha, sb.center[2], sa.l, sb.l, 0, 0, sz, lbx);
-      for (int ka = 0; ka < ncart(sa.l); ++ka) {
-        int a3[3];
-        cart_comp(sa.l, ka, a3[0], a3[1], a3[2]);
-        for (int kb = 0; kb < ncart(sb.l); ++kb) {
-          int b3[3];
-          cart_comp(sb.l, kb, b3[0], b3[1], b3[2]);
-          const Real v = sx[a3[0] * (lbx + 1) + b3[0]] * sy[a3[1] * (lbx + 1) + b3[1]] *
-                         sz[a3[2] * (lbx + 1) + b3[2]];
-          S[(basis.ao_off[a] + ka) * nao + basis.ao_off[b] + kb] = v;
-          if (a != b)
-            S[(basis.ao_off[b] + kb) * nao + basis.ao_off[a] + ka] = v; // mirror
-        }
-      }
+      detail::scatter_pair(S, basis, a, b, +1,
+          [&](int, const int *a3, int, const int *b3) {
+            return sx[a3[0] * (lbx + 1) + b3[0]] * sy[a3[1] * (lbx + 1) + b3[1]] *
+                   sz[a3[2] * (lbx + 1) + b3[2]];
+          });
     }
   return S;
 }
@@ -165,21 +158,12 @@ std::vector<Real> kinetic_matrix(const ShellBasis<Real> &basis, Real tau = Real(
       auto Sx = [&](int i, int j) { return sx[i * (lbx + 1) + j]; };
       auto Sy = [&](int i, int j) { return sy[i * (lbx + 1) + j]; };
       auto Sz = [&](int i, int j) { return sz[i * (lbx + 1) + j]; };
-      for (int ka = 0; ka < ncart(sa.l); ++ka) {
-        int a3[3];
-        cart_comp(sa.l, ka, a3[0], a3[1], a3[2]);
-        for (int kb = 0; kb < ncart(sb.l); ++kb) {
-          int b3[3];
-          cart_comp(sb.l, kb, b3[0], b3[1], b3[2]);
-          const Real v =
-              tx[a3[0] * lb1 + b3[0]] * Sy(a3[1], b3[1]) * Sz(a3[2], b3[2]) +
-              Sx(a3[0], b3[0]) * ty[a3[1] * lb1 + b3[1]] * Sz(a3[2], b3[2]) +
-              Sx(a3[0], b3[0]) * Sy(a3[1], b3[1]) * tz[a3[2] * lb1 + b3[2]];
-          T[(basis.ao_off[a] + ka) * nao + basis.ao_off[b] + kb] = v;
-          if (a != b)
-            T[(basis.ao_off[b] + kb) * nao + basis.ao_off[a] + ka] = v; // mirror
-        }
-      }
+      detail::scatter_pair(T, basis, a, b, +1,
+          [&](int, const int *a3, int, const int *b3) {
+            return tx[a3[0] * lb1 + b3[0]] * Sy(a3[1], b3[1]) * Sz(a3[2], b3[2]) +
+                   Sx(a3[0], b3[0]) * ty[a3[1] * lb1 + b3[1]] * Sz(a3[2], b3[2]) +
+                   Sx(a3[0], b3[0]) * Sy(a3[1], b3[1]) * tz[a3[2] * lb1 + b3[2]];
+          });
     }
   return T;
 }
@@ -224,19 +208,11 @@ std::vector<std::vector<Real>> multipole_matrices(const ShellBasis<Real> &basis,
       };
       for (std::size_t ci = 0; ci < comps.size(); ++ci) {
         const auto &e = comps[ci];
-        for (int ka = 0; ka < ncart(sa.l); ++ka) {
-          int a3[3];
-          cart_comp(sa.l, ka, a3[0], a3[1], a3[2]);
-          for (int kb = 0; kb < ncart(sb.l); ++kb) {
-            int b3[3];
-            cart_comp(sb.l, kb, b3[0], b3[1], b3[2]);
-            const Real v = M(0, e[0], a3[0], b3[0]) * M(1, e[1], a3[1], b3[1]) *
-                           M(2, e[2], a3[2], b3[2]);
-            out[ci][(basis.ao_off[a] + ka) * nao + basis.ao_off[b] + kb] = v;
-            if (a != b)
-              out[ci][(basis.ao_off[b] + kb) * nao + basis.ao_off[a] + ka] = v;
-          }
-        }
+        detail::scatter_pair(out[ci], basis, a, b, +1,
+            [&](int, const int *a3, int, const int *b3) {
+              return M(0, e[0], a3[0], b3[0]) * M(1, e[1], a3[1], b3[1]) *
+                     M(2, e[2], a3[2], b3[2]);
+            });
       }
     }
   return out;
@@ -298,29 +274,15 @@ std::array<std::vector<Real>, 3> angular_momentum(const ShellBasis<Real> &basis,
           for (int j = 0; j <= lb; ++j)
             Mf[d][i * lb1 + j] = m1[(1 * (la + 1) + i) * lb1 + j]; // e=1 block
       }
-      for (int ka = 0; ka < ncart(la); ++ka) {
-        int a3[3];
-        cart_comp(la, ka, a3[0], a3[1], a3[2]);
-        for (int kb = 0; kb < ncart(lb); ++kb) {
-          int b3[3];
-          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-          auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
-          auto M = [&](int d) { return Mf[d][a3[d] * lb1 + b3[d]]; };
-          auto K = [&](int d) { return Kf[d][a3[d] * lb1 + b3[d]]; };
-          const std::size_t idx =
-              (basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb;
-          L[0][idx] = S(0) * (M(1) * K(2) - K(1) * M(2));
-          L[1][idx] = S(1) * (M(2) * K(0) - M(0) * K(2));
-          L[2][idx] = S(2) * (M(0) * K(1) - M(1) * K(0));
-          if (a != b) {
-            const std::size_t jdx = (basis.ao_off[b] + kb) * static_cast<std::size_t>(nao) +
-                                    basis.ao_off[a] + ka;
-            L[0][jdx] = -L[0][idx];
-            L[1][jdx] = -L[1][idx];
-            L[2][jdx] = -L[2][idx];
-          }
-        }
-      }
+      detail::scatter_pair3(L, basis, a, b, -1,
+          [&](int, const int *a3, int, const int *b3) -> std::array<Real, 3> {
+            auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
+            auto M = [&](int d) { return Mf[d][a3[d] * lb1 + b3[d]]; };
+            auto K = [&](int d) { return Kf[d][a3[d] * lb1 + b3[d]]; };
+            return {S(0) * (M(1) * K(2) - K(1) * M(2)),
+                    S(1) * (M(2) * K(0) - M(0) * K(2)),
+                    S(2) * (M(0) * K(1) - M(1) * K(0))};
+          });
     }
   return L;
 }
@@ -354,21 +316,12 @@ std::array<std::vector<Real>, 3> gradient_matrices(const ShellBasis<Real> &basis
             Kf[d][i * lb1 + j] = k;
           }
       }
-      for (int ka = 0; ka < ncart(la); ++ka) {
-        int a3[3];
-        cart_comp(la, ka, a3[0], a3[1], a3[2]);
-        for (int kb = 0; kb < ncart(lb); ++kb) {
-          int b3[3];
-          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-          auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
-          auto K = [&](int d) { return Kf[d][a3[d] * lb1 + b3[d]]; };
-          const std::size_t idx =
-              (basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb;
-          G[0][idx] = K(0) * S(1) * S(2);
-          G[1][idx] = S(0) * K(1) * S(2);
-          G[2][idx] = S(0) * S(1) * K(2);
-        }
-      }
+      detail::scatter_pair3(G, basis, a, b, 0,
+          [&](int, const int *a3, int, const int *b3) -> std::array<Real, 3> {
+            auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
+            auto K = [&](int d) { return Kf[d][a3[d] * lb1 + b3[d]]; };
+            return {K(0) * S(1) * S(2), S(0) * K(1) * S(2), S(0) * S(1) * K(2)};
+          });
     }
   return G;
 }
@@ -405,25 +358,18 @@ kinetic_moment_matrices(const ShellBasis<Real> &basis) {
       }
       auto Si = [&](int d, int i, int j) { return S[d][i * lb1 + j]; };
       auto Ti = [&](int d, int i, int j) { return T[d][i * lb1 + j]; };
-      for (int ka = 0; ka < ncart(la); ++ka) {
-        int a3[3];
-        cart_comp(la, ka, a3[0], a3[1], a3[2]);
-        for (int kb = 0; kb < ncart(lb); ++kb) {
-          int b3[3];
-          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-          auto kin = [&](int ix, int iy, int iz) {
-            return Ti(0, ix, b3[0]) * Si(1, iy, b3[1]) * Si(2, iz, b3[2]) +
-                   Si(0, ix, b3[0]) * Ti(1, iy, b3[1]) * Si(2, iz, b3[2]) +
-                   Si(0, ix, b3[0]) * Si(1, iy, b3[1]) * Ti(2, iz, b3[2]);
-          };
-          const Real Tb = kin(a3[0], a3[1], a3[2]);
-          const std::size_t idx =
-              (basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb;
-          KM[0][idx] = kin(a3[0] + 1, a3[1], a3[2]) + sa.center[0] * Tb;
-          KM[1][idx] = kin(a3[0], a3[1] + 1, a3[2]) + sa.center[1] * Tb;
-          KM[2][idx] = kin(a3[0], a3[1], a3[2] + 1) + sa.center[2] * Tb;
-        }
-      }
+      detail::scatter_pair3(KM, basis, a, b, 0,
+          [&](int, const int *a3, int, const int *b3) -> std::array<Real, 3> {
+            auto kin = [&](int ix, int iy, int iz) {
+              return Ti(0, ix, b3[0]) * Si(1, iy, b3[1]) * Si(2, iz, b3[2]) +
+                     Si(0, ix, b3[0]) * Ti(1, iy, b3[1]) * Si(2, iz, b3[2]) +
+                     Si(0, ix, b3[0]) * Si(1, iy, b3[1]) * Ti(2, iz, b3[2]);
+            };
+            const Real Tb = kin(a3[0], a3[1], a3[2]);
+            return {kin(a3[0] + 1, a3[1], a3[2]) + sa.center[0] * Tb,
+                    kin(a3[0], a3[1] + 1, a3[2]) + sa.center[1] * Tb,
+                    kin(a3[0], a3[1], a3[2] + 1) + sa.center[2] * Tb};
+          });
     }
   return KM;
 }

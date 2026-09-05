@@ -641,6 +641,19 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
      "operators = node lists" already unifies the KERNEL side more elegantly
      than SHARK's per-kernel functions, so the work is mainly the CONSUMER
      (digestion) abstraction. Do this first: it is the seam #1 and #3 slot into.
+     STARTED (2026-09-05, include/intti/lkc.hpp): the CONSUMER seam for the
+     DETERMINISTIC explicit-integral pair builders -- `detail::scatter_pair`
+     (single AO matrix) and `detail::scatter_pair3` (three matrices) hoist the
+     repeated "enumerate the (ka,kb) Cartesian components of pair (a,b),
+     compute the row-major AO indices, write the block, mirror it (+1 sym / -1
+     antisym / 0 none)" boilerplate behind a per-element value callback. First
+     consumer: oneel.hpp, whose six builders (S, T, multipole, angular
+     momentum, gradient, kinetic-moment) dropped ~11 duplicated scatter sites
+     to value-lambdas; byte-exact (suite 206/206, PySCF 1e oracles unchanged).
+     Deliberately NOT applied to the FUSED J/K engines (jbuild/kbuild) or the
+     n^6 threeel builder: their density digestion is fused into the coupling
+     and a generic consumer would de-fuse the hot path (= the #3 conclusion).
+     Next: extend the consumer to ncenter (2c/3c tensor writes) and nuclear.
   3. **Digestion / permutational-redundancy** (SHARK Sec 3.6, Eq 29-37) --
      ANALYSED, DOES NOT APPLY to our J-engine. SHARK's digestion redundancy
      de-duplicates EXPLICIT integrals; jbuild is a J-engine that never forms
