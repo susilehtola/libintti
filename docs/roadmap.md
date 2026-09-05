@@ -1055,12 +1055,17 @@ occupied-orbital ASSEMBLY K_pq = occ_scale sum_i (pi|qi), (pi|qi) = sum_rs C_ri
 C_si (pr|qs), driven through the per-orbital loop on the machine-precise
 separable grid (pr|qs) (step-1), reproduces exchange_build to 1.3e-15 (s-basis,
 one centre). This validates the co-density formulation + occupied-orbital
-assembly. STILL TO DO (the genuine seminumerical advantage): form g_qi = chi_q
-phi_i as a single 3D grid function and take ONE 3D DAGE Coulomb solve per (q,i)
--- avoiding the O(Nbf^2) r,s expansion -- which needs the 3D t-adapted DAGE with
-per-axis FE interpolation (a fixed-grid 3D DAGE is infeasible at accuracy: the
-t_c <~ n/2L resolution limit forces prohibitive n). That is the step-3 build,
-alongside multi-centre bridging.
+assembly. The genuine seminumerical form is now also PROTOTYPED
+(prototype/fe_exchange_dage.cpp, 2026-09-05): form g_qi = chi_q phi_i as ONE 3D
+grid tensor and take a SINGLE 3D DAGE Coulomb solve per (q,i) (no O(Nbf^2) r,s
+expansion), then K_pq = occ_scale sum_i int g_pi V_qi. Reproduces exchange_build
+to rel 1.1e-4 at a coarse grid (5 elem x deg 7, N=40/axis; s-basis, 1 occupied),
+representation-limited and spectrally convergent (the DAGE quadrature is
+machine-exact per steps 1-3). This is the production seminumerical K on the grid
+(pseudospectral/COSX-style), built on the step-3 3D DAGE; cost = nocc*Nbf DAGE
+solves. Combined with the multi-centre DAGE, FE exchange for molecules is
+de-risked. Remaining: accuracy/cost tuning (near-nucleus resolution for the
+cusped co-densities), localized-orbital screening, and library-ization.
 
 **Step-3 (3D t-adapted DAGE) PROTOTYPED** (prototype/fe_dage3d.cpp, 2026-09-05):
 the Coulomb potential of a GENERAL 3D density on the tensorial FE grid,
