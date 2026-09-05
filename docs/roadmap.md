@@ -1380,8 +1380,30 @@ widen the domain by the polynomial's reach. grid_for_basis passes pdeg = 2*lmax
 (the max per-axis AO-product degree). This makes grid-RI J for high-l shells
 match the EXACT GTO coulomb_build directly (new CI GridRI.HighLCoulombMatchesGTO:
 s+d, worst rel error < 4e-2 -- the check that previously failed at 0.2 with an
-envelope-only grid). Suite 224/224. Next: a benchmark vs GTO-RI (and vs the
-analytic contracted engine for ANO); a Kokkos/streaming port.
+envelope-only grid). Suite 224/224.
+KOKKOS PORT of the DAGE operator (2026-09-06): fe_dage3d is now Kokkos-parallel
+-- each axis sweep is a parallel_for over the N^2 independent lines (double-
+buffered A<->B ping-pong; grid arrays staged as device Views via detail::
+to_device), so it runs on the active backend (OpenMP here, CUDA/HIP-ready) with
+per-node math identical to the serial reference (all grid-RI CI tests
+unchanged). Big OpenMP speedup on the DAGE-heavy tests: ContractedExchange
+18.6s->3.7s (~5x), CoulombMatchesGTO 3.0s->0.3s. In the tensor-product grid
+every line shares the same 1D mesh, so all work-items do identical work -- the
+favourable GPU case (M-FE GPU note). Suite 226/226. Since all grid-RI builders
+call fe_dage3d, they all inherit the parallelism. Next: benchmark vs GTO-RI;
+validate on real GPU hardware (blocked on this Intel box); optionally push the
+AO evaluation + contraction (ao_values_on_grid / fe_inner) onto the device too
+to avoid the host round-trip.
+DFT / local-hybrid scope decision (2026-09-06): xc quadrature reuses the grid-RI
+FE substrate (AO-on-grid + contraction) with libxc (MPL-2.0, compatible) as an
+OPTIONAL pointwise v_xc callback -- the core stays a dependency-free integrals
+library. The distinctive niche is HIGH / arbitrary-precision xc integration
+(spectral hp convergence, where Becke atom-centred grids plateau at ~uHartree);
+not the cheapest for qualitative results. The in-scope, distinctive M14 piece is
+the local exact-exchange energy density eps_x^HF(r) on the grid (our 2e
+machinery, no libxc); build it at M14, expose xc quadrature as a general grid
+capability with a v_xc callback, keep libxc an optional binding -- no scope-creep
+into a DFT program.
 
 ORTHONORMAL / MO-BASIS grid-RI is viable (user, 2026-09-05). For J it is a non-
 issue by INVARIANCE: rho = sum D_uv chi_u chi_v is basis-independent, so V =

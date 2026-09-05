@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "device.hpp"
 #include "kernel.hpp"
 #include "tgrid.hpp"
 
@@ -282,42 +283,89 @@ void fe_conv1d(const FEGrid1D<Real> &g, const std::vector<Real> &vg,
 /// (coulomb -> 1/r; yukawa(kappa) -> e^{-kappa r}/r). `nv` is the inner
 /// (flat-kernel) quadrature order. Handles general non-separable densities and
 /// hp (variable-order) grids.
+///
+/// Kokkos-parallel over the N^2 independent lines of each axis sweep (double-
+/// buffered A<->B), so it runs on the active Kokkos backend (OpenMP/CUDA/HIP);
+/// the per-node math is identical to the serial reference. In the tensor-product
+/// grid every line shares the same 1D mesh, so all work-items do identical work
+/// (see the roadmap M-FE GPU note).
 template <class Real>
 std::vector<Real> fe_dage3d(const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
                             const std::vector<Real> &rho, int nv = 32, Real vmax = Real(8)) {
-  const int N = grid.N;
+  const int N = grid.N, ne = grid.ne;
   const std::size_t N3 = static_cast<std::size_t>(N) * N * N;
-  std::vector<Real> vg, vw;
-  detail::fe_gauss_legendre<Real>(nv, Real(-1), Real(1), vg, vw);
-  std::vector<Real> V(N3, Real(0)), work(N3), line(N), out(N);
+  std::vector<Real> vgh, vwh;
+  detail::fe_gauss_legendre<Real>(nv, Real(-1), Real(1), vgh, vwh);
+  auto xnode = detail::to_device(grid.xnode, "fe::xnode");
+  auto be = detail::to_device(grid.be, "fe::be");
+  auto nps = detail::to_device(grid.nps, "fe::nps");
+  auto noff = detail::to_device(grid.noff, "fe::noff");
+  auto rn = detail::to_device(grid.rn, "fe::rn");
+  auto bw = detail::to_device(grid.bw, "fe::bw");
+  auto vg = detail::to_device(vgh, "fe::vg");
+  auto vw = detail::to_device(vwh, "fe::vw");
+  auto R = detail::to_device(rho, "fe::rho");
+  Kokkos::View<Real *> A("fe::A", N3), B("fe::B", N3), V("fe::V", N3);
+  Kokkos::deep_copy(V, Real(0));
+  const int nline = N * N;
+  // one axis sweep: transform each of the N^2 lines (in -> out) along `axis`.
+  auto sweep = [&](Kokkos::View<Real *> in, Kokkos::View<Real *> out, int axis, Real t) {
+    Kokkos::parallel_for(
+        "fe::dage::conv", nline, KOKKOS_LAMBDA(int line) {
+          const int i = line / N, j = line % N;
+          std::size_t base;
+          std::size_t stride;
+          if (axis == 0) { base = (static_cast<std::size_t>(i) * N + j) * N; stride = 1; }
+          else if (axis == 1) { base = static_cast<std::size_t>(i) * N * N + j; stride = N; }
+          else { base = static_cast<std::size_t>(i) * N + j; stride = static_cast<std::size_t>(N) * N; }
+          for (int jo = 0; jo < N; ++jo) {
+            const Real u1 = xnode(jo);
+            Real acc = 0;
+            for (int eB = 0; eB < ne; ++eB) {
+              Real lo = t * (u1 - be(eB + 1)), hi = t * (u1 - be(eB));
+              lo = lo > -vmax ? lo : -vmax;
+              hi = hi < vmax ? hi : vmax;
+              if (hi <= lo) continue;
+              const int o = noff(eB), p = nps(eB);
+              const Real cen = Real(0.5) * (be(eB) + be(eB + 1));
+              const Real hw = Real(0.5) * (be(eB + 1) - be(eB));
+              const Real vc = Real(0.5) * (lo + hi), vh = Real(0.5) * (hi - lo);
+              Real s = 0;
+              for (int gi = 0; gi < nv; ++gi) {
+                const Real v = vc + vh * vg(gi);
+                const Real xi = ((u1 - v / t) - cen) / hw;
+                Real num = 0, den = 0, lag = 0;
+                bool hit = false;
+                for (int k = 0; k < p; ++k) {
+                  const Real dd = xi - rn(o + k);
+                  const Real val = in(base + static_cast<std::size_t>(o + k) * stride);
+                  if (dd < Real(1e-13) && dd > Real(-1e-13)) { lag = val; hit = true; break; }
+                  const Real tt = bw(o + k) / dd;
+                  num += tt * val;
+                  den += tt;
+                }
+                if (!hit) lag = num / den;
+                s += vh * vw(gi) * lag * Kokkos::exp(-v * v);
+              }
+              acc += s / t;
+            }
+            out(base + static_cast<std::size_t>(jo) * stride) = acc;
+          }
+        });
+  };
   for (int it = 0; it < tgrid.n(); ++it) {
-    const Real t = tgrid.t[it];
-    work = rho;
-    // conv along z (contiguous lines)
-    for (int ix = 0; ix < N; ++ix)
-      for (int iy = 0; iy < N; ++iy) {
-        Real *ln = &work[(static_cast<std::size_t>(ix) * N + iy) * N];
-        detail::fe_conv1d(grid, vg, vw, vmax, ln, t, out.data());
-        for (int iz = 0; iz < N; ++iz) ln[iz] = out[iz];
-      }
-    // conv along y
-    for (int ix = 0; ix < N; ++ix)
-      for (int iz = 0; iz < N; ++iz) {
-        for (int iy = 0; iy < N; ++iy) line[iy] = work[(static_cast<std::size_t>(ix) * N + iy) * N + iz];
-        detail::fe_conv1d(grid, vg, vw, vmax, line.data(), t, out.data());
-        for (int iy = 0; iy < N; ++iy) work[(static_cast<std::size_t>(ix) * N + iy) * N + iz] = out[iy];
-      }
-    // conv along x
-    for (int iy = 0; iy < N; ++iy)
-      for (int iz = 0; iz < N; ++iz) {
-        for (int ix = 0; ix < N; ++ix) line[ix] = work[(static_cast<std::size_t>(ix) * N + iy) * N + iz];
-        detail::fe_conv1d(grid, vg, vw, vmax, line.data(), t, out.data());
-        for (int ix = 0; ix < N; ++ix) work[(static_cast<std::size_t>(ix) * N + iy) * N + iz] = out[ix];
-      }
-    const Real wt = tgrid.w[it];
-    for (std::size_t i = 0; i < N3; ++i) V[i] += wt * work[i];
+    const Real t = tgrid.t[it], wt = tgrid.w[it];
+    Kokkos::deep_copy(A, R);
+    sweep(A, B, 0, t); // z: A -> B
+    sweep(B, A, 1, t); // y: B -> A
+    sweep(A, B, 2, t); // x: A -> B (result in B)
+    Kokkos::parallel_for(
+        "fe::dage::acc", N3, KOKKOS_LAMBDA(std::size_t k) { V(k) += wt * B(k); });
   }
-  return V;
+  auto hV = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, V);
+  std::vector<Real> Vout(N3);
+  for (std::size_t k = 0; k < N3; ++k) Vout[k] = hV(k);
+  return Vout;
 }
 
 /// Grid inner product int f g dr over the 3D FE grid (product of 1D weights).
