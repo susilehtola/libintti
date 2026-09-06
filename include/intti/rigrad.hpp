@@ -79,14 +79,20 @@ template <class Real> struct RIGradJobs {
   }
 };
 
-/// Run the batched jobs and accumulate the forces. Mode 0 is the three-centre
-/// coefficient D_mn gamma_P (Term A); Mode 1 is the two-centre
-/// -1/2 gamma_P gamma_Q (Term B). Forces are indexed shell-major over the
-/// concatenated [orbital shells, auxiliary shells] list.
+/// Run the batched jobs and accumulate the forces. The coefficient pattern is
+/// selected by Mode (RI-J uses 0/1, RI-K uses 2/3):
+///   0: D_mn gamma_P                     (RI-J three-centre, Term A)
+///   1: -1/2 gamma_P gamma_Q             (RI-J two-centre,  Term B)
+///   2: c3[(mu,nu,P)]                    (RI-K three-centre, Term 1)
+///   3: c2[(T,U)]                        (RI-K two-centre,  Term 2)
+/// Forces are indexed shell-major over the concatenated [orbital shells,
+/// auxiliary shells] list. Unused coefficient views may be empty.
 template <class Real, int Mode>
 void ri_grad_digest(RIGradJobs<Real> &jobs, const TGrid<Real> &grid,
                     Kokkos::View<const Real *> Dd, int nao,
                     Kokkos::View<const Real *> gam,
+                    Kokkos::View<const Real *> c3v, Kokkos::View<const Real *> c2v,
+                    int naux,
                     Kokkos::View<Real *[3], Kokkos::LayoutLeft> force) {
   if (jobs.njob == 0) return;
   auto tab = make_pair_table(jobs.plist);
@@ -128,8 +134,13 @@ void ri_grad_digest(RIGradJobs<Real> &jobs, const TGrid<Real> &grid,
                 Real cf;
                 if constexpr (Mode == 0)
                   cf = Dd(static_cast<std::size_t>(oa + k[0]) * nao + ob + k[1]) * gam(oc + k[2]);
-                else
+                else if constexpr (Mode == 1)
                   cf = Real(-0.5) * gam(oa + k[0]) * gam(oc + k[2]);
+                else if constexpr (Mode == 2)
+                  cf = c3v(((static_cast<std::size_t>(oa + k[0]) * nao + ob + k[1]) * naux) +
+                           oc + k[2]);
+                else
+                  cf = c2v(static_cast<std::size_t>(oa + k[0]) * naux + oc + k[2]);
                 if (cf == Real(0)) continue;
                 int b3[3];
                 cart_comp(lp, k[p], b3[0], b3[1], b3[2]);
@@ -461,9 +472,10 @@ RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
       }
     auto Dd = detail::to_device(D, static_cast<std::size_t>(nao) * nao, "rig::D");
     auto gam = detail::to_device(gamma, "rig::gamma");
+    Kokkos::View<const Real *> none;
     Kokkos::View<Real *[3], Kokkos::LayoutLeft> force("rig::force", nso + nsa);
-    detail::ri_grad_digest<Real, 0>(jobA, grid, Dd, nao, gam, force);
-    detail::ri_grad_digest<Real, 1>(jobB, grid, Dd, nao, gam, force);
+    detail::ri_grad_digest<Real, 0>(jobA, grid, Dd, nao, gam, none, none, naux, force);
+    detail::ri_grad_digest<Real, 1>(jobB, grid, Dd, nao, gam, none, none, naux, force);
     auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, force);
     for (int s = 0; s < nso; ++s)
       for (int e = 0; e < 3; ++e) g.forb[s][e] = hf(s, e);
@@ -711,6 +723,43 @@ RIGrad<Real> ri_k_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
   g.faux.assign(aux.shells.size(), {Real(0), Real(0), Real(0)});
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
+
+  if constexpr (kokkos_scalar_v<Real>) {
+    // same batched ghost-quartet digestion as the RI-J gradient, with the RI-K
+    // coefficient tensors c3 (three-centre) and c2 (two-centre).
+    detail::RIGradJobs<Real> jobA, jobB;
+    for (int lsh = 0; lsh < nso; ++lsh)
+      for (int nsh = 0; nsh < nso; ++nsh)
+        for (int a = 0; a < nsa; ++a) {
+          const PrimitiveShell<Real> sh[4] = {orb.shells[lsh], orb.shells[nsh], aux.shells[a],
+                                              detail::ghost_shell(aux.shells[a])};
+          for (int pos = 0; pos < 3; ++pos) {
+            const int tgt = (pos == 0) ? lsh : (pos == 1) ? nsh : nso + a;
+            jobA.add(sh, pos, tgt, orb.ao_off[lsh], orb.ao_off[nsh], aux.ao_off[a]);
+          }
+        }
+    for (int a = 0; a < nsa; ++a)
+      for (int b = 0; b < nsa; ++b) {
+        const PrimitiveShell<Real> sh[4] = {aux.shells[a], detail::ghost_shell(aux.shells[a]),
+                                            aux.shells[b], detail::ghost_shell(aux.shells[b])};
+        for (int pos : {0, 2}) {
+          const int tgt = (pos == 0) ? nso + a : nso + b;
+          jobB.add(sh, pos, tgt, aux.ao_off[a], 0, aux.ao_off[b]);
+        }
+      }
+    auto c3d = detail::to_device(c3, "rik::c3");
+    auto c2d = detail::to_device(c2, "rik::c2");
+    Kokkos::View<const Real *> none;
+    Kokkos::View<Real *[3], Kokkos::LayoutLeft> force("rik::force", nso + nsa);
+    detail::ri_grad_digest<Real, 2>(jobA, grid, none, nao, none, c3d, c2d, naux, force);
+    detail::ri_grad_digest<Real, 3>(jobB, grid, none, nao, none, c3d, c2d, naux, force);
+    auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, force);
+    for (int s = 0; s < nso; ++s)
+      for (int e = 0; e < 3; ++e) g.forb[s][e] = hf(s, e);
+    for (int s = 0; s < nsa; ++s)
+      for (int e = 0; e < 3; ++e) g.faux[s][e] = hf(nso + s, e);
+    return g;
+  }
 
   // Term 1: 3-centre d(l n|R) contracted with c3, quartet (l n | R ghost)
   for (int lsh = 0; lsh < nso; ++lsh)
