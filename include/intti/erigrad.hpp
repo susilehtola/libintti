@@ -108,16 +108,19 @@ Real pair_schwarz_margin(const PrimitiveShell<Real> &a, const PrimitiveShell<Rea
 }
 
 // ---- device (GPU) two-electron gradient -------------------------------------
-// Drop the 8-fold symmetry replay: loop ALL ordered quartets (a,b,c,d) once and
-// contribute each, which equals the canonical+replay sum. Batch every quartet's
-// promoted/demoted blocks through eri_quartets (one device pass) and run the
-// gradient contraction on device with atomic accumulation into the per-shell
-// forces. Exact (tau = 0) path only; correctness-first, so it materialises the
-// materialised quartet list. tau > 0 applies the same Schwarz + density screen
-// as the host build during enumeration (host-side), so large systems produce a
-// feasible O(ns^2)-ish list; tau = 0 is the full O(ns^4) exact list (validation
-// sizes). The 8-fold symmetry is still dropped (8x work) -- reinstating it and
-// streaming the batch are the remaining production follow-ups. l <= LMAX-1.
+// Batched-quartet consumer WITH the 8-fold symmetry. Only CANONICAL quartets
+// (a>=b, c>=d, pair(ab)>=pair(cd)) are enumerated and their promoted/demoted
+// blocks evaluated -- ~8x fewer quartet evaluations, which dominate the cost --
+// and the contraction is replayed on each distinct orbit member. The member's
+// block is NOT materialised (no device permute_block): it is the canonical
+// block read through the permutation, since for member slot j <-> canonical
+// slot pm[j] the canonical index is ic[pm[j]] = k[j]. Every member recomputes
+// its own density coefficient, exponent and force target from its own shells,
+// so the sign bookkeeping and centre routing are unchanged from the host body;
+// only the permutation-invariant integral values are shared.
+// tau > 0 applies the same Schwarz + density screen as the host build during
+// (host-side) enumeration; tau = 0 is the exact list. Streaming/chunking the
+// materialised batch is the remaining production follow-up. l <= LMAX-1.
 template <class Real>
 std::vector<std::array<Real, 3>>
 two_electron_gradient_dev(const ShellBasis<Real> &basis, const Real *D,
@@ -165,102 +168,132 @@ two_electron_gradient_dev(const ShellBasis<Real> &basis, const Real *D,
     return static_cast<int>(plist.size()) - 1;
   };
   std::vector<std::pair<int, int>> quartets;
-  std::vector<int> qa, qb, qc, qd; // shells per job (ordered quartet)
-  std::vector<int> plusE, minusE;  // 4 per job: batch-entry index, -1 if absent
+  // 8-FOLD SYMMETRY. Enumerate CANONICAL quartets only (a>=b, c>=d,
+  // pair(ab)>=pair(cd)) and evaluate their promoted/demoted blocks ONCE, then
+  // replay the contraction on each distinct orbit member. The member's block is
+  // the canonical one read through the permutation rather than materialised:
+  // for member slot j <-> canonical slot pm[j], the canonical index is
+  // ic[pm[j]] = k[j]. That is ~8x fewer quartet evaluations, which dominate.
+  std::vector<int> jc0, jc1, jc2, jc3; // canonical shells per job
+  std::vector<int> jp0, jp1, jp2, jp3; // member->canonical permutation
+  std::vector<int> je;                 // 8 per job: plus[0..3] then minus[0..3]
   for (int a = 0; a < ns; ++a)
-    for (int b = 0; b < ns; ++b)
+    for (int b = 0; b <= a; ++b) {
+      const int Pab = a * ns + b;
       for (int c = 0; c < ns; ++c)
-        for (int d = 0; d < ns; ++d) {
+        for (int d = 0; d <= c; ++d) {
+          if (c * ns + d > Pab) continue;
+          const int canon[4] = {a, b, c, d};
           const int L[4] = {hL[a], hL[b], hL[c], hL[d]};
           if (tau > Real(0)) {
-            const int sh[4] = {a, b, c, d};
             Real dw = 0;
             for (int i = 0; i < 4; ++i)
-              for (int jj = 0; jj < 4; ++jj) dw = std::max(dw, Dmax[sh[i] * ns + sh[jj]]);
+              for (int jj = 0; jj < 4; ++jj)
+                dw = std::max(dw, Dmax[canon[i] * ns + canon[jj]]);
             const Real almax = std::max({hAl[a], hAl[b], hAl[c], hAl[d]});
             if (2 * almax * Q[a * ns + b] * Q[c * ns + d] * dw * dw < tau) continue;
           }
-          qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
-          for (int pos = 0; pos < 4; ++pos) {
-            // plus: shell at pos promoted
-            int bp = (pos == 0) ? add_pair(a, 1, b, 0)
-                     : (pos == 1) ? add_pair(a, 0, b, 1)
-                                  : add_pair(a, 0, b, 0);
-            int kp = (pos == 2) ? add_pair(c, 1, d, 0)
-                     : (pos == 3) ? add_pair(c, 0, d, 1)
-                                  : add_pair(c, 0, d, 0);
-            plusE.push_back(static_cast<int>(quartets.size()));
+          // the eight canonical blocks, indexed by canonical slot
+          int cplus[4], cminus[4];
+          for (int cp = 0; cp < 4; ++cp) {
+            const int bp = add_pair(a, cp == 0 ? 1 : 0, b, cp == 1 ? 1 : 0);
+            const int kp = add_pair(c, cp == 2 ? 1 : 0, d, cp == 3 ? 1 : 0);
+            cplus[cp] = static_cast<int>(quartets.size());
             quartets.push_back({bp, kp});
-            // minus: shell at pos demoted (only if l>=1)
-            if (L[pos] >= 1) {
-              int bm = (pos == 0) ? add_pair(a, -1, b, 0)
-                       : (pos == 1) ? add_pair(a, 0, b, -1)
-                                    : add_pair(a, 0, b, 0);
-              int km = (pos == 2) ? add_pair(c, -1, d, 0)
-                       : (pos == 3) ? add_pair(c, 0, d, -1)
-                                    : add_pair(c, 0, d, 0);
-              minusE.push_back(static_cast<int>(quartets.size()));
+            if (L[cp] >= 1) {
+              const int bm = add_pair(a, cp == 0 ? -1 : 0, b, cp == 1 ? -1 : 0);
+              const int km = add_pair(c, cp == 2 ? -1 : 0, d, cp == 3 ? -1 : 0);
+              cminus[cp] = static_cast<int>(quartets.size());
               quartets.push_back({bm, km});
             } else {
-              minusE.push_back(-1);
+              cminus[cp] = -1;
             }
           }
+          // distinct orbit members
+          int seen[8][4];
+          int nseen = 0;
+          for (int g = 0; g < 8; ++g) {
+            const int *pm = detail::eri_perms[g];
+            const int mem[4] = {canon[pm[0]], canon[pm[1]], canon[pm[2]], canon[pm[3]]};
+            bool dup = false;
+            for (int t = 0; t < nseen && !dup; ++t)
+              dup = seen[t][0] == mem[0] && seen[t][1] == mem[1] && seen[t][2] == mem[2] &&
+                    seen[t][3] == mem[3];
+            if (dup) continue;
+            for (int t = 0; t < 4; ++t) seen[nseen][t] = mem[t];
+            ++nseen;
+            jc0.push_back(a); jc1.push_back(b); jc2.push_back(c); jc3.push_back(d);
+            jp0.push_back(pm[0]); jp1.push_back(pm[1]);
+            jp2.push_back(pm[2]); jp3.push_back(pm[3]);
+            for (int cp = 0; cp < 4; ++cp) je.push_back(cplus[cp]);
+            for (int cp = 0; cp < 4; ++cp) je.push_back(cminus[cp]);
+          }
         }
-  const int njob = static_cast<int>(qa.size());
+    }
+  const int njob = static_cast<int>(jc0.size());
   auto tab = make_pair_table(plist);
   auto batch = make_batch(tab, quartets);
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::g2::out", batch.nout_total);
   eri_quartets(tab, batch, grid, out, ws);
 
-  auto dqa = to_device(qa, "intti::g2::qa"), dqb = to_device(qb, "intti::g2::qb");
-  auto dqc = to_device(qc, "intti::g2::qc"), dqd = to_device(qd, "intti::g2::qd");
-  auto dplus = to_device(plusE, "intti::g2::plusE");
-  auto dminus = to_device(minusE, "intti::g2::minusE");
+  auto dc0 = to_device(jc0, "g2::c0"), dc1 = to_device(jc1, "g2::c1");
+  auto dc2 = to_device(jc2, "g2::c2"), dc3 = to_device(jc3, "g2::c3");
+  auto dp0 = to_device(jp0, "g2::p0"), dp1 = to_device(jp1, "g2::p1");
+  auto dp2 = to_device(jp2, "g2::p2"), dp3 = to_device(jp3, "g2::p3");
+  auto dje = to_device(je, "g2::je");
   auto offv = batch.out_offset;
   Kokkos::View<Real *[3], Kokkos::LayoutLeft> gradd("intti::g2::grad", ns);
   Kokkos::parallel_for(
       "intti::g2::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
-        const int sh[4] = {dqa(j), dqb(j), dqc(j), dqd(j)};
-        const int La = shL(sh[0]), Lb = shL(sh[1]), Lc = shL(sh[2]), Ld = shL(sh[3]);
-        const int na = ncart(La), nb = ncart(Lb), nc = ncart(Lc), nd = ncart(Ld);
-        const int off0 = shOff(sh[0]), off1 = shOff(sh[1]), off2 = shOff(sh[2]), off3 = shOff(sh[3]);
-        auto Dm = [&](int i, int k) { return Dd(static_cast<std::size_t>(i) * nao + k); };
+        const int canon[4] = {dc0(j), dc1(j), dc2(j), dc3(j)};
+        const int pm[4] = {dp0(j), dp1(j), dp2(j), dp3(j)};
+        int Lc[4], mem[4], Lm[4], offm[4];
+        for (int t = 0; t < 4; ++t) Lc[t] = shL(canon[t]);
+        for (int t = 0; t < 4; ++t) {
+          mem[t] = canon[pm[t]];
+          Lm[t] = Lc[pm[t]];
+          offm[t] = shOff(mem[t]);
+        }
+        const int nm[4] = {ncart(Lm[0]), ncart(Lm[1]), ncart(Lm[2]), ncart(Lm[3])};
+        auto Dm = [&](int i, int k2) { return Dd(static_cast<std::size_t>(i) * nao + k2); };
         for (int pos = 0; pos < 4; ++pos) {
-          const int Lp = shL(sh[pos]);
-          const int pe = dplus(j * 4 + pos), me = dminus(j * 4 + pos);
+          const int cp = pm[pos]; // canonical slot carrying this derivative
+          const int Lp = Lc[cp];
+          const int pe = dje(j * 8 + cp), me = dje(j * 8 + 4 + cp);
           const int pbase = offv(pe);
           const int mbase = (me >= 0) ? offv(me) : 0;
-          // block dims for plus (pos promoted) and minus (pos demoted)
-          const int dP[4] = {ncart(pos == 0 ? La + 1 : La), ncart(pos == 1 ? Lb + 1 : Lb),
-                             ncart(pos == 2 ? Lc + 1 : Lc), ncart(pos == 3 ? Ld + 1 : Ld)};
-          const int dM[4] = {ncart(pos == 0 ? La - 1 : La), ncart(pos == 1 ? Lb - 1 : Lb),
-                             ncart(pos == 2 ? Lc - 1 : Lc), ncart(pos == 3 ? Ld - 1 : Ld)};
-          const Real ap = shAl(sh[pos]);
-          for (int ka = 0; ka < na; ++ka) {
-            int a3[3];
-            cart_comp(La, ka, a3[0], a3[1], a3[2]);
-            for (int kb = 0; kb < nb; ++kb) {
-              int b3[3];
-              cart_comp(Lb, kb, b3[0], b3[1], b3[2]);
-              for (int kc = 0; kc < nc; ++kc) {
-                int c3[3];
-                cart_comp(Lc, kc, c3[0], c3[1], c3[2]);
-                for (int kd = 0; kd < nd; ++kd) {
-                  int d3[3];
-                  cart_comp(Ld, kd, d3[0], d3[1], d3[2]);
+          int dP[4], dM[4];
+          for (int t = 0; t < 4; ++t) {
+            dP[t] = ncart(Lc[t]);
+            dM[t] = ncart(Lc[t]);
+          }
+          dP[cp] = ncart(Lp + 1);
+          if (Lp >= 1) dM[cp] = ncart(Lp - 1);
+          const Real ap = shAl(mem[pos]);
+          int k[4];
+          for (k[0] = 0; k[0] < nm[0]; ++k[0])
+            for (k[1] = 0; k[1] < nm[1]; ++k[1])
+              for (k[2] = 0; k[2] < nm[2]; ++k[2])
+                for (k[3] = 0; k[3] < nm[3]; ++k[3]) {
                   const Real coeff =
-                      Real(0.5) * Dm(off0 + ka, off1 + kb) * Dm(off2 + kc, off3 + kd) -
-                      Real(0.25) * Dm(off0 + ka, off2 + kc) * Dm(off1 + kb, off3 + kd);
+                      Real(0.5) * Dm(offm[0] + k[0], offm[1] + k[1]) *
+                          Dm(offm[2] + k[2], offm[3] + k[3]) -
+                      Real(0.25) * Dm(offm[0] + k[0], offm[2] + k[2]) *
+                          Dm(offm[1] + k[1], offm[3] + k[3]);
                   if (coeff == Real(0)) continue;
-                  const int *base3 = pos == 0 ? a3 : pos == 1 ? b3 : pos == 2 ? c3 : d3;
-                  const int idxc[4] = {ka, kb, kc, kd};
+                  int base3[3];
+                  cart_comp(Lm[pos], k[pos], base3[0], base3[1], base3[2]);
                   for (int e = 0; e < 3; ++e) {
                     int mm[3] = {base3[0], base3[1], base3[2]};
                     mm[e] = base3[e] + 1;
                     const int ip = comp_index(Lp + 1, mm[0], mm[1]);
-                    int ic[4] = {idxc[0], idxc[1], idxc[2], idxc[3]};
-                    ic[pos] = ip;
+                    // member indices with pos replaced by the promoted component,
+                    // mapped onto canonical slots: ic[pm[t]] = kk[t]
+                    int kk[4] = {k[0], k[1], k[2], k[3]};
+                    kk[pos] = ip;
+                    int ic[4];
+                    for (int t = 0; t < 4; ++t) ic[pm[t]] = kk[t];
                     const std::size_t pidx =
                         (((static_cast<std::size_t>(ic[0]) * dP[1] + ic[1]) * dP[2] + ic[2]) *
                              dP[3] + ic[3]);
@@ -268,19 +301,18 @@ two_electron_gradient_dev(const ShellBasis<Real> &basis, const Real *D,
                     if (base3[e] >= 1 && me >= 0) {
                       mm[e] = base3[e] - 1;
                       const int im = comp_index(Lp - 1, mm[0], mm[1]);
-                      int icm[4] = {idxc[0], idxc[1], idxc[2], idxc[3]};
-                      icm[pos] = im;
+                      int kk2[4] = {k[0], k[1], k[2], k[3]};
+                      kk2[pos] = im;
+                      int ic2[4];
+                      for (int t = 0; t < 4; ++t) ic2[pm[t]] = kk2[t];
                       const std::size_t midx =
-                          (((static_cast<std::size_t>(icm[0]) * dM[1] + icm[1]) * dM[2] + icm[2]) *
-                               dM[3] + icm[3]);
+                          (((static_cast<std::size_t>(ic2[0]) * dM[1] + ic2[1]) * dM[2] + ic2[2]) *
+                               dM[3] + ic2[3]);
                       term -= Real(base3[e]) * out(mbase + midx);
                     }
-                    Kokkos::atomic_add(&gradd(sh[pos], e), coeff * term);
+                    Kokkos::atomic_add(&gradd(mem[pos], e), coeff * term);
                   }
                 }
-              }
-            }
-          }
         }
       });
   auto gh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, gradd);
