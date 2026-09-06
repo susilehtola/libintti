@@ -158,6 +158,64 @@ TEST(SpinOrbit, TwoElectronCoulombVsFiniteDifference) {
   EXPECT_GT(std::abs(yx) + std::abs(yy) + std::abs(yz), 1e-5) << "trivially zero";
 }
 
+// Exchange-type 2e SO: Ke_k,us = sum_{l,n} D_ln (u l|SO_k|n s), the density
+// bridging one electron-1 index (lambda) and one electron-2 index (nu). Oracle:
+// the mixed centre FD with mu (output row) shifted by delta, lambda (summed) by
+// delta+eta, nu,sigma fixed -- differentiating the raw operator directly.
+TEST(SpinOrbit, TwoElectronExchangeVsFiniteDifference) {
+  const std::array<std::array<double, 3>, 4> A{
+      {{0.0, 0.0, 0.0}, {0.4, 0.1, -0.3}, {-0.2, 0.5, 0.7}, {0.6, -0.4, 0.2}}};
+  const std::array<double, 4> al{1.3, 0.9, 1.1, 0.7};
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  std::vector<intti::PrimitiveShell<double>> sh;
+  for (int i = 0; i < 4; ++i) sh.push_back({al[i], {A[i][0], A[i][1], A[i][2]}, 0});
+  auto base = intti::make_basis(sh);
+  const int n = base.nao; // 4
+  std::vector<double> D(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = 0.3 + 0.1 * i - 0.05 * j + 0.02 * i * j;
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) D[j * n + i] = D[i * n + j];
+
+  auto Ke = intti::spin_orbit_2e_exchange(base, D.data(), grid);
+
+  // Fe(delta,eta) = sum_{lambda,nu} D_{lambda,nu} (mu lambda | nu sigma), mu=0
+  // (row) shifted delta, lambda shifted delta+eta, nu summed, sigma=1 fixed.
+  const int muS = 0, sigS = 1;
+  const double h = 3e-3;
+  auto Fe = [&](const std::array<double, 3> &dl, const std::array<double, 3> &et) {
+    intti::PrimitiveShell<double> mu{al[muS], {A[muS][0] + dl[0], A[muS][1] + dl[1], A[muS][2] + dl[2]}, 0};
+    intti::PrimitiveShell<double> sig{al[sigS], {A[sigS][0], A[sigS][1], A[sigS][2]}, 0};
+    double f = 0;
+    for (int lb = 0; lb < 4; ++lb)
+      for (int nu = 0; nu < 4; ++nu) {
+        intti::PrimitiveShell<double> lam{
+            al[lb], {A[lb][0] + dl[0] + et[0], A[lb][1] + dl[1] + et[1], A[lb][2] + dl[2] + et[2]}, 0};
+        intti::PrimitiveShell<double> sn{al[nu], {A[nu][0], A[nu][1], A[nu][2]}, 0};
+        f += D[lb * n + nu] * intti::detail::eri_block4(mu, lam, sn, sig, grid)[0];
+      }
+    return f;
+  };
+  auto e = [](int ax) { std::array<double, 3> v{0, 0, 0}; v[ax] = 1.0; return v; };
+  auto mixed = [&](int i, int j) {
+    auto pi = e(i), pj = e(j);
+    auto sc = [&](double si, double sj) {
+      std::array<double, 3> dl{si * h * pi[0], si * h * pi[1], si * h * pi[2]};
+      std::array<double, 3> et{sj * h * pj[0], sj * h * pj[1], sj * h * pj[2]};
+      return Fe(dl, et);
+    };
+    return (sc(1, 1) - sc(1, -1) - sc(-1, 1) + sc(-1, -1)) / (4 * h * h);
+  };
+  const double kx = mixed(1, 2) - mixed(2, 1);
+  const double ky = mixed(2, 0) - mixed(0, 2);
+  const double kz = mixed(0, 1) - mixed(1, 0);
+  const std::size_t idx = static_cast<std::size_t>(muS) * n + sigS;
+  EXPECT_NEAR(Ke[0][idx], kx, 1e-4 * (std::abs(kx) + 1)) << "Ke_x";
+  EXPECT_NEAR(Ke[1][idx], ky, 1e-4 * (std::abs(ky) + 1)) << "Ke_y";
+  EXPECT_NEAR(Ke[2][idx], kz, 1e-4 * (std::abs(kz) + 1)) << "Ke_z";
+  EXPECT_GT(std::abs(kx) + std::abs(ky) + std::abs(kz), 1e-5) << "trivially zero";
+}
+
 TEST(SpinOrbit, TwoElectronAntisymmetric) {
   // s + p on two centres -> nontrivial antisymmetric Y_k
   std::vector<intti::PrimitiveShell<double>> shells = {

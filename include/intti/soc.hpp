@@ -156,6 +156,91 @@ spin_orbit_1e(const ShellBasis<Real> &basis,
 /// quartets -- no new kernel. Correctness-first O(N^4) shell loop (like the 1e
 /// SO double loop); the fused/screened build is a later optimisation. D is
 /// nao x nao row-major; grid the Coulomb t-grid. Antisymmetric: Y_k = -Y_k^T.
+namespace detail {
+
+/// Per-quartet two-electron spin-orbit block for four explicit primitive shells:
+///   out[(((k*nca+ka)*ncb+kb)*ncc+kc)*ncd+kd] = eps_kij ( d_i sa  d_j sb | sc sd )
+/// = (sa sb | SO_k | sc sd), the spin-same-orbit integral with electron-1's pair
+/// (sa,sb) differentiated. Built from promoted/demoted plain quartets
+/// (eri_block4) via the MD centre-shift combination -- no 1/r12^3 kernel.
+template <class Real>
+std::vector<Real> spin_orbit_2e_block(const PrimitiveShell<Real> &sa,
+                                      const PrimitiveShell<Real> &sb,
+                                      const PrimitiveShell<Real> &sc,
+                                      const PrimitiveShell<Real> &sd,
+                                      const TGrid<Real> &grid) {
+  const int la = sa.l, lb = sb.l;
+  const int nca = ncart(la), ncb = ncart(lb), ncc = ncart(sc.l), ncd = ncart(sd.l);
+  auto shl = [](PrimitiveShell<Real> s, int dl) { s.l += dl; return s; };
+  // promoted/demoted electron-1 blocks: blk[a-sign][b-sign], sign 0 = +1 (l+1).
+  std::vector<Real> blk[2][2];
+  blk[0][0] = eri_block4(shl(sa, 1), shl(sb, 1), sc, sd, grid);
+  if (lb >= 1) blk[0][1] = eri_block4(shl(sa, 1), shl(sb, -1), sc, sd, grid);
+  if (la >= 1) blk[1][0] = eri_block4(shl(sa, -1), shl(sb, 1), sc, sd, grid);
+  if (la >= 1 && lb >= 1) blk[1][1] = eri_block4(shl(sa, -1), shl(sb, -1), sc, sd, grid);
+  const int nb_s[2] = {ncart(lb + 1), lb >= 1 ? ncart(lb - 1) : 0};
+  // derivative-in-direction terms for one Cartesian component of a shell of
+  // momentum l: sgn 0 -> (l+1) block, coeff -2 alpha; sgn 1 -> (l-1), coeff the
+  // Cartesian power in that direction. Returns the term count (1 or 2).
+  auto terms = [](int l, const int c3[3], Real alpha, int dir, int sgn[2],
+                  int ci[2], Real co[2]) -> int {
+    int nt = 0;
+    int t[3] = {c3[0], c3[1], c3[2]};
+    t[dir] += 1;
+    sgn[nt] = 0;
+    ci[nt] = comp_index(l + 1, t[0], t[1]);
+    co[nt] = -2 * alpha;
+    ++nt;
+    if (c3[dir] >= 1) {
+      int u[3] = {c3[0], c3[1], c3[2]};
+      u[dir] -= 1;
+      sgn[nt] = 1;
+      ci[nt] = comp_index(l - 1, u[0], u[1]);
+      co[nt] = static_cast<Real>(c3[dir]);
+      ++nt;
+    }
+    return nt;
+  };
+  std::vector<Real> out(static_cast<std::size_t>(3) * nca * ncb * ncc * ncd, Real(0));
+  for (int ka = 0; ka < nca; ++ka) {
+    int a3[3];
+    cart_comp(la, ka, a3[0], a3[1], a3[2]);
+    for (int kb = 0; kb < ncb; ++kb) {
+      int b3[3];
+      cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+      // (d_i sa)(d_j sb | sc sd) for one (kc,kd) ket component
+      auto val = [&](int i, int j, int kc, int kd) -> Real {
+        int as[2], aci[2], bs[2], bci[2];
+        Real aco[2], bco[2];
+        const int nat = terms(la, a3, sa.alpha, i, as, aci, aco);
+        const int nbt = terms(lb, b3, sb.alpha, j, bs, bci, bco);
+        Real v = 0;
+        for (int u = 0; u < nat; ++u)
+          for (int w = 0; w < nbt; ++w) {
+            const std::vector<Real> &B = blk[as[u]][bs[w]];
+            const int nbc = nb_s[bs[w]];
+            const std::size_t idx =
+                (((static_cast<std::size_t>(aci[u]) * nbc + bci[w]) * ncc + kc) * ncd + kd);
+            v += aco[u] * bco[w] * B[idx];
+          }
+        return v;
+      };
+      for (int kc = 0; kc < ncc; ++kc)
+        for (int kd = 0; kd < ncd; ++kd) {
+          const std::size_t base =
+              ((static_cast<std::size_t>(ka) * ncb + kb) * ncc + kc) * ncd + kd;
+          const std::size_t plane = static_cast<std::size_t>(nca) * ncb * ncc * ncd;
+          out[0 * plane + base] = val(1, 2, kc, kd) - val(2, 1, kc, kd);
+          out[1 * plane + base] = val(2, 0, kc, kd) - val(0, 2, kc, kd);
+          out[2 * plane + base] = val(0, 1, kc, kd) - val(1, 0, kc, kd);
+        }
+    }
+  }
+  return out;
+}
+
+} // namespace detail
+
 template <class Real>
 std::array<std::vector<Real>, 3>
 spin_orbit_2e_coulomb(const ShellBasis<Real> &basis, const Real *D,
@@ -164,88 +249,80 @@ spin_orbit_2e_coulomb(const ShellBasis<Real> &basis, const Real *D,
   std::array<std::vector<Real>, 3> Y;
   for (auto &m : Y) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
-  auto shl = [](PrimitiveShell<Real> s, int dl) { s.l += dl; return s; };
-  // derivative-in-direction terms for one Cartesian component (lx,ly,lz) of a
-  // shell of momentum l: sgn 0 -> (l+1) block with coeff -2 alpha, sgn 1 ->
-  // (l-1) block with coeff = the power in that direction. Returns term count.
-  auto terms = [](int l, const int c3[3], Real alpha, int dir, int sgn[2],
-                  int ci[2], Real co[2]) -> int {
-    int nt = 0;
-    int t[3] = {c3[0], c3[1], c3[2]};
-    t[dir] += 1;
-    sgn[nt] = 0;
-    ci[nt] = detail::comp_index(l + 1, t[0], t[1]);
-    co[nt] = -2 * alpha;
-    ++nt;
-    if (c3[dir] >= 1) {
-      int u[3] = {c3[0], c3[1], c3[2]};
-      u[dir] -= 1;
-      sgn[nt] = 1;
-      ci[nt] = detail::comp_index(l - 1, u[0], u[1]);
-      co[nt] = static_cast<Real>(c3[dir]);
-      ++nt;
-    }
-    return nt;
-  };
   for (int a = 0; a < ns; ++a)
     for (int b = 0; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
-      const int la = sa.l, lb = sb.l, nca = ncart(la), ncb = ncart(lb);
-      const int nb_s[2] = {ncart(lb + 1), lb >= 1 ? ncart(lb - 1) : 0};
+      const int nca = ncart(sa.l), ncb = ncart(sb.l);
       for (int c = 0; c < ns; ++c)
         for (int d = 0; d < ns; ++d) {
           const auto &sc = basis.shells[c], &sd = basis.shells[d];
           const int ncc = ncart(sc.l), ncd = ncart(sd.l);
-          // promoted/demoted electron-1 blocks: blk[a-sign][b-sign], sign 0=+1.
-          std::vector<Real> blk[2][2];
-          blk[0][0] = detail::eri_block4(shl(sa, 1), shl(sb, 1), sc, sd, grid);
-          if (lb >= 1) blk[0][1] = detail::eri_block4(shl(sa, 1), shl(sb, -1), sc, sd, grid);
-          if (la >= 1) blk[1][0] = detail::eri_block4(shl(sa, -1), shl(sb, 1), sc, sd, grid);
-          if (la >= 1 && lb >= 1)
-            blk[1][1] = detail::eri_block4(shl(sa, -1), shl(sb, -1), sc, sd, grid);
-          for (int ka = 0; ka < nca; ++ka) {
-            int a3[3];
-            cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          const auto blk = detail::spin_orbit_2e_block(sa, sb, sc, sd, grid);
+          const std::size_t plane = static_cast<std::size_t>(nca) * ncb * ncc * ncd;
+          for (int ka = 0; ka < nca; ++ka)
             for (int kb = 0; kb < ncb; ++kb) {
-              int b3[3];
-              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-              // (d_i mu)(d_j lambda | nu sigma) for one (kc,kd) ket component
-              auto val = [&](int i, int j, int kc, int kd) -> Real {
-                int as[2], aci[2], bs[2], bci[2];
-                Real aco[2], bco[2];
-                const int nat = terms(la, a3, sa.alpha, i, as, aci, aco);
-                const int nbt = terms(lb, b3, sb.alpha, j, bs, bci, bco);
-                Real v = 0;
-                for (int u = 0; u < nat; ++u)
-                  for (int w = 0; w < nbt; ++w) {
-                    const std::vector<Real> &B = blk[as[u]][bs[w]];
-                    const int nbc = nb_s[bs[w]];
-                    const std::size_t idx =
-                        (((static_cast<std::size_t>(aci[u]) * nbc + bci[w]) * ncc + kc) *
-                             ncd + kd);
-                    v += aco[u] * bco[w] * B[idx];
-                  }
-                return v;
-              };
-              Real yx = 0, yy = 0, yz = 0;
+              const std::size_t mu = basis.ao_off[a] + ka, lam = basis.ao_off[b] + kb;
               for (int kc = 0; kc < ncc; ++kc)
                 for (int kd = 0; kd < ncd; ++kd) {
                   const Real Dcd = D[static_cast<std::size_t>(basis.ao_off[c] + kc) * nao +
                                      basis.ao_off[d] + kd];
                   if (Dcd == Real(0)) continue;
-                  yx += Dcd * (val(1, 2, kc, kd) - val(2, 1, kc, kd));
-                  yy += Dcd * (val(2, 0, kc, kd) - val(0, 2, kc, kd));
-                  yz += Dcd * (val(0, 1, kc, kd) - val(1, 0, kc, kd));
+                  const std::size_t base =
+                      ((static_cast<std::size_t>(ka) * ncb + kb) * ncc + kc) * ncd + kd;
+                  for (int k = 0; k < 3; ++k)
+                    Y[k][mu * nao + lam] += Dcd * blk[k * plane + base];
                 }
-              const std::size_t mu = basis.ao_off[a] + ka, lam = basis.ao_off[b] + kb;
-              Y[0][mu * nao + lam] += yx;
-              Y[1][mu * nao + lam] += yy;
-              Y[2][mu * nao + lam] += yz;
             }
-          }
         }
     }
   return Y;
+}
+
+/// Two-electron spin-orbit "exchange-type" matrices {Ke_x, Ke_y, Ke_z} (each
+/// nao x nao). Ke_k,us = sum_{l,n} D_ln (u l | SO_k | n s): the same
+/// spin-same-orbit integral as spin_orbit_2e_coulomb, but with the density
+/// bridging one electron-1 index (lambda) and one electron-2 index (nu), leaving
+/// mu (electron 1) and sigma (electron 2) as the matrix indices. Together with
+/// the Coulomb-type matrix and the 1e SO matrix this is the building block for a
+/// spin-orbit mean-field (SOMF/AMFI) effective one-electron operator; the
+/// mean-field linear combination and its coefficients are a downstream modelling
+/// choice (Breit-Pauli spin-same/other-orbit) and are not fixed here. Same
+/// correctness-first O(N^4) shell loop; D is nao x nao row-major.
+template <class Real>
+std::array<std::vector<Real>, 3>
+spin_orbit_2e_exchange(const ShellBasis<Real> &basis, const Real *D,
+                       const TGrid<Real> &grid) {
+  const int nao = basis.nao;
+  std::array<std::vector<Real>, 3> Ke;
+  for (auto &m : Ke) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
+  const int ns = static_cast<int>(basis.shells.size());
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int nca = ncart(sa.l), ncb = ncart(sb.l);
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          const auto &sc = basis.shells[c], &sd = basis.shells[d];
+          const int ncc = ncart(sc.l), ncd = ncart(sd.l);
+          const auto blk = detail::spin_orbit_2e_block(sa, sb, sc, sd, grid);
+          const std::size_t plane = static_cast<std::size_t>(nca) * ncb * ncc * ncd;
+          for (int ka = 0; ka < nca; ++ka)
+            for (int kb = 0; kb < ncb; ++kb)
+              for (int kc = 0; kc < ncc; ++kc) {
+                const Real Dln = D[static_cast<std::size_t>(basis.ao_off[b] + kb) * nao +
+                                   basis.ao_off[c] + kc];
+                if (Dln == Real(0)) continue;
+                for (int kd = 0; kd < ncd; ++kd) {
+                  const std::size_t mu = basis.ao_off[a] + ka, sig = basis.ao_off[d] + kd;
+                  const std::size_t base =
+                      ((static_cast<std::size_t>(ka) * ncb + kb) * ncc + kc) * ncd + kd;
+                  for (int k = 0; k < 3; ++k)
+                    Ke[k][mu * nao + sig] += Dln * blk[k * plane + base];
+                }
+              }
+        }
+    }
+  return Ke;
 }
 
 } // namespace intti
