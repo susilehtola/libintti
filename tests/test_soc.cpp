@@ -282,4 +282,62 @@ TEST(SpinOrbit, TwoElectronScreeningMatchesExact) {
       EXPECT_NEAR(Y0[k][i], Yex[k][i], 1e-14 * scale) << "tau=0 k=" << k;
 }
 
+
+TEST(SpinOrbit, TwoElectronDeviceMatchesBlockLoopAtHigherL) {
+  // The device build stores each shifted-bra quartet ONCE in a canonical
+  // orientation (bra swap x ket swap) and reads it back through the permutation.
+  // With s shells only -- what the finite-difference oracles above use -- a bra
+  // swap is a no-op, so this pins the permuted reads where they actually differ:
+  // unequal angular momenta, up to d. Reference is the per-quartet
+  // spin_orbit_2e_block loop, a separate implementation in the same precision.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const std::vector<intti::PrimitiveShell<double>> sh = {
+      {1.1, {0.0, 0.0, 0.0}, 0},
+      {0.8, {0.5, -0.2, 0.3}, 1},
+      {1.4, {-0.3, 0.4, 0.1}, 2},
+      {0.6, {0.2, 0.3, -0.5}, 1}};
+  auto basis = intti::make_basis(sh);
+  const int nao = basis.nao;
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) D[i * nao + j] = 0.2 / (1 + std::abs(i - j)) + 0.01 * i;
+  const int ns = static_cast<int>(sh.size());
+  std::array<std::vector<double>, 3> Yref, Kref;
+  for (auto &m : Yref) m.assign(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (auto &m : Kref) m.assign(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b)
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          const int nca = intti::ncart(sh[a].l), ncb = intti::ncart(sh[b].l);
+          const int ncc = intti::ncart(sh[c].l), ncd = intti::ncart(sh[d].l);
+          const auto blk = intti::detail::spin_orbit_2e_block(sh[a], sh[b], sh[c], sh[d], grid);
+          const std::size_t plane = static_cast<std::size_t>(nca) * ncb * ncc * ncd;
+          for (int ka = 0; ka < nca; ++ka)
+            for (int kb = 0; kb < ncb; ++kb)
+              for (int kc = 0; kc < ncc; ++kc)
+                for (int kd = 0; kd < ncd; ++kd) {
+                  const std::size_t base =
+                      ((static_cast<std::size_t>(ka) * ncb + kb) * ncc + kc) * ncd + kd;
+                  const std::size_t mu = basis.ao_off[a] + ka, lam = basis.ao_off[b] + kb;
+                  const std::size_t nu = basis.ao_off[c] + kc, sig = basis.ao_off[d] + kd;
+                  for (int k = 0; k < 3; ++k) {
+                    Yref[k][mu * nao + lam] += D[nu * nao + sig] * blk[k * plane + base];
+                    Kref[k][mu * nao + sig] += D[lam * nao + nu] * blk[k * plane + base];
+                  }
+                }
+        }
+  const auto Y = intti::spin_orbit_2e_coulomb(basis, D.data(), grid);
+  const auto K = intti::spin_orbit_2e_exchange(basis, D.data(), grid);
+  double scale = 0;
+  for (int k = 0; k < 3; ++k)
+    for (double v : Yref[k]) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 1e-6);
+  for (int k = 0; k < 3; ++k)
+    for (std::size_t i = 0; i < Yref[k].size(); ++i) {
+      EXPECT_NEAR(Y[k][i], Yref[k][i], 1e-11 * scale) << "coulomb k=" << k << " i=" << i;
+      EXPECT_NEAR(K[k][i], Kref[k][i], 1e-11 * scale) << "exchange k=" << k << " i=" << i;
+    }
+}
+
 } // namespace

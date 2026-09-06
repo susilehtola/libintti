@@ -36,6 +36,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "erigrad.hpp" // detail::eri_block4, detail::comp_index
@@ -273,7 +274,7 @@ KOKKOS_INLINE_FUNCTION int so_terms(int l, const int c3[3], Real alpha, int dir,
 /// Shared batch: the 4 shifted-bra x unshifted-ket quartets per ordered quartet.
 template <class Real> struct SO2eBatch {
   Kokkos::View<Real *> out, shAl;
-  Kokkos::View<int *> qa, qb, qc, qd, e00, e01, e10, e11, shL, shOff;
+  Kokkos::View<int *> qa, qb, qc, qd, e00, e01, e10, e11, shL, shOff, ksw;
   Kokkos::View<std::int64_t *> boff; ///< 64-bit: see QuartetBatch::out_offset
   int njob{0}, nao{0};
 };
@@ -328,14 +329,28 @@ SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real
     const Real two_al = 2 * hAl[s];
     return two_al > Real(hL[s]) ? two_al : Real(hL[s]);
   };
+  // Permutational dedup. The quartets here are ordinary ERIs over a SHIFTED bra
+  // pair and an unshifted ket, so the two intra-pair swaps hold: (ab|cd) =
+  // (ba|cd) = (ab|dc). The bra-ket swap buys nothing -- a shifted bra can never
+  // coincide with an unshifted ket -- so the fold is 4-fold, not 8. Each block is
+  // stored once in its canonical orientation (the smaller pair id) and the digest
+  // reads it back through the permutation; the entry arrays pack that as
+  // 2*index + braswap, with -1 for an absent shift.
   std::vector<std::pair<int, int>> quartets;
-  std::vector<int> qa, qb, qc, qd, e00, e01, e10, e11;
+  std::unordered_map<long long, int> seen;
+  const long long npair_all = static_cast<long long>(plist.size());
+  auto canon = [&](int p1, int p2, int &swap) {
+    swap = (p2 >= 0 && p2 < p1) ? 1 : 0;
+    return swap ? p2 : p1;
+  };
+  std::vector<int> qa, qb, qc, qd, e00, e01, e10, e11, ksw;
   for (int a = 0; a < ns; ++a)
     for (int b = 0; b < ns; ++b)
       for (int c = 0; c < ns; ++c)
         for (int d = 0; d < ns; ++d) {
           const int la = hL[a], lb = hL[b];
-          const int ket = pair_id(c, 0, d, 0);
+          int kswap = 0;
+          const int ket = canon(pair_id(c, 0, d, 0), pair_id(d, 0, c, 0), kswap);
           if (tau > Real(0)) {
             Real qbra = 0;
             for (int da = 1; da >= -1; da -= 2)
@@ -346,15 +361,26 @@ SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real
             if (scale(a) * scale(b) * qbra * Q[ket] < tau) continue;
           }
           qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
-          auto emit = [&](int bp) {
-            int e = static_cast<int>(quartets.size());
-            quartets.push_back({bp, ket});
-            return e;
+          ksw.push_back(kswap);
+          auto emit = [&](int da, int db) {
+            int bswap = 0;
+            const int bp = canon(pair_id(a, da, b, db), pair_id(b, db, a, da), bswap);
+            const long long key = static_cast<long long>(bp) * npair_all + ket;
+            auto it = seen.find(key);
+            int e;
+            if (it == seen.end()) {
+              e = static_cast<int>(quartets.size());
+              quartets.push_back({bp, ket});
+              seen.emplace(key, e);
+            } else {
+              e = it->second;
+            }
+            return 2 * e + bswap;
           };
-          e00.push_back(emit(pair_id(a, 1, b, 1)));
-          e01.push_back(lb >= 1 ? emit(pair_id(a, 1, b, -1)) : -1);
-          e10.push_back(la >= 1 ? emit(pair_id(a, -1, b, 1)) : -1);
-          e11.push_back((la >= 1 && lb >= 1) ? emit(pair_id(a, -1, b, -1)) : -1);
+          e00.push_back(emit(1, 1));
+          e01.push_back(lb >= 1 ? emit(1, -1) : -1);
+          e10.push_back(la >= 1 ? emit(-1, 1) : -1);
+          e11.push_back((la >= 1 && lb >= 1) ? emit(-1, -1) : -1);
         }
   auto batch = make_batch(tab, quartets);
   QuartetWorkspace<Real> ws;
@@ -372,6 +398,7 @@ SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real
   B.e01 = to_device(e01, "intti::so2e::e01");
   B.e10 = to_device(e10, "intti::so2e::e10");
   B.e11 = to_device(e11, "intti::so2e::e11");
+  B.ksw = to_device(ksw, "intti::so2e::ksw");
   B.njob = static_cast<int>(qa.size());
   return B;
 }
@@ -388,6 +415,7 @@ spin_orbit_2e_coulomb_dev(const ShellBasis<Real> &basis, const Real *D,
   auto out = B.out, shAl = B.shAl;
   auto shL = B.shL, shOff = B.shOff, boff = B.boff;
   auto qa = B.qa, qb = B.qb, qc = B.qc, qd = B.qd, e00 = B.e00, e01 = B.e01, e10 = B.e10, e11 = B.e11;
+  auto ksw = B.ksw;
   Kokkos::parallel_for(
       "intti::so2e::coulomb", Kokkos::RangePolicy<>(0, B.njob), KOKKOS_LAMBDA(int j) {
         const int a = qa(j), b = qb(j), c = qc(j), d = qd(j);
@@ -395,9 +423,16 @@ spin_orbit_2e_coulomb_dev(const ShellBasis<Real> &basis, const Real *D,
         const int nc = ncart(lc), nd = ncart(ld);
         const Real ala = shAl(a), alb = shAl(b);
         const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
-        const std::int64_t base[2][2] = {
-            {boff(e00(j)), e01(j) >= 0 ? boff(e01(j)) : 0},
-            {e10(j) >= 0 ? boff(e10(j)) : 0, e11(j) >= 0 ? boff(e11(j)) : 0}};
+        // entry arrays pack 2*quartet + braswap; -1 marks an absent shift
+        const int ent[2][2] = {{e00(j), e01(j)}, {e10(j), e11(j)}};
+        std::int64_t base[2][2];
+        int bsw[2][2];
+        for (int u = 0; u < 2; ++u)
+          for (int w = 0; w < 2; ++w) {
+            base[u][w] = ent[u][w] >= 0 ? boff(ent[u][w] >> 1) : 0;
+            bsw[u][w] = ent[u][w] >= 0 ? (ent[u][w] & 1) : 0;
+          }
+        const int kswap = ksw(j);
         for (int ka = 0; ka < ncart(la); ++ka) {
           int a3[3];
           cart_comp(la, ka, a3[0], a3[1], a3[2]);
@@ -413,10 +448,16 @@ spin_orbit_2e_coulomb_dev(const ShellBasis<Real> &basis, const Real *D,
               Real v = 0;
               for (int u = 0; u < na; ++u)
                 for (int w = 0; w < nb; ++w) {
+                  const int lap = as[u] == 0 ? la + 1 : la - 1;
                   const int lbp = bs[w] == 0 ? lb + 1 : lb - 1;
-                  const int nbc = ncart(lbp);
-                  const std::size_t idx =
-                      (((static_cast<std::size_t>(aci[u]) * nbc + bci[w]) * nc + kc) * nd + kd);
+                  const int nac = ncart(lap), nbc = ncart(lbp);
+                  // read the canonical block through the stored permutation
+                  const std::size_t ibra = bsw[as[u]][bs[w]]
+                                               ? static_cast<std::size_t>(bci[w]) * nac + aci[u]
+                                               : static_cast<std::size_t>(aci[u]) * nbc + bci[w];
+                  const std::size_t iket = kswap ? static_cast<std::size_t>(kd) * nc + kc
+                                                 : static_cast<std::size_t>(kc) * nd + kd;
+                  const std::size_t idx = ibra * (static_cast<std::size_t>(nc) * nd) + iket;
                   v += aco[u] * bco[w] * out(base[as[u]][bs[w]] + idx);
                 }
               return v;
@@ -455,6 +496,7 @@ spin_orbit_2e_exchange_dev(const ShellBasis<Real> &basis, const Real *D,
   auto out = B.out, shAl = B.shAl;
   auto shL = B.shL, shOff = B.shOff, boff = B.boff;
   auto qa = B.qa, qb = B.qb, qc = B.qc, qd = B.qd, e00 = B.e00, e01 = B.e01, e10 = B.e10, e11 = B.e11;
+  auto ksw = B.ksw;
   Kokkos::parallel_for(
       "intti::so2e::exchange", Kokkos::RangePolicy<>(0, B.njob), KOKKOS_LAMBDA(int j) {
         const int a = qa(j), b = qb(j), c = qc(j), d = qd(j);
@@ -462,9 +504,16 @@ spin_orbit_2e_exchange_dev(const ShellBasis<Real> &basis, const Real *D,
         const int nc = ncart(lc), nd = ncart(ld);
         const Real ala = shAl(a), alb = shAl(b);
         const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
-        const std::int64_t base[2][2] = {
-            {boff(e00(j)), e01(j) >= 0 ? boff(e01(j)) : 0},
-            {e10(j) >= 0 ? boff(e10(j)) : 0, e11(j) >= 0 ? boff(e11(j)) : 0}};
+        // entry arrays pack 2*quartet + braswap; -1 marks an absent shift
+        const int ent[2][2] = {{e00(j), e01(j)}, {e10(j), e11(j)}};
+        std::int64_t base[2][2];
+        int bsw[2][2];
+        for (int u = 0; u < 2; ++u)
+          for (int w = 0; w < 2; ++w) {
+            base[u][w] = ent[u][w] >= 0 ? boff(ent[u][w] >> 1) : 0;
+            bsw[u][w] = ent[u][w] >= 0 ? (ent[u][w] & 1) : 0;
+          }
+        const int kswap = ksw(j);
         for (int ka = 0; ka < ncart(la); ++ka) {
           int a3[3];
           cart_comp(la, ka, a3[0], a3[1], a3[2]);
@@ -479,10 +528,16 @@ spin_orbit_2e_exchange_dev(const ShellBasis<Real> &basis, const Real *D,
               Real v = 0;
               for (int u = 0; u < na; ++u)
                 for (int w = 0; w < nb; ++w) {
+                  const int lap = as[u] == 0 ? la + 1 : la - 1;
                   const int lbp = bs[w] == 0 ? lb + 1 : lb - 1;
-                  const int nbc = ncart(lbp);
-                  const std::size_t idx =
-                      (((static_cast<std::size_t>(aci[u]) * nbc + bci[w]) * nc + kc) * nd + kd);
+                  const int nac = ncart(lap), nbc = ncart(lbp);
+                  // read the canonical block through the stored permutation
+                  const std::size_t ibra = bsw[as[u]][bs[w]]
+                                               ? static_cast<std::size_t>(bci[w]) * nac + aci[u]
+                                               : static_cast<std::size_t>(aci[u]) * nbc + bci[w];
+                  const std::size_t iket = kswap ? static_cast<std::size_t>(kd) * nc + kc
+                                                 : static_cast<std::size_t>(kc) * nd + kd;
+                  const std::size_t idx = ibra * (static_cast<std::size_t>(nc) * nd) + iket;
                   v += aco[u] * bco[w] * out(base[as[u]][bs[w]] + idx);
                 }
               return v;
