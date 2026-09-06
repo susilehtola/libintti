@@ -705,11 +705,20 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   body on device, selecting the coefficient by Mode (0: D_mn gamma_P, 1:
   -1/2 gamma_P gamma_Q, 2: c3, 3: c2) and accumulating into one [orb shells, aux
   shells] force array with atomics. The fit (gemm/syevd) stays host -- dense
-  linear algebra, not integrals. ~3-4x faster on the RIGrad tests. Remaining
-  M18 Tier 2: the RI HESSIANS (ri_j_hessian/ri_k_hessian, which use
-  quartet_pos_hess -- the same one-order-up port already done once for erihess,
-  with its offset-pattern key table) and three-electron (threeel/threeel_ri,
-  ~587 lines). (giao2e's dB derivative is real on the device because only the
+  linear algebra, not integrals. ~3-4x faster on the RIGrad tests. RI HESSIANS DONE
+  (2026-09-06) too: ri_j_hessian and ri_k_hessian direct terms ported via
+  detail::RIHessJobs + detail::ri_hess_digest, which run the quartet_pos_hess
+  body on device over the allowed (p,q) non-ghost positions, with the offset
+  patterns (single +-2, and +-1 at two positions) generated per allowed-position
+  set and looked up by a 625-entry key table -- the same construction as erihess.
+  The response terms (r^T M^{-1} r) stay host: dense linear algebra over first
+  derivatives. rigrad is therefore FULLY ported. Measured against the start of
+  the port: exchange gradient 1046 -> 57 ms (~18x), Coulomb gradient 1013 -> 61
+  ms (~17x), Coulomb Hessian 2013 -> 333 ms (~6x), exchange Hessian 7804 -> 318
+  ms (~25x); the whole suite went 236-464 s -> 133 s over the session.
+  Remaining M18 Tier 2: three-electron (threeel/threeel_ri, ~587 lines), plus the
+  perf follow-ups (reinstate the 8-fold symmetry on the drop-symmetry 2e builds,
+  stream/chunk the batch, and screen the SO/GIAO-2e builds). (giao2e's dB derivative is real on the device because only the
   imaginary part is computed.)
   FINITE MAGNETIC FIELD + Kokkos::complex DEVICE PATH DONE (2026-09-06). Two
   pieces. (a) giao_jk: the complex J/K in a FINITE field -- the 2e half of the
