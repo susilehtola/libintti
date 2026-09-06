@@ -526,9 +526,20 @@ RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
 
 /// Geometric Hessian of the RI Coulomb energy E_J, as a (3 ncen) x (3 ncen)
 /// matrix with ncen = (#orbital shells) + (#auxiliary shells), ordered orbital
-/// shells first then auxiliary shells (Cartesian-minor). Uses the envelope form
+/// shells first then auxiliary shells (Cartesian-minor).
+///
+/// E_J = 1/2 d^T M^{-1} d with gamma = M^{-1} d, so differentiating twice gives
 ///   d^2E_J/dxdy = gamma^T d_xy - 1/2 gamma^T M_xy gamma + r_x^T M^{-1} r_y,
-/// r_x = d_x - M_x gamma. The caller maps shells to atoms and sums.
+///   r_x = d_x - M_x gamma  ( = M gamma_x ).
+/// This is just the exact second derivative of that expression -- nothing
+/// exotic, and the standard density-fitting gradient/Hessian algebra. Its
+/// structural content is the VARIATIONAL / 2n+1 rule: because gamma is the
+/// stationary point of the fitting functional, the GRADIENT needs no gamma_x at
+/// all, and the HESSIAN needs only gamma_x (through r_x), never gamma_xy.
+/// (Earlier revisions of this comment called it "the envelope form"; that is
+/// loose -- the envelope theorem names the first-order statement, and the
+/// second-order one is the 2n+1 rule, which in fact would allow up to the THIRD
+/// derivative from gamma_x alone.) The caller maps shells to atoms and sums.
 template <class Real>
 std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                                const Real *D, const TGrid<Real> &grid,

@@ -656,6 +656,47 @@ TEST(GIAO, FiniteFieldFockHermitianAndConjugatesUnderFieldReversal) {
   EXPECT_LT(rev, 1e-12 * mx) << "B -> -B must conjugate F";
 }
 
+// At B = 0 the integrals are real, so giao_jk is exactly the COMPLEX-MO path:
+// real integrals contracted with a complex Hermitian density. It pins the
+// asymmetry between J and K -- J sees only Re D (the real ERI is symmetric
+// under the ket-pair swap, so the antisymmetric Im D cancels), while K does
+// depend on Im D. This is also why the ordinary exchange_build cannot be reused
+// for complex MOs: it assumes K_ab = K_ba, which needs a symmetric density.
+TEST(GIAO, ComplexDensityJSeesOnlyRealPartButKDoesNot) {
+  auto bas = jk_basis();
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const double B0[3] = {0.0, 0.0, 0.0};
+  auto D = hermitian_density(nao); // complex Hermitian, nonzero imaginary part
+  std::vector<C> Dre(D.size());
+  double imx = 0;
+  for (std::size_t i = 0; i < D.size(); ++i) {
+    Dre[i] = C(D[i].real(), 0.0);
+    imx = std::max(imx, std::abs(D[i].imag()));
+  }
+  ASSERT_GT(imx, 1e-6) << "the density must actually be complex";
+
+  auto full = intti::giao_jk(bas, D.data(), B0, grid);
+  auto reonly = intti::giao_jk(bas, Dre.data(), B0, grid);
+
+  double mx = 0, dJ = 0, dK = 0, Jimag = 0, Kherm = 0;
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      const std::size_t ij = static_cast<std::size_t>(i) * nao + j;
+      const std::size_t ji = static_cast<std::size_t>(j) * nao + i;
+      mx = std::max(mx, std::abs(full.J[ij]));
+      dJ = std::max(dJ, std::abs(full.J[ij] - reonly.J[ij]));
+      dK = std::max(dK, std::abs(full.K[ij] - reonly.K[ij]));
+      Jimag = std::max(Jimag, std::abs(full.J[ij].imag()));
+      Kherm = std::max(Kherm, std::abs(full.K[ij] - std::conj(full.K[ji])));
+    }
+  ASSERT_GT(mx, 1e-6);
+  EXPECT_LT(dJ, 1e-12 * mx) << "J must depend only on Re D";
+  EXPECT_LT(Jimag, 1e-12 * mx) << "J from a Hermitian D at B=0 must be real";
+  EXPECT_GT(dK, 1e-6 * mx) << "K must genuinely depend on Im D";
+  EXPECT_LT(Kherm, 1e-12 * mx) << "K must stay Hermitian for a Hermitian D";
+}
+
 // ---- structure of the finite-B pair space (prerequisite for a CD path) ------
 // A Cholesky decomposition needs a HERMITIAN POSITIVE-DEFINITE matrix. At
 // finite B the matrix the real CD code would form, M_PQ = (mn|ls), is complex
