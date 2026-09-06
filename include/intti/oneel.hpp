@@ -18,6 +18,8 @@
 #include <cstddef>
 #include <vector>
 
+#include "batch.hpp"  // PairTable, make_pair_table (E precomputed on device)
+#include "device.hpp" // detail::to_device / to_host
 #include "fock.hpp"
 #include "gto.hpp"
 #include "hermite1d.hpp"
@@ -108,11 +110,139 @@ void multipole_1d(const std::vector<Real> &s1, int lbx, int la, int lb, Real A,
   }
 }
 
+// ---- device (GPU) 1e path ---------------------------------------------------
+// Same architecture as the J/K builds: e_coeffs are precomputed on the host into
+// the PairTable's device E View (make_pair_table), and the Cartesian assembly +
+// scatter run in a Kokkos parallel_for over shell pairs. Extending each pair's
+// angular momentum by (exa,exb) makes the on-device E carry the higher indices
+// kinetic (+2 on the ket) and multipoles (+order on the bra) need. The public
+// builders dispatch here for float/double/long double and keep the serial host
+// loop for __float128 / class-type scalars (which Kokkos cannot run).
+
+template <class Real> struct OneEPairs {
+  PairTable<Real> tab;          ///< E for (la+exa, lb+exb)
+  Kokkos::View<int *> aoa, aob; ///< AO offsets of the canonical pair's shells
+  Kokkos::View<int *> la0, lb0; ///< original momenta (output loop bounds)
+  Kokkos::View<Real *> beta;    ///< ket exponent (kinetic recurrence)
+  int npair{0};
+};
+
+/// Canonical (a<=b) shell pairs above the screening threshold, each extended by
+/// (exa,exb), with the side arrays the device 1e kernels need.
+template <class Real>
+OneEPairs<Real> make_1e_pairs(const ShellBasis<Real> &basis, int exa, int exb, Real tau) {
+  const int ns = static_cast<int>(basis.shells.size());
+  std::vector<ShellPair<Real>> plist;
+  std::vector<int> haoa, haob, hla0, hlb0;
+  std::vector<Real> hbeta;
+  for (int a = 0; a < ns; ++a)
+    for (int b = a; b < ns; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      if (pair_gauss_prefactor(sa, sb) <= tau) continue; // exact at tau = 0
+      PrimitiveShell<Real> sae = sa, sbe = sb;
+      sae.l += exa;
+      sbe.l += exb;
+      plist.push_back(make_pair(sae, sbe));
+      haoa.push_back(basis.ao_off[a]);
+      haob.push_back(basis.ao_off[b]);
+      hla0.push_back(sa.l);
+      hlb0.push_back(sb.l);
+      hbeta.push_back(sb.alpha);
+    }
+  OneEPairs<Real> op;
+  op.tab = make_pair_table(plist);
+  op.npair = op.tab.npair;
+  op.aoa = to_device(haoa, "intti::1e::aoa");
+  op.aob = to_device(haob, "intti::1e::aob");
+  op.la0 = to_device(hla0, "intti::1e::la0");
+  op.lb0 = to_device(hlb0, "intti::1e::lb0");
+  op.beta = to_device(hbeta, "intti::1e::beta");
+  return op;
+}
+
+template <class Real>
+std::vector<Real> overlap_matrix_dev(const ShellBasis<Real> &basis, Real tau) {
+  const int nao = basis.nao;
+  auto op = make_1e_pairs(basis, 0, 0, tau);
+  const int npair = op.npair;
+  Kokkos::View<Real *> Sd("intti::ovlp::S", static_cast<std::size_t>(nao) * nao);
+  auto pv = op.tab.p, Ev = op.tab.E;
+  auto lav = op.tab.la, lbv = op.tab.lb, eoffv = op.tab.e_off, aoa = op.aoa, aob = op.aob;
+  const Real pi = pi_v<Real>();
+  Kokkos::parallel_for(
+      "intti::ovlp::asm", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        const int la = lav(p), lb = lbv(p), n1 = la + lb + 1;
+        const int esz = (la + 1) * (lb + 1) * n1;
+        const Real pref = sqrt_(pi / pv(p));
+        const Real pref3 = pref * pref * pref;
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        for (int ka = 0; ka < ncart(la); ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncart(lb); ++kb) {
+            int b3[3];
+            cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+            const Real ex = Ev(eo + 0 * esz + (a3[0] * (lb + 1) + b3[0]) * n1);
+            const Real ey = Ev(eo + 1 * esz + (a3[1] * (lb + 1) + b3[1]) * n1);
+            const Real ez = Ev(eo + 2 * esz + (a3[2] * (lb + 1) + b3[2]) * n1);
+            const Real val = pref3 * ex * ey * ez;
+            const int r = oa + ka, c = ob + kb;
+            Sd(static_cast<std::size_t>(r) * nao + c) = val;
+            if (r != c) Sd(static_cast<std::size_t>(c) * nao + r) = val;
+          }
+        }
+      });
+  return to_host(Sd);
+}
+
+template <class Real>
+std::vector<Real> kinetic_matrix_dev(const ShellBasis<Real> &basis, Real tau) {
+  const int nao = basis.nao;
+  auto op = make_1e_pairs(basis, 0, 2, tau); // ket +2 for the T recurrence
+  const int npair = op.npair;
+  Kokkos::View<Real *> Td("intti::kin::T", static_cast<std::size_t>(nao) * nao);
+  auto pv = op.tab.p, Ev = op.tab.E, betav = op.beta;
+  auto lav = op.tab.la, lbv = op.tab.lb, eoffv = op.tab.e_off, aoa = op.aoa, aob = op.aob;
+  const Real pi = pi_v<Real>();
+  Kokkos::parallel_for(
+      "intti::kin::asm", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        const int la = lav(p), lbx = lbv(p), lb0 = lbx - 2, n1 = la + lbx + 1;
+        const int esz = (la + 1) * (lbx + 1) * n1;
+        const Real pref = sqrt_(pi / pv(p)), bta = betav(p);
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        auto S1 = [&](int d, int i, int j) {
+          return pref * Ev(eo + d * esz + (i * (lbx + 1) + j) * n1);
+        };
+        auto T1 = [&](int d, int i, int j) {
+          Real v = -2 * bta * bta * S1(d, i, j + 2) + bta * (2 * j + 1) * S1(d, i, j);
+          if (j >= 2) v -= Real(0.5) * j * (j - 1) * S1(d, i, j - 2);
+          return v;
+        };
+        for (int ka = 0; ka < ncart(la); ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncart(lb0); ++kb) {
+            int b3[3];
+            cart_comp(lb0, kb, b3[0], b3[1], b3[2]);
+            const Real sx = S1(0, a3[0], b3[0]), sy = S1(1, a3[1], b3[1]), sz = S1(2, a3[2], b3[2]);
+            const Real val = T1(0, a3[0], b3[0]) * sy * sz + sx * T1(1, a3[1], b3[1]) * sz +
+                             sx * sy * T1(2, a3[2], b3[2]);
+            const int r = oa + ka, c = ob + kb;
+            Td(static_cast<std::size_t>(r) * nao + c) = val;
+            if (r != c) Td(static_cast<std::size_t>(c) * nao + r) = val;
+          }
+        }
+      });
+  return to_host(Td);
+}
+
 } // namespace detail
 
 /// Overlap matrix S (nao x nao, row-major) over the primitive Cartesian AOs.
 template <class Real>
 std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis, Real tau = Real(0)) {
+  if constexpr (kokkos_scalar_v<Real>)
+    return detail::overlap_matrix_dev(basis, tau);
   const int nao = basis.nao;
   std::vector<Real> S(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
@@ -138,6 +268,8 @@ std::vector<Real> overlap_matrix(const ShellBasis<Real> &basis, Real tau = Real(
 /// Kinetic energy matrix T = -1/2 <a| nabla^2 |b>.
 template <class Real>
 std::vector<Real> kinetic_matrix(const ShellBasis<Real> &basis, Real tau = Real(0)) {
+  if constexpr (kokkos_scalar_v<Real>)
+    return detail::kinetic_matrix_dev(basis, tau);
   const int nao = basis.nao;
   std::vector<Real> T(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
