@@ -31,6 +31,7 @@ add_executable(intti_tests
   test_nuclear.cpp
   test_ncenter.cpp
   test_localhybrid.cpp
+  test_soc.cpp
   test_deriv.cpp
   test_geoderiv.cpp
   test_erigrad.cpp

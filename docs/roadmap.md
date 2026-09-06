@@ -591,6 +591,17 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
 
 - **M17 — spin-orbit** (`soc.hpp`): 1e SO off moment+t-quad; 2e SO
   (SOMF/Breit-Pauli) as the new operator.
+  1e SO DONE (2026-09-06): spin_orbit_1e returns {W_x,W_y,W_z},
+  W_k = sum_A Z_A eps_kij <mu| (r-R_A)_i/r_A^3 d_j |nu>. No 1/r^3 kernel needed --
+  (r-R_A)_i/r_A^3 = d/dR_A,i(1/r_A), so it is the attraction t-quadrature with the
+  charge-position derivative (field: raise the Hermite index, field_d = -sum E B_{tau+1})
+  crossed with the ket derivative d_j; assembled per axis as
+  W_x = plain_x(field_y ketder_z - field_z ketder_y), cyclic. Validated
+  (tests/test_soc.cpp) against a mixed finite difference of nuclear_matrix
+  (W_k = -eps_kij sum_A Z_A d^2/dR_A,i dR_nu,j <mu|1/r_A|nu>, an independent
+  oracle) to 1e-5 on all three components, plus the required antisymmetry
+  W_k = -W_k^T (suite 230/230). Remaining M17: the 2e spin-orbit (SOMF/Breit-
+  Pauli) as a new operator on the quartet machinery.
 
 - **M18 — GPU + performance engineering**: table-driven bit-packed Hermite
   recurrence and batched-GEMM contractions (libintX-style, architecture only
