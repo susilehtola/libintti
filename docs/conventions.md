@@ -139,3 +139,28 @@ Exchange has the same trap at the Fock level: at finite B the exchange must
 be `K_mn = Σ_ls (ml|sn) D_ls`, **not** `(ml|ns)`. The two coincide for real
 ERIs, but only `(ml|sn)` is Hermitian once the London phases make the
 integrals complex (`giao_jk`, giao2e.hpp).
+
+## Derivatives: analytic shift, never numerical, never from the interpolant
+
+All derivative integrals use the exact McMurchie-Davidson centre shift
+
+```
+d/dA_x : F(i) -> i F(i-1) - 2a F(i+1)
+```
+
+on the Gaussian factor, so a derivative is an exact linear combination of
+shifted-angular-momentum integrals from the same engine. Because the t grid is
+perturbation-independent, differentiation commutes with the quadrature, and
+arbitrary-order mixed derivatives are just repeated shifts (`geoderiv`). There
+is **no finite differencing inside the library** -- FD appears only in tests, as
+the independent oracle.
+
+**Design rule for the FE/grid pillar.** `fegrid`/`gridri` currently take no
+derivatives (they do the potential solve only). If derivatives are ever needed
+in the FE representation -- gradients of grid-RI J/K, or a kinetic operator on
+the grid -- evaluate the **analytic** derivative at the nodes (available via the
+same MD shift) rather than differentiating the Lagrange interpolant.
+Differentiating a LIP expansion loses roughly one order of accuracy per
+derivative and is worst at element boundaries, which would silently cap the
+precision of a pillar whose whole point is being convergent to near machine
+precision.
