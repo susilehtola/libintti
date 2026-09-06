@@ -699,10 +699,17 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   -- at B=0 the ERIs are real so dJ/dB, dK/dB are i times a real combination;
   the digestion (London phase-vector cross products, base + bra+1 + ket+1 blocks
   per quartet) runs on the real device path with atomics, wrapped in i on host.
-  Validated vs the JK field-derivative FD. Remaining M18 Tier 2: RI gradient/
-  Hessian (rigrad, ~769 lines) and three-electron (threeel/threeel_ri, ~587) --
-  same batched-quartet-consumer pattern (LKC/SHARK #2); both are large focused
-  ports. (giao2e's dB derivative is real on the device because only the
+  Validated vs the JK field-derivative FD. RI GRADIENTS DONE (2026-09-06):
+  ri_j_gradient and ri_k_gradient ported -- detail::RIGradJobs collects the
+  (ghost-quartet, pos) jobs and detail::ri_grad_digest runs the quartet_pos_grad
+  body on device, selecting the coefficient by Mode (0: D_mn gamma_P, 1:
+  -1/2 gamma_P gamma_Q, 2: c3, 3: c2) and accumulating into one [orb shells, aux
+  shells] force array with atomics. The fit (gemm/syevd) stays host -- dense
+  linear algebra, not integrals. ~3-4x faster on the RIGrad tests. Remaining
+  M18 Tier 2: the RI HESSIANS (ri_j_hessian/ri_k_hessian, which use
+  quartet_pos_hess -- the same one-order-up port already done once for erihess,
+  with its offset-pattern key table) and three-electron (threeel/threeel_ri,
+  ~587 lines). (giao2e's dB derivative is real on the device because only the
   imaginary part is computed.)
   FINITE MAGNETIC FIELD + Kokkos::complex DEVICE PATH DONE (2026-09-06). Two
   pieces. (a) giao_jk: the complex J/K in a FINITE field -- the 2e half of the
@@ -1906,3 +1913,18 @@ index bookkeeping in hot routines; screening.hpp provides the estimate); item 4
 geohess nuclear_attraction_hessian 18x-per-charge (needs a nuclear_geoderiv
 elevated-l block variant returning all (e,f) components), minor caching
 (c2s_matrix per l, batch tail bcoef -- device-lambda hoist).
+
+- **FINITE-FIELD / COMPLEX PATH -- COMPLETE (2026-09-06).** Every integral a
+  finite-field (London/GIAO) SCF needs now exists, runs on the Kokkos::complex
+  device path, and is validated individually and in composition: complex S(B),
+  T(B), V(B) (giao_overlap/kinetic/nuclear) and J(B), K(B) (giao_jk). The
+  capstone test composes F = T + V + J - K/2 and checks it reproduces the real
+  Fock at B = 0 to 1e-11, is Hermitian at finite B, and conjugates under
+  B -> -B. Deliberately out of scope here, this being an integrals library: the
+  SCF driver itself and the complex Hermitian eigensolver it would need (only
+  real syevd is wired).
+  Also added: cross-basis coulomb_cross / exchange_cross -- Coulomb for
+  electron-proton / NEO (homogeneous pairs) and exchange for projection-free
+  initial guesses where the density lives in a different basis than the target
+  (heterogeneous pairs) -- validated by reducing exactly to coulomb_build /
+  exchange_build when both bases coincide.
