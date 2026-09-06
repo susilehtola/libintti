@@ -32,6 +32,8 @@
 #include <cstddef>
 #include <vector>
 
+#include "batch.hpp"   // PairTable, make_batch, eri_quartets
+#include "device.hpp"  // detail::to_device / to_host
 #include "erigrad.hpp" // detail::comp_index, detail::eri_block4, permute_block, eri_perms
 #include "fock.hpp"
 #include "gto.hpp"
@@ -39,6 +41,131 @@
 #include "tgrid.hpp"
 
 namespace intti {
+
+namespace detail {
+
+// device (GPU) GIAO 2e field derivative. At B=0 the ERIs are real, so dJ/dB and
+// dK/dB are i times a real combination of real ERI blocks -- computed on the
+// real device path here, wrapped in i on the host. Drop-symmetry: each ordered
+// quartet is a member directly (no permute); 3 blocks per quartet (base, bra +1,
+// ket +1) are batched and the phase-vector digestion runs on device with atomic
+// accumulation into the real imaginary-part matrices. l <= LMAX-1.
+template <class Real>
+void giao_jk_dB_dev(const ShellBasis<Real> &basis, const Real *D, const TGrid<Real> &grid,
+                    std::array<std::vector<Real>, 3> &Jim,
+                    std::array<std::vector<Real>, 3> &Kim) {
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  std::vector<int> hL(ns), hOff(ns);
+  for (int i = 0; i < ns; ++i) {
+    hL[i] = basis.shells[i].l;
+    hOff[i] = basis.ao_off[i];
+  }
+  Kokkos::View<Real *[3], Kokkos::LayoutLeft> shC("intti::g2b::C", ns);
+  {
+    auto h = Kokkos::create_mirror_view(shC);
+    for (int i = 0; i < ns; ++i)
+      for (int d = 0; d < 3; ++d) h(i, d) = basis.shells[i].center[d];
+    Kokkos::deep_copy(shC, h);
+  }
+  std::vector<ShellPair<Real>> plist;
+  auto add_pair = [&](int si, int di, int sj, int dj) {
+    PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
+    a.l += di;
+    b.l += dj;
+    plist.push_back(make_pair(a, b));
+    return static_cast<int>(plist.size()) - 1;
+  };
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> qa, qb, qc, qd, eBase, eBra, eKet;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b)
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
+          const int pab = add_pair(a, 0, b, 0), pcd = add_pair(c, 0, d, 0);
+          eBase.push_back(static_cast<int>(quartets.size()));
+          quartets.push_back({pab, pcd});
+          eBra.push_back(static_cast<int>(quartets.size()));
+          quartets.push_back({add_pair(a, 1, b, 0), pcd});
+          eKet.push_back(static_cast<int>(quartets.size()));
+          quartets.push_back({add_pair(a, 0, b, 0), add_pair(c, 1, d, 0)});
+        }
+  const int njob = static_cast<int>(qa.size());
+  auto tab = make_pair_table(plist);
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::g2b::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+  auto shL = to_device(hL, "intti::g2b::L"), shOff = to_device(hOff, "intti::g2b::off");
+  auto Dd = to_device(D, n2, "intti::g2b::D");
+  auto dqa = to_device(qa, "g2b::qa"), dqb = to_device(qb, "g2b::qb");
+  auto dqc = to_device(qc, "g2b::qc"), dqd = to_device(qd, "g2b::qd");
+  auto dB = to_device(eBase, "g2b::eB"), dBra = to_device(eBra, "g2b::eBr"), dKet = to_device(eKet, "g2b::eK");
+  auto offv = batch.out_offset;
+  Kokkos::View<Real *> Jd("intti::g2b::J", 3 * n2), Kd("intti::g2b::K", 3 * n2);
+  Kokkos::parallel_for(
+      "intti::g2b::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+        const int a = dqa(j), b = dqb(j), c = dqc(j), d = dqd(j);
+        const int la = shL(a), lb = shL(b), lc = shL(c), ld = shL(d);
+        const int na = ncart(la), nb = ncart(lb), nc = ncart(lc), nd = ncart(ld);
+        const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
+        const int nbase[4] = {na, nb, nc, nd};
+        const int npA[4] = {ncart(la + 1), nb, nc, nd};
+        const int npC[4] = {na, nb, ncart(lc + 1), nd};
+        const int bB = offv(dB(j)), bBra = offv(dBra(j)), bKet = offv(dKet(j));
+        const Real w1[3] = {shC(a, 0) - shC(b, 0), shC(a, 1) - shC(b, 1), shC(a, 2) - shC(b, 2)};
+        const Real w2[3] = {shC(c, 0) - shC(d, 0), shC(c, 1) - shC(d, 1), shC(c, 2) - shC(d, 2)};
+        const Real Ra[3] = {shC(a, 0), shC(a, 1), shC(a, 2)};
+        const Real Rc[3] = {shC(c, 0), shC(c, 1), shC(c, 2)};
+        auto idx4 = [](const int n[4], int i0, int i1, int i2, int i3) {
+          return ((static_cast<std::size_t>(i0) * n[1] + i1) * n[2] + i2) * n[3] + i3;
+        };
+        for (int ka = 0; ka < na; ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < nb; ++kb)
+            for (int kc = 0; kc < nc; ++kc) {
+              int c3[3];
+              cart_comp(lc, kc, c3[0], c3[1], c3[2]);
+              for (int kd = 0; kd < nd; ++kd) {
+                const Real b0 = out(bB + idx4(nbase, ka, kb, kc, kd));
+                Real M1[3], M2[3];
+                for (int e = 0; e < 3; ++e) {
+                  int m[3] = {a3[0], a3[1], a3[2]};
+                  m[e] += 1;
+                  const int ip = comp_index(la + 1, m[0], m[1]);
+                  M1[e] = out(bBra + idx4(npA, ip, kb, kc, kd)) + Ra[e] * b0;
+                  int mc[3] = {c3[0], c3[1], c3[2]};
+                  mc[e] += 1;
+                  const int icp = comp_index(lc + 1, mc[0], mc[1]);
+                  M2[e] = out(bKet + idx4(npC, ka, kb, icp, kd)) + Rc[e] * b0;
+                }
+                const Real dI[3] = {
+                    Real(0.5) * ((-w1[2] * M1[1] + w1[1] * M1[2]) + (-w2[2] * M2[1] + w2[1] * M2[2])),
+                    Real(0.5) * ((w1[2] * M1[0] - w1[0] * M1[2]) + (w2[2] * M2[0] - w2[0] * M2[2])),
+                    Real(0.5) * ((-w1[1] * M1[0] + w1[0] * M1[1]) + (-w2[1] * M2[0] + w2[0] * M2[1]))};
+                const Real Dcd = Dd(static_cast<std::size_t>(oc + kc) * nao + od + kd);
+                const Real Dbd = Dd(static_cast<std::size_t>(ob + kb) * nao + od + kd);
+                const std::size_t jjk = static_cast<std::size_t>(oa + ka) * nao + ob + kb;
+                const std::size_t kkk = static_cast<std::size_t>(oa + ka) * nao + oc + kc;
+                for (int k = 0; k < 3; ++k) {
+                  Kokkos::atomic_add(&Jd(k * n2 + jjk), dI[k] * Dcd);
+                  Kokkos::atomic_add(&Kd(k * n2 + kkk), dI[k] * Dbd);
+                }
+              }
+            }
+        }
+      });
+  auto hJ = to_host(Jd), hK = to_host(Kd);
+  for (int k = 0; k < 3; ++k) {
+    Jim[k].assign(hJ.begin() + k * n2, hJ.begin() + (k + 1) * n2);
+    Kim[k].assign(hK.begin() + k * n2, hK.begin() + (k + 1) * n2);
+  }
+}
+
+} // namespace detail
 
 /// dJ/dB and dK/dB at B = 0: three purely imaginary nao x nao matrices each,
 /// in the order {x, y, z}. D is the nao x nao AO density (row-major); the J/K
@@ -59,6 +186,24 @@ GiaoJKderiv<Real> giao_jk_dB(const ShellBasis<Real> &basis, const Real *D,
   for (int k = 0; k < 3; ++k) {
     Jim[k].assign(n2, Real(0));
     Kim[k].assign(n2, Real(0));
+  }
+  if constexpr (kokkos_scalar_v<Real>) {
+    bool ok = true;
+    for (const auto &s : basis.shells)
+      if (s.l >= LMAX) ok = false; // bra/ket promoted by one
+    if (ok) {
+      detail::giao_jk_dB_dev(basis, D, grid, Jim, Kim);
+      GiaoJKderiv<Real> out;
+      for (int k = 0; k < 3; ++k) {
+        out.dJ[k].assign(n2, C(0));
+        out.dK[k].assign(n2, C(0));
+        for (std::size_t i = 0; i < n2; ++i) {
+          out.dJ[k][i] = C(Real(0), Jim[k][i]);
+          out.dK[k][i] = C(Real(0), Kim[k][i]);
+        }
+      }
+      return out;
+    }
   }
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
   auto idx4 = [](const int n[4], int i0, int i1, int i2, int i3) {
