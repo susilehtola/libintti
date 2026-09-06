@@ -241,4 +241,45 @@ TEST(SpinOrbit, TwoElectronAntisymmetric) {
   EXPECT_LT(asym, 1e-11 * (mag + 1)) << "Y not antisymmetric";
 }
 
+
+TEST(SpinOrbit, TwoElectronScreeningMatchesExact) {
+  // The ordered quartet loop is pruned with a Schwarz bound on the
+  // derivative-expanded quartets, carrying max(2 alpha, l) per bra shell for the
+  // MD centre-shift coefficients. On an extended chain -- where screening is
+  // supposed to bite -- a tight tau must reproduce the unscreened matrices, and
+  // a loose one must degrade smoothly rather than drop whole blocks.
+  std::vector<intti::PrimitiveShell<double>> shells;
+  for (int i = 0; i < 8; ++i)
+    shells.push_back({0.6 + 0.3 * i, {4.0 * i, 0.2 * (i % 3), -0.1 * (i % 2)}, i % 2});
+  auto basis = intti::make_basis(shells);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nao = basis.nao;
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j)
+      D[i * nao + j] = (i == j) ? 1.0 : 0.15 / (1 + std::abs(i - j));
+  const auto Yex = intti::spin_orbit_2e_coulomb(basis, D.data(), grid);
+  const auto Kex = intti::spin_orbit_2e_exchange(basis, D.data(), grid);
+  double scale = 0;
+  for (int k = 0; k < 3; ++k)
+    for (double v : Yex[k]) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 0.0);
+  for (double tau : {1e-12, 1e-10}) {
+    const auto Y = intti::spin_orbit_2e_coulomb(basis, D.data(), grid, tau);
+    const auto K = intti::spin_orbit_2e_exchange(basis, D.data(), grid, tau);
+    for (int k = 0; k < 3; ++k)
+      for (std::size_t i = 0; i < Yex[k].size(); ++i) {
+        EXPECT_NEAR(Y[k][i], Yex[k][i], 1e-9 * scale) << "coulomb tau=" << tau << " k=" << k;
+        EXPECT_NEAR(K[k][i], Kex[k][i], 1e-9 * scale) << "exchange tau=" << tau << " k=" << k;
+      }
+  }
+  // tau = 0 enumerates exactly the same quartets, so it agrees to round-off --
+  // not bit-for-bit: the digest scatters with atomics, whose summation order
+  // varies between runs of identical code.
+  const auto Y0 = intti::spin_orbit_2e_coulomb(basis, D.data(), grid, 0.0);
+  for (int k = 0; k < 3; ++k)
+    for (std::size_t i = 0; i < Yex[k].size(); ++i)
+      EXPECT_NEAR(Y0[k][i], Yex[k][i], 1e-14 * scale) << "tau=0 k=" << k;
+}
+
 } // namespace

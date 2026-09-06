@@ -781,4 +781,111 @@ TEST(GIAO, FiniteFieldPairGramIsHermitianPositive) {
   EXPECT_GT(nonherm, 1e-6 * mx) << "(mn|ls) is NOT Hermitian -- no Cholesky of it";
 }
 
+
+TEST(GIAO, ComplexSchwarzBoundsFiniteFieldEris) {
+  // A London ERI is a BILINEAR form in the pair densities, so the Schwarz bound
+  // is built from the bra-swapped Gram element (P|P_reversed): rho_P^* =
+  // rho_(ba), hence (ab|cd) = <rho_ba|rho_cd> and |(ab|cd)| <= Q_(ab) Q_(cd)
+  // with Q_P = sqrt(max_components |(P|P_reversed)|). (P|P) -- what the real
+  // schwarz() uses -- is not even real here. Check the bound directly against
+  // every ordered shell quartet at finite field.
+  const double Bf[3] = {0.13, -0.07, 0.21};
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const std::vector<intti::PrimitiveShell<double>> shells = {
+      {0.9, {0.0, 0.0, 0.0}, 0}, {1.3, {0.6, 0.1, -0.2}, 1},
+      {0.7, {-0.4, 0.5, 0.3}, 0}, {1.1, {0.2, -0.3, 0.7}, 1}};
+  const int ns = static_cast<int>(shells.size());
+  std::vector<intti::ShellPair<C>> sp;
+  std::vector<intti::ShellPair<Kokkos::complex<double>>> kp;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      sp.push_back(intti::make_giao_pair(shells[a], shells[b], Bf));
+      kp.push_back(intti::detail::to_kokkos_pair(sp.back()));
+    }
+  auto tab = intti::make_pair_table(kp);
+  const auto Q = intti::detail::giao_schwarz(tab, kp, ns, grid);
+  ASSERT_EQ(Q.size(), sp.size());
+  const int npair = static_cast<int>(sp.size());
+  double worst = 0; // tightest the bound ever gets, to prove it is not vacuous
+  for (int ib = 0; ib < npair; ++ib)
+    for (int ik = 0; ik < npair; ++ik) {
+      const int n = intti::ncart(sp[ib].la) * intti::ncart(sp[ib].lb) *
+                    intti::ncart(sp[ik].la) * intti::ncart(sp[ik].lb);
+      std::vector<C> buf(n);
+      intti::eri_quartet(sp[ib], sp[ik], grid, buf.data());
+      const double bound = Q[ib] * Q[ik];
+      for (int k = 0; k < n; ++k) {
+        EXPECT_LE(std::abs(buf[k]), bound * (1 + 1e-10))
+            << "Schwarz violated at pair " << ib << "," << ik << " comp " << k;
+        worst = std::max(worst, std::abs(buf[k]) / bound);
+      }
+    }
+  EXPECT_GT(worst, 0.1) << "bound should be tight somewhere, not vacuous";
+}
+
+TEST(GIAO, FiniteFieldJKScreeningMatchesExact) {
+  // The screened quartet enumeration must reproduce the unscreened J/K. Uses an
+  // extended chain, where the Schwarz bound actually prunes.
+  const double Bf[3] = {0.1, 0.0, -0.15};
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PrimitiveShell<double>> shells;
+  for (int i = 0; i < 6; ++i)
+    shells.push_back({0.7 + 0.2 * i, {3.5 * i, 0.1 * (i % 2), 0.0}, i % 2});
+  auto bas = intti::make_basis(shells);
+  const int nao = bas.nao;
+  std::vector<C> D(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      const double r = 0.3 / (1 + std::abs(i - j)), im = (i == j) ? 0.0 : 0.05 * (i - j);
+      D[i * nao + j] = C(r, im); // Hermitian
+    }
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) D[j * nao + i] = std::conj(D[i * nao + j]);
+  const auto ex = intti::giao_jk(bas, D.data(), Bf, grid);
+  double scale = 0;
+  for (const auto &v : ex.J) scale = std::max(scale, std::abs(v));
+  for (const auto &v : ex.K) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 1e-6);
+  for (double tau : {1e-12, 1e-10}) {
+    const auto sc = intti::giao_jk(bas, D.data(), Bf, grid, tau);
+    for (std::size_t i = 0; i < ex.J.size(); ++i) {
+      EXPECT_NEAR(std::abs(sc.J[i] - ex.J[i]), 0.0, 1e-9 * scale) << "J tau=" << tau;
+      EXPECT_NEAR(std::abs(sc.K[i] - ex.K[i]), 0.0, 1e-9 * scale) << "K tau=" << tau;
+    }
+  }
+}
+
+
+TEST(GIAO, FieldDerivativeScreeningMatchesExact) {
+  // dJ/dB, dK/dB screened against the unscreened build. The bound has to carry
+  // the phase vectors and the promoted-pair Schwarz factors, not just Q_bra
+  // Q_ket, because the digest forms (a^{+e} b|cd) + R_a[e] (ab|cd).
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PrimitiveShell<double>> shells;
+  for (int i = 0; i < 6; ++i)
+    shells.push_back({0.7 + 0.2 * i, {3.5 * i, 0.1 * (i % 2), 0.0}, i % 2});
+  auto bas = intti::make_basis(shells);
+  const int nao = bas.nao;
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) D[i * nao + j] = 0.3 / (1 + std::abs(i - j));
+  const auto ex = intti::giao_jk_dB(bas, D.data(), grid);
+  double scale = 0;
+  for (int k = 0; k < 3; ++k) {
+    for (const auto &v : ex.dJ[k]) scale = std::max(scale, std::abs(v));
+    for (const auto &v : ex.dK[k]) scale = std::max(scale, std::abs(v));
+  }
+  ASSERT_GT(scale, 1e-6);
+  for (double tau : {1e-12, 1e-10}) {
+    const auto sc = intti::giao_jk_dB(bas, D.data(), grid, tau);
+    for (int k = 0; k < 3; ++k)
+      for (std::size_t i = 0; i < ex.dJ[k].size(); ++i) {
+        EXPECT_NEAR(std::abs(sc.dJ[k][i] - ex.dJ[k][i]), 0.0, 1e-9 * scale)
+            << "dJ tau=" << tau << " k=" << k;
+        EXPECT_NEAR(std::abs(sc.dK[k][i] - ex.dK[k][i]), 0.0, 1e-9 * scale)
+            << "dK tau=" << tau << " k=" << k;
+      }
+  }
+}
+
 } // namespace

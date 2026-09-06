@@ -58,8 +58,11 @@ namespace intti {
 /// and (ab|cd) = (cd|ab), both J and K are Hermitian for Hermitian D.
 /// D is the complex (Hermitian) AO density, row-major.
 ///
-/// The London phases break the 8-fold ERI symmetry ((mn|ls) != (nm|ls); it
-/// conjugates instead), so all ordered shell quartets are evaluated.
+/// The London phases break the INTRA-PAIR folds of the 8-fold ERI symmetry
+/// ((mn|ls) != (nm|ls); it conjugates instead), but the bra-ket swap
+/// (mn|ls) = (ls|mn) survives -- it needs only that 1/r12 is symmetric in the
+/// two electrons. So the builder enumerates ib <= ik over ordered pairs and
+/// replays each off-diagonal block in both orientations: 2-fold, not 8-fold.
 template <class Real> struct GiaoJK {
   std::vector<std::complex<Real>> J, K;
 };
@@ -85,20 +88,72 @@ template <class Real> using ComplexJK = GiaoJK<Real>;
 
 template <class Real>
 ComplexJK<Real> complex_jk(const ShellBasis<Real> &basis, const std::complex<Real> *D,
-                           const TGrid<Real> &grid) {
+                           const TGrid<Real> &grid, Real tau = Real(0)) {
   const Real zero_field[3] = {Real(0), Real(0), Real(0)};
-  return giao_jk(basis, D, zero_field, grid);
+  return giao_jk(basis, D, zero_field, grid, tau);
 }
 
 namespace detail {
+
+/// Schwarz bound for London (complex) pair densities. The ERI is a BILINEAR
+/// form in the pair densities, not a sesquilinear one: with rho_P = omega_a^*
+/// omega_b and the convention (ab|cd) = int int rho_(ab)(1) rho_(cd)(2)/r12,
+///
+///   (ab|cd) = <rho_ba | rho_cd>,   <f|g> = int int f^*(1) g(2) / r12,
+///
+/// because rho_P^* = rho_(ba). Cauchy-Schwarz then gives
+///
+///   |(ab|cd)| <= sqrt((ab|ba)) sqrt((dc|cd)),
+///
+/// and bra-ket symmetry turns the second factor into sqrt((cd|dc)) -- the same
+/// functional form as the first. So ONE vector over ordered pairs suffices,
+///
+///   Q_P = sqrt(max_components |(P | P_reversed)|),
+///
+/// and it bounds both slots. This is exactly the construction fock.hpp's
+/// schwarz() static_asserts about: (P|P) stops being the pair-density norm as
+/// soon as the pairs are complex, so the real routine must not be reused here.
+/// Pair ip = a*ns + b, so the reversed pair is (ip % ns)*ns + ip / ns.
+template <class Real>
+std::vector<Real> giao_schwarz(const PairTable<Kokkos::complex<Real>> &tab,
+                               const std::vector<ShellPair<Kokkos::complex<Real>>> &plist,
+                               int ns, const TGrid<Real> &grid) {
+  using KC = Kokkos::complex<Real>;
+  const int npair = static_cast<int>(plist.size());
+  std::vector<std::pair<int, int>> qs(npair);
+  for (int ip = 0; ip < npair; ++ip) qs[ip] = {ip, (ip % ns) * ns + ip / ns};
+  auto batch = make_batch(tab, qs);
+  QuartetWorkspace<KC> ws;
+  Kokkos::View<KC *> out("intti::gjk::schwarz", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+  auto oh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, out);
+  std::vector<Real> Q(npair);
+  for (int ip = 0; ip < npair; ++ip) {
+    const int na = ncart(plist[ip].la), nb = ncart(plist[ip].lb);
+    const std::size_t base = batch.h_offset[ip];
+    Real qmax = 0;
+    for (int ka = 0; ka < na; ++ka)
+      for (int kb = 0; kb < nb; ++kb) {
+        // the ket is the reversed pair, so this component's partner is (kb, ka)
+        const std::size_t idx =
+            ((static_cast<std::size_t>(ka) * nb + kb) * nb + kb) * na + ka;
+        const Real v = abs_(oh(base + idx));
+        if (v > qmax) qmax = v;
+      }
+    Q[ip] = sqrt_(qmax);
+  }
+  return Q;
+}
 
 /// Device finite-field J/K: the London pairs are built on the host (complex
 /// centres), pushed through the batched ERI driver instantiated on
 /// Kokkos::complex, and digested on device. Real and imaginary parts are
 /// accumulated into separate real Views so only real atomics are needed.
+/// `tau` (0 = off) screens the ordered pair x pair quartet loop with the
+/// complex Schwarz bound above.
 template <class Real>
 GiaoJK<Real> giao_jk_dev(const ShellBasis<Real> &basis, const std::complex<Real> *D,
-                         const Real B[3], const TGrid<Real> &grid) {
+                         const Real B[3], const TGrid<Real> &grid, Real tau) {
   using KC = Kokkos::complex<Real>;
   using C = std::complex<Real>;
   const int ns = static_cast<int>(basis.shells.size());
@@ -118,10 +173,18 @@ GiaoJK<Real> giao_jk_dev(const ShellBasis<Real> &basis, const std::complex<Real>
     }
   const int npair = static_cast<int>(plist.size());
   auto tab = make_pair_table(plist);
+  std::vector<Real> Q;
+  if (tau > Real(0)) Q = giao_schwarz(tab, plist, ns, grid);
+  // Only the BRA-KET swap survives the London phases, so enumerate ib <= ik and
+  // let the digest replay each off-diagonal block in both orientations: half the
+  // ERI evaluations, every ordered quartet still counted exactly once.
   std::vector<std::pair<int, int>> quartets;
-  quartets.reserve(static_cast<std::size_t>(npair) * npair);
+  quartets.reserve(static_cast<std::size_t>(npair) * (npair + 1) / 2);
   for (int ib = 0; ib < npair; ++ib)
-    for (int ik = 0; ik < npair; ++ik) quartets.push_back({ib, ik});
+    for (int ik = ib; ik < npair; ++ik) {
+      if (tau > Real(0) && Q[ib] * Q[ik] < tau) continue;
+      quartets.push_back({ib, ik});
+    }
   auto batch = make_batch(tab, quartets);
   QuartetWorkspace<KC> ws;
   Kokkos::View<KC *> out("intti::gjk::out", batch.nout_total);
@@ -159,6 +222,16 @@ GiaoJK<Real> giao_jk_dev(const ShellBasis<Real> &basis, const std::complex<Real>
                 const std::size_t ik2 = static_cast<std::size_t>(oa + ka) * nao + od + kd;
                 Kokkos::atomic_add(&Kr(ik2), dK.real());
                 Kokkos::atomic_add(&Ki(ik2), dK.imag());
+                if (ib == ik) continue;
+                // the same block read as (cd|ab): bra-ket swap, value unchanged
+                const KC dJ2 = v * Dd(static_cast<std::size_t>(oa + ka) * nao + ob + kb);
+                const std::size_t ij2 = static_cast<std::size_t>(oc + kc) * nao + od + kd;
+                Kokkos::atomic_add(&Jr(ij2), dJ2.real());
+                Kokkos::atomic_add(&Ji(ij2), dJ2.imag());
+                const KC dK2 = v * Dd(static_cast<std::size_t>(od + kd) * nao + oa + ka);
+                const std::size_t ik3 = static_cast<std::size_t>(oc + kc) * nao + ob + kb;
+                Kokkos::atomic_add(&Kr(ik3), dK2.real());
+                Kokkos::atomic_add(&Ki(ik3), dK2.imag());
               }
       });
   auto hJr = to_host(Jr), hJi = to_host(Ji), hKr = to_host(Kr), hKi = to_host(Ki);
@@ -174,11 +247,14 @@ GiaoJK<Real> giao_jk_dev(const ShellBasis<Real> &basis, const std::complex<Real>
 
 } // namespace detail
 
+/// `tau` (0 = off) screens the quartet loop with the complex Schwarz bound
+/// giao_schwarz(); it applies to the device path, which is the one taken for
+/// every scalar Kokkos supports. The generic fallback below is unscreened.
 template <class Real>
 GiaoJK<Real> giao_jk(const ShellBasis<Real> &basis, const std::complex<Real> *D,
-                     const Real B[3], const TGrid<Real> &grid) {
+                     const Real B[3], const TGrid<Real> &grid, Real tau = Real(0)) {
   if constexpr (kokkos_scalar_v<Kokkos::complex<Real>>)
-    return detail::giao_jk_dev(basis, D, B, grid);
+    return detail::giao_jk_dev(basis, D, B, grid, tau);
   using C = std::complex<Real>;
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao;
@@ -224,10 +300,19 @@ namespace detail {
 // quartet is a member directly (no permute); 3 blocks per quartet (base, bra +1,
 // ket +1) are batched and the phase-vector digestion runs on device with atomic
 // accumulation into the real imaginary-part matrices. l <= LMAX-1.
+/// `tau` (0 = off) screens the ordered quartet loop. The digest forms
+///   dI = 0.5 (w1 x M1 + w2 x M2),  M1 = (a^{+e} b|cd) + R_a[e] (ab|cd),
+/// (M2 the same on the ket), so the bound carries the phase vectors w = R_a-R_b,
+/// R_c-R_d and the Schwarz factors of BOTH the base and the promoted pairs:
+///   |dI| <= |w1|(Q_{a+1,b} Q_{cd} + |R_a| Q_{ab} Q_{cd})
+///         + |w2|(Q_{ab} Q_{c+1,d} + |R_c| Q_{ab} Q_{cd}).
+/// Note this bound is gauge-origin dependent through |R_a|, |R_c| (the RESULT is
+/// not -- the phase vectors are centre differences), so a distant gauge origin
+/// loosens it and screening simply prunes less.
 template <class Real>
 void giao_jk_dB_dev(const ShellBasis<Real> &basis, const Real *D, const TGrid<Real> &grid,
                     std::array<std::vector<Real>, 3> &Jim,
-                    std::array<std::vector<Real>, 3> &Kim) {
+                    std::array<std::vector<Real>, 3> &Kim, Real tau) {
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao;
   const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
@@ -243,13 +328,37 @@ void giao_jk_dB_dev(const ShellBasis<Real> &basis, const Real *D, const TGrid<Re
       for (int d = 0; d < 3; ++d) h(i, d) = basis.shells[i].center[d];
     Kokkos::deep_copy(shC, h);
   }
+  // Distinct pairs only -- the base (i,j) and the bra-promoted (i+1,j) -- memoised
+  // on (shell, promotion) x shell. Building them inside the quartet loop instead
+  // would put ~5 ns^4 pairs and their E tables in the table where 2 ns^2 are
+  // distinct (it even built (a,b) twice per job).
   std::vector<ShellPair<Real>> plist;
-  auto add_pair = [&](int si, int di, int sj, int dj) {
-    PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
-    a.l += di;
-    b.l += dj;
-    plist.push_back(make_pair(a, b));
-    return static_cast<int>(plist.size()) - 1;
+  std::vector<int> pid(static_cast<std::size_t>(ns) * 2 * ns, -1);
+  auto pair_id = [&](int si, int di, int sj) {
+    const std::size_t key = (static_cast<std::size_t>(si) * 2 + di) * ns + sj;
+    if (pid[key] < 0) {
+      PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
+      a.l += di;
+      plist.push_back(make_pair(a, b));
+      pid[key] = static_cast<int>(plist.size()) - 1;
+    }
+    return pid[key];
+  };
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      pair_id(a, 0, b);
+      pair_id(a, 1, b);
+    }
+  auto tab = make_pair_table(plist);
+  std::vector<Real> Q;
+  if (tau > Real(0)) Q = schwarz(tab, plist, grid);
+  auto maxabs = [](const Real *u, const Real *v) {
+    Real m = 0;
+    for (int e = 0; e < 3; ++e) {
+      const Real x = abs_(v ? u[e] - v[e] : u[e]);
+      if (x > m) m = x;
+    }
+    return m;
   };
   std::vector<std::pair<int, int>> quartets;
   std::vector<int> qa, qb, qc, qd, eBase, eBra, eKet;
@@ -257,17 +366,27 @@ void giao_jk_dB_dev(const ShellBasis<Real> &basis, const Real *D, const TGrid<Re
     for (int b = 0; b < ns; ++b)
       for (int c = 0; c < ns; ++c)
         for (int d = 0; d < ns; ++d) {
+          const int pab = pair_id(a, 0, b), pcd = pair_id(c, 0, d);
+          const int pAb = pair_id(a, 1, b), pCd = pair_id(c, 1, d);
+          if (tau > Real(0)) {
+            const Real qbra = Q[pab], qket = Q[pcd];
+            const Real w1 = maxabs(basis.shells[a].center, basis.shells[b].center);
+            const Real w2 = maxabs(basis.shells[c].center, basis.shells[d].center);
+            const Real ra = maxabs(basis.shells[a].center, nullptr);
+            const Real rc = maxabs(basis.shells[c].center, nullptr);
+            const Real m1 = Q[pAb] * qket + ra * qbra * qket;
+            const Real m2 = qbra * Q[pCd] + rc * qbra * qket;
+            if (w1 * m1 + w2 * m2 < tau) continue;
+          }
           qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
-          const int pab = add_pair(a, 0, b, 0), pcd = add_pair(c, 0, d, 0);
           eBase.push_back(static_cast<int>(quartets.size()));
           quartets.push_back({pab, pcd});
           eBra.push_back(static_cast<int>(quartets.size()));
-          quartets.push_back({add_pair(a, 1, b, 0), pcd});
+          quartets.push_back({pAb, pcd});
           eKet.push_back(static_cast<int>(quartets.size()));
-          quartets.push_back({add_pair(a, 0, b, 0), add_pair(c, 1, d, 0)});
+          quartets.push_back({pab, pCd});
         }
   const int njob = static_cast<int>(qa.size());
-  auto tab = make_pair_table(plist);
   auto batch = make_batch(tab, quartets);
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::g2b::out", batch.nout_total);
@@ -348,9 +467,11 @@ template <class Real> struct GiaoJKderiv {
   std::array<std::vector<std::complex<Real>>, 3> dJ, dK;
 };
 
+/// `tau` (0 = off) screens the device path's quartet loop; see
+/// giao_jk_dB_dev for the bound. The generic host fallback is unscreened.
 template <class Real>
 GiaoJKderiv<Real> giao_jk_dB(const ShellBasis<Real> &basis, const Real *D,
-                             const TGrid<Real> &grid) {
+                             const TGrid<Real> &grid, Real tau = Real(0)) {
   using C = std::complex<Real>;
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao;
@@ -366,7 +487,7 @@ GiaoJKderiv<Real> giao_jk_dB(const ShellBasis<Real> &basis, const Real *D,
     for (const auto &s : basis.shells)
       if (s.l >= LMAX) ok = false; // bra/ket promoted by one
     if (ok) {
-      detail::giao_jk_dB_dev(basis, D, grid, Jim, Kim);
+      detail::giao_jk_dB_dev(basis, D, grid, Jim, Kim, tau);
       GiaoJKderiv<Real> out;
       for (int k = 0; k < 3; ++k) {
         out.dJ[k].assign(n2, C(0));

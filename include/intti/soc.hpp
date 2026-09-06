@@ -278,8 +278,14 @@ template <class Real> struct SO2eBatch {
   int njob{0}, nao{0};
 };
 
+/// `tau` (0 = off) screens the ordered quartet loop with a Schwarz bound on the
+/// DERIVATIVE-expanded quartets: the digest reads shifted-bra blocks weighted by
+/// the MD centre-shift coefficients (-2 alpha on the raised term, the Cartesian
+/// power on the lowered one), so the bound carries max(2 alpha, l) per bra shell
+/// on top of the usual Q_bra Q_ket. Conservative, hence safe.
 template <class Real>
-SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real> &grid) {
+SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real> &grid,
+                                 Real tau = Real(0)) {
   const int ns = static_cast<int>(basis.shells.size());
   SO2eBatch<Real> B;
   B.nao = basis.nao;
@@ -290,13 +296,37 @@ SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real
     hOff[i] = basis.ao_off[i];
     hAl[i] = basis.shells[i].alpha;
   }
+  // Every DISTINCT pair the digest can ask for -- the unshifted kets and the
+  // four shifted bras -- built once and memoised on (shell, shift) x (shell,
+  // shift). Constructing them inside the quartet loop instead would put ~5 ns^4
+  // pairs (and their E tables) in the pair table where only ~5 ns^2 are distinct.
   std::vector<ShellPair<Real>> plist;
-  auto add_pair = [&](int si, int di, int sj, int dj) {
-    PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
-    a.l += di;
-    b.l += dj;
-    plist.push_back(make_pair(a, b));
-    return static_cast<int>(plist.size()) - 1;
+  std::vector<int> pid(static_cast<std::size_t>(ns) * 3 * ns * 3, -1);
+  auto pair_id = [&](int si, int di, int sj, int dj) {
+    if (hL[si] + di < 0 || hL[sj] + dj < 0) return -1;
+    const std::size_t key =
+        ((static_cast<std::size_t>(si) * 3 + (di + 1)) * ns + sj) * 3 + (dj + 1);
+    if (pid[key] < 0) {
+      PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
+      a.l += di;
+      b.l += dj;
+      plist.push_back(make_pair(a, b));
+      pid[key] = static_cast<int>(plist.size()) - 1;
+    }
+    return pid[key];
+  };
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      pair_id(a, 0, b, 0);
+      for (int da = 1; da >= -1; da -= 2)
+        for (int db = 1; db >= -1; db -= 2) pair_id(a, da, b, db);
+    }
+  auto tab = make_pair_table(plist);
+  std::vector<Real> Q;
+  if (tau > Real(0)) Q = schwarz(tab, plist, grid);
+  auto scale = [&](int s) {
+    const Real two_al = 2 * hAl[s];
+    return two_al > Real(hL[s]) ? two_al : Real(hL[s]);
   };
   std::vector<std::pair<int, int>> quartets;
   std::vector<int> qa, qb, qc, qd, e00, e01, e10, e11;
@@ -305,19 +335,27 @@ SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real
       for (int c = 0; c < ns; ++c)
         for (int d = 0; d < ns; ++d) {
           const int la = hL[a], lb = hL[b];
-          const int ket = add_pair(c, 0, d, 0);
+          const int ket = pair_id(c, 0, d, 0);
+          if (tau > Real(0)) {
+            Real qbra = 0;
+            for (int da = 1; da >= -1; da -= 2)
+              for (int db = 1; db >= -1; db -= 2) {
+                const int p = pair_id(a, da, b, db);
+                if (p >= 0 && Q[p] > qbra) qbra = Q[p];
+              }
+            if (scale(a) * scale(b) * qbra * Q[ket] < tau) continue;
+          }
           qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
           auto emit = [&](int bp) {
             int e = static_cast<int>(quartets.size());
             quartets.push_back({bp, ket});
             return e;
           };
-          e00.push_back(emit(add_pair(a, 1, b, 1)));
-          e01.push_back(lb >= 1 ? emit(add_pair(a, 1, b, -1)) : -1);
-          e10.push_back(la >= 1 ? emit(add_pair(a, -1, b, 1)) : -1);
-          e11.push_back((la >= 1 && lb >= 1) ? emit(add_pair(a, -1, b, -1)) : -1);
+          e00.push_back(emit(pair_id(a, 1, b, 1)));
+          e01.push_back(lb >= 1 ? emit(pair_id(a, 1, b, -1)) : -1);
+          e10.push_back(la >= 1 ? emit(pair_id(a, -1, b, 1)) : -1);
+          e11.push_back((la >= 1 && lb >= 1) ? emit(pair_id(a, -1, b, -1)) : -1);
         }
-  auto tab = make_pair_table(plist);
   auto batch = make_batch(tab, quartets);
   QuartetWorkspace<Real> ws;
   B.out = Kokkos::View<Real *>("intti::so2e::out", batch.nout_total);
@@ -341,9 +379,9 @@ SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real
 template <class Real>
 std::array<std::vector<Real>, 3>
 spin_orbit_2e_coulomb_dev(const ShellBasis<Real> &basis, const Real *D,
-                          const TGrid<Real> &grid) {
+                          const TGrid<Real> &grid, Real tau) {
   const int nao = basis.nao;
-  auto B = build_so2e_batch(basis, grid);
+  auto B = build_so2e_batch(basis, grid, tau);
   auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "intti::so2e::D");
   Kokkos::View<Real *> Yd("intti::so2e::Y", static_cast<std::size_t>(3) * nao * nao);
   const std::size_t plane = static_cast<std::size_t>(nao) * nao;
@@ -408,9 +446,9 @@ spin_orbit_2e_coulomb_dev(const ShellBasis<Real> &basis, const Real *D,
 template <class Real>
 std::array<std::vector<Real>, 3>
 spin_orbit_2e_exchange_dev(const ShellBasis<Real> &basis, const Real *D,
-                           const TGrid<Real> &grid) {
+                           const TGrid<Real> &grid, Real tau) {
   const int nao = basis.nao;
-  auto B = build_so2e_batch(basis, grid);
+  auto B = build_so2e_batch(basis, grid, tau);
   auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "intti::so2ex::D");
   Kokkos::View<Real *> Ked("intti::so2ex::Ke", static_cast<std::size_t>(3) * nao * nao);
   const std::size_t plane = static_cast<std::size_t>(nao) * nao;
@@ -477,12 +515,12 @@ spin_orbit_2e_exchange_dev(const ShellBasis<Real> &basis, const Real *D,
 template <class Real>
 std::array<std::vector<Real>, 3>
 spin_orbit_2e_coulomb(const ShellBasis<Real> &basis, const Real *D,
-                      const TGrid<Real> &grid) {
+                      const TGrid<Real> &grid, Real tau = Real(0)) {
   if constexpr (kokkos_scalar_v<Real>) {
     bool ok = true;
     for (const auto &s : basis.shells)
       if (s.l >= LMAX) ok = false; // bra shells are promoted to l+1
-    if (ok) return detail::spin_orbit_2e_coulomb_dev(basis, D, grid);
+    if (ok) return detail::spin_orbit_2e_coulomb_dev(basis, D, grid, tau);
   }
   const int nao = basis.nao;
   std::array<std::vector<Real>, 3> Y;
@@ -530,12 +568,12 @@ spin_orbit_2e_coulomb(const ShellBasis<Real> &basis, const Real *D,
 template <class Real>
 std::array<std::vector<Real>, 3>
 spin_orbit_2e_exchange(const ShellBasis<Real> &basis, const Real *D,
-                       const TGrid<Real> &grid) {
+                       const TGrid<Real> &grid, Real tau = Real(0)) {
   if constexpr (kokkos_scalar_v<Real>) {
     bool ok = true;
     for (const auto &s : basis.shells)
       if (s.l >= LMAX) ok = false; // bra shells are promoted to l+1
-    if (ok) return detail::spin_orbit_2e_exchange_dev(basis, D, grid);
+    if (ok) return detail::spin_orbit_2e_exchange_dev(basis, D, grid, tau);
   }
   const int nao = basis.nao;
   std::array<std::vector<Real>, 3> Ke;
