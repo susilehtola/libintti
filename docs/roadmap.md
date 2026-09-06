@@ -702,8 +702,31 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   Validated vs the JK field-derivative FD. Remaining M18 Tier 2: RI gradient/
   Hessian (rigrad, ~769 lines) and three-electron (threeel/threeel_ri, ~587) --
   same batched-quartet-consumer pattern (LKC/SHARK #2); both are large focused
-  ports. (giao2e is real on the device because only the imaginary part is
-  computed; a fully complex device path would need Kokkos::complex.) Production follow-ups for the 2e derivative/SO
+  ports. (giao2e's dB derivative is real on the device because only the
+  imaginary part is computed.)
+  FINITE MAGNETIC FIELD + Kokkos::complex DEVICE PATH DONE (2026-09-06). Two
+  pieces. (a) giao_jk: the complex J/K in a FINITE field -- the 2e half of the
+  London/GIAO Fock matrix a finite-field SCF needs (giao.hpp already had the
+  finite-B complex S/T/V and complex ERIs; the fused 2e builder was the gap).
+  Physics note: at finite B the exchange must be K_mn = sum (ml|sn) D_ls, NOT
+  the (ml|ns) the B=0 derivative may use -- the two coincide only for real ERIs,
+  and only (ml|sn) is Hermitian once the London phases make the integrals
+  complex. The phases also break the 8-fold symmetry (a bra swap conjugates
+  rather than equals), so all ordered quartets are evaluated. (b) The device
+  complex path: Kokkos::complex is now a kokkos_scalar_v (device-runnable,
+  unlike std::complex), abs_ dispatches on kokkos_scalar_v before is_complex_v,
+  and batch.hpp makes the real-vs-scalar split explicit -- PairTable::p is
+  real_t, the drivers take TGrid<real_t>, and p/q/D/theta/rho/t/prefactors are R
+  while P/E/B/f/g/val are the scalar (a no-op for real scalars; e_coeffs and
+  hermite_b already had the split). giao_jk_dev then runs the batched ERI driver
+  instantiated on Kokkos::complex and digests J/K on device, accumulating real
+  and imaginary parts into separate real Views so only real atomics are needed.
+  Validated: at B=0 the COMPLEX DEVICE J/K reproduces the REAL DEVICE
+  coulomb_build/exchange_build to 1e-12; Hermiticity; B->-B conjugation. Suite
+  232/232. Finite field is thus the first genuinely complex GPU capability;
+  remaining complex work: the finite-B 1e matrices (giao_overlap/kinetic/nuclear
+  are still std::complex host) and a complex SCF driver.
+  Production follow-ups for the 2e derivative/SO
   builds: reinstate the 8-fold symmetry and stream/chunk the quartet list
   (materialised now, O(ns^4) at tau=0, so large systems need screening +
   streaming).
