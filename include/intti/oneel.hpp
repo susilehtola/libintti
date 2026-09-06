@@ -124,6 +124,7 @@ template <class Real> struct OneEPairs {
   Kokkos::View<int *> aoa, aob; ///< AO offsets of the canonical pair's shells
   Kokkos::View<int *> la0, lb0; ///< original momenta (output loop bounds)
   Kokkos::View<Real *> beta;    ///< ket exponent (kinetic recurrence)
+  Kokkos::View<Real *[3], Kokkos::LayoutLeft> Acen; ///< bra centre (multipoles)
   int npair{0};
 };
 
@@ -135,6 +136,7 @@ OneEPairs<Real> make_1e_pairs(const ShellBasis<Real> &basis, int exa, int exb, R
   std::vector<ShellPair<Real>> plist;
   std::vector<int> haoa, haob, hla0, hlb0;
   std::vector<Real> hbeta;
+  std::vector<std::array<Real, 3>> hAcen;
   for (int a = 0; a < ns; ++a)
     for (int b = a; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
@@ -148,6 +150,7 @@ OneEPairs<Real> make_1e_pairs(const ShellBasis<Real> &basis, int exa, int exb, R
       hla0.push_back(sa.l);
       hlb0.push_back(sb.l);
       hbeta.push_back(sb.alpha);
+      hAcen.push_back({sa.center[0], sa.center[1], sa.center[2]});
     }
   OneEPairs<Real> op;
   op.tab = make_pair_table(plist);
@@ -157,6 +160,13 @@ OneEPairs<Real> make_1e_pairs(const ShellBasis<Real> &basis, int exa, int exb, R
   op.la0 = to_device(hla0, "intti::1e::la0");
   op.lb0 = to_device(hlb0, "intti::1e::lb0");
   op.beta = to_device(hbeta, "intti::1e::beta");
+  op.Acen = Kokkos::View<Real *[3], Kokkos::LayoutLeft>("intti::1e::Acen", op.npair);
+  {
+    auto hA = Kokkos::create_mirror_view(op.Acen);
+    for (int p = 0; p < op.npair; ++p)
+      for (int d = 0; d < 3; ++d) hA(p, d) = hAcen[p][d];
+    Kokkos::deep_copy(op.Acen, hA);
+  }
   return op;
 }
 
@@ -236,6 +246,78 @@ std::vector<Real> kinetic_matrix_dev(const ShellBasis<Real> &basis, Real tau) {
   return to_host(Td);
 }
 
+template <class Real>
+std::vector<std::vector<Real>>
+multipole_matrices_dev(const ShellBasis<Real> &basis, int max_order,
+                       const Real origin[3], Real tau) {
+  const int nao = basis.nao;
+  // component list (ex,ey,ez): order 0..max_order, cart_comp within each order
+  std::vector<int> hcomp; // flat 3*ncomp
+  for (int L = 0; L <= max_order; ++L)
+    for (int k = 0; k < ncart(L); ++k) {
+      int e[3];
+      cart_comp(L, k, e[0], e[1], e[2]);
+      hcomp.push_back(e[0]);
+      hcomp.push_back(e[1]);
+      hcomp.push_back(e[2]);
+    }
+  const int ncomp = static_cast<int>(hcomp.size() / 3);
+  auto op = make_1e_pairs(basis, max_order, 0, tau); // bra + order
+  const int npair = op.npair;
+  auto comp = to_device(hcomp, "intti::mp::comp");
+  Kokkos::View<Real *> Md("intti::mp::M",
+                          static_cast<std::size_t>(ncomp) * nao * nao);
+  auto pv = op.tab.p, Ev = op.tab.E;
+  auto lav = op.tab.la, lbv = op.tab.lb, eoffv = op.tab.e_off, aoa = op.aoa, aob = op.aob;
+  auto Acen = op.Acen;
+  const Real pi = pi_v<Real>();
+  const Real Ox = origin[0], Oy = origin[1], Oz = origin[2];
+  const std::size_t plane = static_cast<std::size_t>(nao) * nao;
+  Kokkos::parallel_for(
+      "intti::mp::asm", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        const int lax = lav(p), lb0 = lbv(p), la0 = lax - max_order, n1 = lax + lb0 + 1;
+        const int esz = (lax + 1) * (lb0 + 1) * n1;
+        const Real pref = sqrt_(pi / pv(p));
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        const Real dAO[3] = {Acen(p, 0) - Ox, Acen(p, 1) - Oy, Acen(p, 2) - Oz};
+        auto S1 = [&](int d, int i, int j) {
+          return pref * Ev(eo + d * esz + (i * (lb0 + 1) + j) * n1);
+        };
+        // <i|(x-O)^e|j> = sum_k C(e,k) (A-O)^{e-k} S_{i+k,j}
+        auto M = [&](int d, int e, int i, int j) {
+          Real acc = 0, binom = 1;
+          for (int k = 0; k <= e; ++k) {
+            Real pw = 1;
+            for (int r = 0; r < e - k; ++r) pw *= dAO[d];
+            acc += binom * pw * S1(d, i + k, j);
+            binom = binom * (e - k) / (k + 1);
+          }
+          return acc;
+        };
+        for (int ci = 0; ci < comp.extent_int(0) / 3; ++ci) {
+          const int ex = comp(3 * ci + 0), ey = comp(3 * ci + 1), ez = comp(3 * ci + 2);
+          for (int ka = 0; ka < ncart(la0); ++ka) {
+            int a3[3];
+            cart_comp(la0, ka, a3[0], a3[1], a3[2]);
+            for (int kb = 0; kb < ncart(lb0); ++kb) {
+              int b3[3];
+              cart_comp(lb0, kb, b3[0], b3[1], b3[2]);
+              const Real val = M(0, ex, a3[0], b3[0]) * M(1, ey, a3[1], b3[1]) *
+                               M(2, ez, a3[2], b3[2]);
+              const int r = oa + ka, c = ob + kb;
+              Md(ci * plane + static_cast<std::size_t>(r) * nao + c) = val;
+              if (r != c) Md(ci * plane + static_cast<std::size_t>(c) * nao + r) = val;
+            }
+          }
+        }
+      });
+  auto flat = to_host(Md);
+  std::vector<std::vector<Real>> out(ncomp);
+  for (int ci = 0; ci < ncomp; ++ci)
+    out[ci].assign(flat.begin() + ci * plane, flat.begin() + (ci + 1) * plane);
+  return out;
+}
+
 } // namespace detail
 
 /// Overlap matrix S (nao x nao, row-major) over the primitive Cartesian AOs.
@@ -310,6 +392,8 @@ std::vector<std::vector<Real>> multipole_matrices(const ShellBasis<Real> &basis,
                                                   int max_order,
                                                   const Real origin[3],
                                                   Real tau = Real(0)) {
+  if constexpr (kokkos_scalar_v<Real>)
+    return detail::multipole_matrices_dev(basis, max_order, origin, tau);
   const int nao = basis.nao;
   // component list: (ex,ey,ez), total order 0..max_order, cart_comp ordering
   std::vector<std::array<int, 3>> comps;
