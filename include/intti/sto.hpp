@@ -20,6 +20,24 @@
 // primitive ShellBasis with a contraction map, and the contraction of any
 // primitive AO matrix down to the STO basis. Higher n (extra even radial
 // powers r^{2k}) is a later extension; the minimal-STO case is exact here.
+//
+// COST, stated plainly. The s-transform does NOT make the four transforms of a
+// four-centre STO integral go away; it converts them into contraction depth.
+// A contracted GTO is NOT separable per Cartesian axis -- only each PRIMITIVE
+// is -- so the engine never factorises a contracted function: it evaluates
+// primitive quartets (separable, MD + t quadrature) and the contraction is a
+// linear combination of the resulting integral VALUES. That is why nothing new
+// is needed on the analytic path, but it also means a four-centre STO quartet
+// costs ns^4 primitive quartets (sto_jk_build literally decontracts to the
+// ns-times-larger primitive basis, runs the ordinary J/K build there, and
+// contracts the matrices back). With the default ns = 48 that factor is large;
+// what makes it viable is (a) Schwarz screening, very effective here because
+// the s grid spans a huge exponent range so most primitive pairs are
+// negligible, (b) the pair-level E-coefficient reuse, and (c) shrinking ns via
+// [smin, smax] plus the delta-tail correction.
+//
+// This is exactly the regime where the GRID route wins instead: on a grid a
+// contracted AO is evaluated pointwise, so contraction is FREE -- no ns^4.
 
 #include <cmath>
 #include <cstddef>

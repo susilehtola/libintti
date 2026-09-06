@@ -292,6 +292,222 @@ std::vector<Real> quartet_pos_deriv_block(const PrimitiveShell<Real> &s0,
   return out;
 }
 
+/// Device jobs for the RI Hessians: one job per ghost-shell quartet, carrying
+/// the batch entry for each per-position l-offset pattern the second-derivative
+/// digestion asks for. Same construction as the 2e Hessian (erihess): patterns
+/// are single +-2 at an allowed position (the p == q terms) and +-1 at two
+/// allowed positions (p != q), looked up in the kernel by a 625-entry key table.
+/// `positions` lists the non-ghost slots (the ghost's derivative is zero).
+template <class Real> struct RIHessJobs {
+  std::vector<std::array<int, 4>> pats; ///< the offset patterns, in a fixed order
+  std::vector<int> idxkey;              ///< key(o) -> pattern index, or -1
+  std::vector<ShellPair<Real>> plist;
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> ent;                  ///< npat entries per job (-1 if absent)
+  std::vector<int> jl0, jl1, jl2, jl3;   ///< base momenta
+  std::vector<Real> ja0, ja1, ja2, ja3;  ///< exponents
+  std::vector<int> jo0, jo1, jo2;        ///< AO offsets for the coefficient
+  std::vector<int> jt0, jt1, jt2;        ///< Hessian centre index per position
+  int npat{0}, njob{0};
+
+  static int key(const std::array<int, 4> &o) {
+    return (((o[0] + 2) * 5 + (o[1] + 2)) * 5 + (o[2] + 2)) * 5 + (o[3] + 2);
+  }
+  /// Build the pattern list for the given non-ghost positions.
+  void build_patterns(const std::vector<int> &positions) {
+    pats.clear();
+    pats.push_back({0, 0, 0, 0});
+    for (int p : positions) {
+      std::array<int, 4> a{}, b{};
+      a[p] = 2;
+      b[p] = -2;
+      pats.push_back(a);
+      pats.push_back(b);
+    }
+    const int sg[4][2] = {{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+    for (std::size_t i = 0; i < positions.size(); ++i)
+      for (std::size_t j = i + 1; j < positions.size(); ++j)
+        for (int s = 0; s < 4; ++s) {
+          std::array<int, 4> o{};
+          o[positions[i]] = sg[s][0];
+          o[positions[j]] = sg[s][1];
+          pats.push_back(o);
+        }
+    npat = static_cast<int>(pats.size());
+    idxkey.assign(625, -1);
+    for (int i = 0; i < npat; ++i) idxkey[key(pats[i])] = i;
+  }
+  /// Add one quartet job; `tg` are the Hessian centre indices per position.
+  void add(const PrimitiveShell<Real> sh[4], const int tg[3], int o0, int o1, int o2) {
+    const int L[4] = {sh[0].l, sh[1].l, sh[2].l, sh[3].l};
+    for (int i = 0; i < npat; ++i) {
+      const auto &o = pats[i];
+      bool ok = true;
+      for (int t = 0; t < 4; ++t)
+        if (L[t] + o[t] < 0) ok = false;
+      if (!ok) { ent.push_back(-1); continue; }
+      PrimitiveShell<Real> s[4] = {sh[0], sh[1], sh[2], sh[3]};
+      for (int t = 0; t < 4; ++t) s[t].l += o[t];
+      const int ib = static_cast<int>(plist.size());
+      plist.push_back(make_pair(s[0], s[1]));
+      const int ik = static_cast<int>(plist.size());
+      plist.push_back(make_pair(s[2], s[3]));
+      ent.push_back(static_cast<int>(quartets.size()));
+      quartets.push_back({ib, ik});
+    }
+    jl0.push_back(L[0]); jl1.push_back(L[1]); jl2.push_back(L[2]); jl3.push_back(L[3]);
+    ja0.push_back(sh[0].alpha); ja1.push_back(sh[1].alpha);
+    ja2.push_back(sh[2].alpha); ja3.push_back(sh[3].alpha);
+    jo0.push_back(o0); jo1.push_back(o1); jo2.push_back(o2);
+    jt0.push_back(tg[0]); jt1.push_back(tg[1]); jt2.push_back(tg[2]);
+    ++njob;
+  }
+};
+
+/// Run the RI Hessian jobs: the quartet_pos_hess body on device, over the
+/// allowed (p,q) position pairs, accumulating cf * d2 into the (3 ncen)^2
+/// Hessian with atomics. Mode selects the coefficient exactly as the gradient
+/// digest does (0: D_mn gamma_P, 1: -1/2 gamma_P gamma_Q, 2: c3, 3: c2).
+template <class Real, int Mode>
+void ri_hess_digest(RIHessJobs<Real> &jobs, const std::vector<int> &positions,
+                    const TGrid<Real> &grid, Kokkos::View<const Real *> Dd, int nao,
+                    Kokkos::View<const Real *> gam, Kokkos::View<const Real *> c3v,
+                    Kokkos::View<const Real *> c2v, int naux, int dim,
+                    Kokkos::View<Real *> H) {
+  if (jobs.njob == 0) return;
+  auto tab = make_pair_table(jobs.plist);
+  auto batch = make_batch(tab, jobs.quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::rih::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+  auto entv = to_device(jobs.ent, "rih::ent");
+  auto idxv = to_device(jobs.idxkey, "rih::idx");
+  auto posv = to_device(positions, "rih::pos");
+  auto l0 = to_device(jobs.jl0, "rih::l0"), l1 = to_device(jobs.jl1, "rih::l1");
+  auto l2 = to_device(jobs.jl2, "rih::l2"), l3 = to_device(jobs.jl3, "rih::l3");
+  auto a0 = to_device(jobs.ja0, "rih::a0"), a1 = to_device(jobs.ja1, "rih::a1");
+  auto a2 = to_device(jobs.ja2, "rih::a2"), a3 = to_device(jobs.ja3, "rih::a3");
+  auto o0v = to_device(jobs.jo0, "rih::o0"), o1v = to_device(jobs.jo1, "rih::o1");
+  auto o2v = to_device(jobs.jo2, "rih::o2");
+  auto t0 = to_device(jobs.jt0, "rih::t0"), t1 = to_device(jobs.jt1, "rih::t1");
+  auto t2 = to_device(jobs.jt2, "rih::t2");
+  auto offv = batch.out_offset;
+  const int npat = jobs.npat, njob = jobs.njob;
+  const int npos = static_cast<int>(positions.size());
+  Kokkos::parallel_for(
+      "intti::rih::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+        const int L[4] = {l0(j), l1(j), l2(j), l3(j)};
+        const Real al[4] = {a0(j), a1(j), a2(j), a3(j)};
+        const int nc[4] = {ncart(L[0]), ncart(L[1]), ncart(L[2]), ncart(L[3])};
+        const int tg[3] = {t0(j), t1(j), t2(j)};
+        const int oa = o0v(j), ob = o1v(j), oc = o2v(j);
+        auto rawval = [&](const int o[4], const int m[4][3]) -> Real {
+          const int kk = (((o[0] + 2) * 5 + (o[1] + 2)) * 5 + (o[2] + 2)) * 5 + (o[3] + 2);
+          const int pi2 = idxv(kk);
+          if (pi2 < 0) return Real(0);
+          const int e2 = entv(j * npat + pi2);
+          if (e2 < 0) return Real(0);
+          int nn[4], id[4];
+          for (int t = 0; t < 4; ++t) {
+            const int lt = L[t] + o[t];
+            if (m[t][0] < 0 || m[t][1] < 0 || m[t][2] < 0 ||
+                m[t][0] + m[t][1] + m[t][2] != lt)
+              return Real(0);
+            nn[t] = ncart(lt);
+            id[t] = comp_index(lt, m[t][0], m[t][1]);
+          }
+          return out(offv(e2) +
+                     ((((static_cast<std::size_t>(id[0]) * nn[1] + id[1]) * nn[2] + id[2]) *
+                       nn[3]) + id[3]));
+        };
+        int bm[4][3];
+        int k[4];
+        for (k[0] = 0; k[0] < nc[0]; ++k[0])
+          for (k[1] = 0; k[1] < nc[1]; ++k[1])
+            for (k[2] = 0; k[2] < nc[2]; ++k[2])
+              for (k[3] = 0; k[3] < nc[3]; ++k[3]) {
+                Real cf;
+                if constexpr (Mode == 0)
+                  cf = Dd(static_cast<std::size_t>(oa + k[0]) * nao + ob + k[1]) * gam(oc + k[2]);
+                else if constexpr (Mode == 1)
+                  cf = Real(-0.5) * gam(oa + k[0]) * gam(oc + k[2]);
+                else if constexpr (Mode == 2)
+                  cf = c3v(((static_cast<std::size_t>(oa + k[0]) * nao + ob + k[1]) * naux) +
+                           oc + k[2]);
+                else
+                  cf = c2v(static_cast<std::size_t>(oa + k[0]) * naux + oc + k[2]);
+                if (cf == Real(0)) continue;
+                for (int t = 0; t < 4; ++t) cart_comp(L[t], k[t], bm[t][0], bm[t][1], bm[t][2]);
+                auto mset = [&](int p, const int mp[3], int q, const int mq[3], int mm[4][3]) {
+                  for (int r = 0; r < 4; ++r)
+                    for (int t = 0; t < 3; ++t) mm[r][t] = bm[r][t];
+                  for (int t = 0; t < 3; ++t) mm[p][t] = mp[t];
+                  if (q != p)
+                    for (int t = 0; t < 3; ++t) mm[q][t] = mq[t];
+                };
+                for (int pi = 0; pi < npos; ++pi)
+                  for (int qi = 0; qi < npos; ++qi) {
+                    const int p = posv(pi), q = posv(qi);
+                    const Real ap = al[p], aq = al[q];
+                    for (int e = 0; e < 3; ++e)
+                      for (int f = 0; f < 3; ++f) {
+                        Real d2 = 0;
+                        int mm[4][3];
+                        if (p == q) {
+                          const int *mp = bm[p];
+                          const int de = (e == f) ? 1 : 0;
+                          int T[4][3];
+                          for (int t = 0; t < 3; ++t)
+                            T[0][t] = T[1][t] = T[2][t] = T[3][t] = mp[t];
+                          T[0][e] += 1; T[0][f] += 1;
+                          T[1][f] += 1; T[1][e] -= 1;
+                          T[2][e] += 1; T[2][f] -= 1;
+                          T[3][e] -= 1; T[3][f] -= 1;
+                          int o2a[4] = {0, 0, 0, 0}, o0a[4] = {0, 0, 0, 0}, om2[4] = {0, 0, 0, 0};
+                          o2a[p] = 2;
+                          om2[p] = -2;
+                          mset(p, T[0], q, T[0], mm);
+                          d2 += 2 * ap * (2 * ap * rawval(o2a, mm));
+                          mset(p, T[1], q, T[1], mm);
+                          d2 += 2 * ap * (-(Real(mp[e]) + de) * rawval(o0a, mm));
+                          mset(p, T[2], q, T[2], mm);
+                          d2 += -Real(mp[f]) * (2 * ap * rawval(o0a, mm));
+                          mset(p, T[3], q, T[3], mm);
+                          d2 += -Real(mp[f]) * (-(Real(mp[e]) - de) * rawval(om2, mm));
+                        } else {
+                          const int *mp = bm[p], *mq = bm[q];
+                          int Pe1[3], Pe0[3], Qf1[3], Qf0[3];
+                          for (int t = 0; t < 3; ++t) {
+                            Pe1[t] = mp[t]; Pe0[t] = mp[t];
+                            Qf1[t] = mq[t]; Qf0[t] = mq[t];
+                          }
+                          Pe1[e] += 1; Pe0[e] -= 1;
+                          Qf1[f] += 1; Qf0[f] -= 1;
+                          int oo[4];
+                          auto seto = [&](int dp, int dq) {
+                            for (int t = 0; t < 4; ++t) oo[t] = 0;
+                            oo[p] += dp;
+                            oo[q] += dq;
+                          };
+                          mset(p, Pe1, q, Qf1, mm); seto(1, 1);
+                          d2 += 4 * ap * aq * rawval(oo, mm);
+                          mset(p, Pe1, q, Qf0, mm); seto(1, -1);
+                          d2 += -2 * ap * Real(mq[f]) * rawval(oo, mm);
+                          mset(p, Pe0, q, Qf1, mm); seto(-1, 1);
+                          d2 += -Real(mp[e]) * 2 * aq * rawval(oo, mm);
+                          mset(p, Pe0, q, Qf0, mm); seto(-1, -1);
+                          d2 += Real(mp[e]) * Real(mq[f]) * rawval(oo, mm);
+                        }
+                        if (d2 != Real(0))
+                          Kokkos::atomic_add(
+                              &H((3 * tg[pi] + e) * static_cast<std::size_t>(dim) + 3 * tg[qi] + f),
+                              cf * d2);
+                      }
+                  }
+              }
+      });
+}
+
 /// Second geometric derivative d^2/dR_{p,e} dR_{q,f} of the quartet
 /// (s0 s1 | s2 s3), contracted with coeff(k0,k1,k2,k3) over the components,
 /// returned as out[e][f]. The MD centre-shift applied twice (l+/-2 for p==q,
@@ -631,6 +847,40 @@ std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
   // response term H[x][y] = sum_P r[x][P] s[y][P] = (r s^T)[x][y]
   detail::gemm('N', 'T', dim, dim, naux, Real(1), r.data(), naux, s.data(), naux, Real(1),
                H.data(), dim);
+  if constexpr (kokkos_scalar_v<Real>) {
+    // Device direct terms. The response term r^T M^{-1} r above is dense linear
+    // algebra over first derivatives and stays on the host; H already holds it,
+    // so the device contribution is ADDED, not assigned.
+    detail::RIHessJobs<Real> jA, jB;
+    const std::vector<int> posA{0, 1, 2}, posB{0, 2};
+    jA.build_patterns(posA);
+    for (int m = 0; m < nso; ++m)
+      for (int n = 0; n < nso; ++n)
+        for (int a = 0; a < nsa; ++a) {
+          const PrimitiveShell<Real> sh[4] = {orb.shells[m], orb.shells[n], aux.shells[a],
+                                              ghost(aux.shells[a])};
+          const int tg[3] = {cshell(false, m), cshell(false, n), cshell(true, a)};
+          jA.add(sh, tg, orb.ao_off[m], orb.ao_off[n], aux.ao_off[a]);
+        }
+    jB.build_patterns(posB);
+    for (int a = 0; a < nsa; ++a)
+      for (int b = 0; b < nsa; ++b) {
+        const PrimitiveShell<Real> sh[4] = {aux.shells[a], ghost(aux.shells[a]),
+                                            aux.shells[b], ghost(aux.shells[b])};
+        const int tg[3] = {cshell(true, a), cshell(true, b), 0};
+        jB.add(sh, tg, aux.ao_off[a], 0, aux.ao_off[b]);
+      }
+    auto Dd = detail::to_device(D, static_cast<std::size_t>(nao) * nao, "rih::D");
+    auto gam = detail::to_device(gamma, "rih::gamma");
+    Kokkos::View<const Real *> none;
+    Kokkos::View<Real *> Hd("rih::H", static_cast<std::size_t>(dim) * dim);
+    detail::ri_hess_digest<Real, 0>(jA, posA, grid, Dd, nao, gam, none, none, naux, dim, Hd);
+    detail::ri_hess_digest<Real, 1>(jB, posB, grid, Dd, nao, gam, none, none, naux, dim, Hd);
+    auto hh = detail::to_host(Hd);
+    for (std::size_t i = 0; i < H.size(); ++i) H[i] += hh[i];
+    return H;
+  }
+
   // direct term 1: gamma^T d_xy, 3-centre with coeff D_mn gamma_P
   for (int m = 0; m < nso; ++m)
     for (int n = 0; n < nso; ++n)
