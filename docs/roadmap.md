@@ -669,14 +669,21 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   ported via make_1e_pairs (bra +1 for the d/dR_bra shift; +alpha exponent and
   an all_pairs mode added -- gradients are not symmetric, so every ordered pair
   is assembled with no transpose). geoderiv/geohess higher orders ride these via
-  FD. Remaining M18 Tier 2 is now the TWO-electron quartet-derivative surface --
-  rewrite the 2e derivative (erigrad/erihess/rigrad), GIAO 2e (giao2e),
-  three-electron (threeel/threeel_ri) and spin-orbit (soc) builders as batched-
-  quartet consumers (enumerate the promoted/demoted quartets, hand them to
-  eri_quartets as one batch, contract on device), the LKC-consumer pattern
-  (SHARK #2); for the derivative builds the 8-fold symmetry replay can be dropped
-  in the first device pass (evaluate all quartets, they are cheap and parallel on
-  device) and reinstated later.
+  FD. 2e energy gradient DONE (2026-09-06): two_electron_gradient ported -- drop
+  the 8-fold symmetry (loop all ordered quartets once = canonical+replay sum),
+  batch every quartet's promoted/demoted blocks (4 pos x +/-) into one
+  eri_quartets call, and run the gradient digestion (coeff 1/2 D_ab D_cd -
+  1/4 D_ac D_bd; MD term 2 alpha(l+1) - l(l-1)) in a parallel_for over quartets
+  with atomic accumulation into per-shell forces (comp_index made
+  KOKKOS_INLINE_FUNCTION). Exact (tau=0) -> device; screened (tau>0) + __float128
+  keep the host symmetry-replay build. Validated by EriGrad force-vs-FD and
+  EriGrad.ScreeningMatchesExact (device exact == host canonical+8-fold+screened).
+  Remaining M18 Tier 2: the 2e Hessian (erihess), RI gradient (rigrad), GIAO 2e
+  (giao2e), three-electron (threeel/threeel_ri) and spin-orbit (soc) -- same
+  batched-quartet-consumer pattern (LKC/SHARK #2). Production follow-ups for the
+  2e gradient: reinstate the 8-fold symmetry and stream/chunk the quartet list
+  (materialised now, O(ns^4) at tau=0, so large systems need screening +
+  streaming).
   Build note: this box's /tmp is a 25 GB tmpfs quota shared with other sessions'
   scratch; if the compiler hits "Disk quota exceeded", build with
   TMPDIR=<repo>/build/ctmp (on /home, 143 GB free). Precision note: the analytic path in double already hits
