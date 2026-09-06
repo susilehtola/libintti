@@ -173,6 +173,18 @@ std::vector<Real> run_batch(const PairTable<Real> &pairs,
 /// step 2 rebuilds the vectors RI-style, L = (ab|J) S^{-1/2}, which is one
 /// batched integral pass plus dense linear algebra. Requires float/double
 /// (host LAPACK); arbitrary-precision Cholesky is deferred.
+///
+/// CONVENTION / REAL-ONLY. A Cholesky decomposition needs a HERMITIAN POSITIVE
+/// DEFINITE matrix, and this code decomposes the pair-space matrix M_PQ =
+/// (P|Q) with diagonal D_ab = (ab|ab). That identifies (P|Q) with the
+/// Coulomb-metric Gram matrix <rho_P|rho_Q> of the pair densities rho_P =
+/// omega_a^* omega_b, which holds ONLY for real pair densities. For complex
+/// (London/GIAO) pairs rho_P^* = rho_(ba), so:
+///   - the Gram matrix is the BRA-SWAPPED integral <rho_P|rho_Q> = (ba|cd);
+///   - the matrix formed here, (mn|ls), is complex SYMMETRIC but NOT Hermitian,
+///     so it admits no Cholesky at all (see the GIAO pair-Gram test).
+/// Templating this on a complex scalar would therefore be silently wrong, not
+/// merely unsupported -- hence the explicit !is_complex_v guard.
 template <class Real>
 CholeskyBasis<Real> two_step_cholesky(const PairTable<Real> &pairs,
                                       const TGrid<Real> &grid,
@@ -183,6 +195,12 @@ CholeskyBasis<Real> two_step_cholesky(const PairTable<Real> &pairs,
   // LAPACK, so long double is supported via one_step (see below).
   static_assert(kokkos_scalar_v<Real>,
                 "two_step_cholesky needs a batched-integral scalar (float/double/long double)");
+  static_assert(!is_complex_v<Real>,
+                "two_step_cholesky decomposes (P|Q) as the pair-density Gram "
+                "matrix, which requires REAL pair densities; for complex "
+                "(London/GIAO) pairs (mn|ls) is complex symmetric but not "
+                "Hermitian and has no Cholesky -- decompose the bra-swapped "
+                "Gram form (nm|ls) instead");
   CholeskyBasis<Real> basis;
   const int npair = pairs.npair;
   basis.prod_offset.resize(npair + 1);

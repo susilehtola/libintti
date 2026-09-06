@@ -65,22 +65,6 @@ template <class Real> struct GiaoJK {
 
 namespace detail {
 
-/// std::complex ShellPair -> Kokkos::complex ShellPair (device-runnable).
-template <class Real>
-ShellPair<Kokkos::complex<Real>> to_kokkos_pair(const ShellPair<std::complex<Real>> &sp) {
-  ShellPair<Kokkos::complex<Real>> o;
-  o.p = sp.p;
-  o.la = sp.la;
-  o.lb = sp.lb;
-  for (int d = 0; d < 3; ++d) {
-    o.P[d] = Kokkos::complex<Real>(sp.P[d].real(), sp.P[d].imag());
-    o.K[d] = Kokkos::complex<Real>(sp.K[d].real(), sp.K[d].imag());
-    o.A[d] = sp.A[d];
-    o.B[d] = sp.B[d];
-  }
-  return o;
-}
-
 /// Device finite-field J/K: the London pairs are built on the host (complex
 /// centres), pushed through the batched ERI driver instantiated on
 /// Kokkos::complex, and digested on device. Real and imaginary parts are

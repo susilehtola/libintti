@@ -83,10 +83,26 @@ void make_shell_pairs(const ShellBasis<Real> &basis,
 
 /// Cauchy-Schwarz factors Q_p = sqrt(max_comp (p_comp | p_comp)) per pair,
 /// from one batched diagonal call.
+///
+/// CONVENTION. The ERI is (ab|cd) = int int omega_a^* omega_b (1/r12)
+/// omega_c^* omega_d -- the FIRST index of each pair is the conjugated one
+/// (make_giao_pair). This routine additionally identifies the pair-space
+/// diagonal (P|P) with the squared Coulomb-metric norm <rho_P|rho_P> of the
+/// pair density rho_P = omega_a^* omega_b. That identification holds ONLY for
+/// real pair densities: in general rho_P^* = rho_(ba), so the Gram element is
+/// the BRA-SWAPPED integral <rho_P|rho_Q> = (ba|cd), and for complex (London)
+/// pairs (P|P) is not even real -- there is no ordering to take a max over.
+/// Hence the static_assert: a complex Schwarz bound must be built from the
+/// bra-swapped Gram form, not from this one.
 template <class Real>
 std::vector<Real> schwarz(const PairTable<Real> &pairs,
                           const std::vector<ShellPair<Real>> &pair_list,
                           const TGrid<Real> &grid) {
+  static_assert(!is_complex_v<Real>,
+                "schwarz() identifies (P|P) with the pair-density norm "
+                "<rho_P|rho_P>, which only holds for REAL pair densities; for "
+                "complex (London/GIAO) pairs use the bra-swapped Gram form "
+                "(ba|cd), since rho_P^* = rho_(ba)");
   using std::sqrt;
   const int npair = pairs.npair;
   std::vector<std::pair<int, int>> diag(npair);

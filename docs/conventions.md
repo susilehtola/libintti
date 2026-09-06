@@ -90,3 +90,52 @@ per-primitive `cart_norm_pyscf` multiplication is needed; it is already
 implied. This was confirmed by reconstructing PySCF's `int1e_ovlp_cart`
 diagonal (both axial and off-axial Cartesian components) from raw `env`
 coefficients for contracted d and f shells, matching to double precision.
+
+## Complex scalars: the ERI convention vs the pair-density Gram matrix
+
+The two-electron integral is
+
+```
+(ab|cd) = ∫∫ ω_a*(1) ω_b(1)  (1/r₁₂)  ω_c*(2) ω_d(2)
+```
+
+— the **first index of each pair is the conjugated one** (`make_giao_pair`,
+include/intti/giao.hpp). This is the standard complex-orbital chemist
+convention and is what every Fock-like build uses (`coulomb_build`,
+`exchange_build`, `giao_jk`). It is consistent across the API.
+
+What is **not** the same object is the Coulomb-metric **Gram matrix** of the
+pair densities ρ_P = ω_a* ω_b. Because ρ_P* = ρ_(ba),
+
+```
+⟨ρ_P|ρ_Q⟩ = (ba|cd)      -- the BRA PAIR SWAPPED
+```
+
+For **real** orbitals ρ_P* = ρ_P and the two coincide, which is why the
+real code may freely use `(P|Q)` as a metric. For **complex** (London/GIAO)
+pairs they differ, and the distinction is not cosmetic:
+
+- `(mn|ls)` is complex **symmetric** (`M_PQ = M_QP`, by electron exchange)
+  but **not Hermitian** — so it admits **no Cholesky decomposition at all**.
+- `(nm|ls)` is Hermitian positive definite with a real positive diagonal —
+  this is what a finite-B Cholesky/RI metric must decompose.
+
+Both facts are pinned numerically at B ≠ 0 by
+`GIAO.FiniteFieldPairGramIsHermitianPositive` (tests/test_giao.cpp).
+
+Consequences enforced in code (all no-ops for the real path):
+
+- `schwarz()` (fock.hpp) forms `Q_P = sqrt(max (P|P))`, identifying `(P|P)`
+  with `⟨ρ_P|ρ_P⟩`; it `static_assert`s `!is_complex_v`.
+- `two_step_cholesky()` / `pivoted_cholesky()` (cholesky.hpp) decompose
+  `(P|Q)` as that Gram matrix; they `static_assert` `!is_complex_v`.
+
+These guards matter because `Kokkos::complex` is now a `kokkos_scalar_v`
+(the finite-field device path), so `PairTable<Kokkos::complex<double>>` is
+legal and these routines would otherwise instantiate and be **silently
+wrong** rather than failing to build.
+
+Exchange has the same trap at the Fock level: at finite B the exchange must
+be `K_mn = Σ_ls (ml|sn) D_ls`, **not** `(ml|ns)`. The two coincide for real
+ERIs, but only `(ml|sn)` is Hermitian once the London phases make the
+integrals complex (`giao_jk`, giao2e.hpp).

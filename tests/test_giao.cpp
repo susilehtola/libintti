@@ -543,6 +543,27 @@ TEST(GIAO, FiniteFieldJKFieldReversalConjugates) {
   EXPECT_LT(rev, 1e-12 * mx) << "B -> -B must conjugate J,K";
 }
 
+// S(B) = <omega_mu|omega_nu> must be Hermitian at finite field (the London
+// phases make it Hermitian, not symmetric) and genuinely complex.
+TEST(GIAO, FiniteFieldOverlapHermitian) {
+  auto bas = jk_basis();
+  const int nao = bas.nao;
+  const double Bf[3] = {0.2, -0.3, 0.7};
+  auto S = intti::giao_overlap(bas, Bf);
+  double mx = 0, herm = 0, imag = 0;
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      const std::size_t ij = static_cast<std::size_t>(i) * nao + j;
+      const std::size_t ji = static_cast<std::size_t>(j) * nao + i;
+      mx = std::max(mx, std::abs(S[ij]));
+      herm = std::max(herm, std::abs(S[ij] - std::conj(S[ji])));
+      imag = std::max(imag, std::abs(S[ij].imag()));
+    }
+  ASSERT_GT(mx, 1e-6);
+  EXPECT_GT(imag, 1e-6 * mx) << "the field must make S genuinely complex";
+  EXPECT_LT(herm, 1e-13 * mx) << "S(B) must be Hermitian";
+}
+
 // ---- structure of the finite-B pair space (prerequisite for a CD path) ------
 // A Cholesky decomposition needs a HERMITIAN POSITIVE-DEFINITE matrix. At
 // finite B the matrix the real CD code would form, M_PQ = (mn|ls), is complex

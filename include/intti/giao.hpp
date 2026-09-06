@@ -103,6 +103,117 @@ ShellPair<std::complex<Real>> make_giao_pair(const PrimitiveShell<Real> &a,
   return sp;
 }
 
+namespace detail {
+
+/// std::complex ShellPair -> Kokkos::complex ShellPair (device-runnable).
+/// std::complex cannot be used inside a device kernel; Kokkos::complex can, and
+/// carries the same algebra, so this is the bridge from the host-built London
+/// pairs to the device path.
+template <class Real>
+ShellPair<Kokkos::complex<Real>> to_kokkos_pair(const ShellPair<std::complex<Real>> &sp) {
+  ShellPair<Kokkos::complex<Real>> o;
+  o.p = sp.p;
+  o.la = sp.la;
+  o.lb = sp.lb;
+  for (int d = 0; d < 3; ++d) {
+    o.P[d] = Kokkos::complex<Real>(sp.P[d].real(), sp.P[d].imag());
+    o.K[d] = Kokkos::complex<Real>(sp.K[d].real(), sp.K[d].imag());
+    o.A[d] = sp.A[d];
+    o.B[d] = sp.B[d];
+  }
+  return o;
+}
+
+/// London pairs for the finite-field 1e builders, as a device PairTable of
+/// Kokkos::complex plus the side arrays the kernels need. Every ordered (a,b)
+/// pair is stored (the London phases make S,T,V Hermitian, not symmetric, and
+/// the host builders loop all pairs too). (exa,exb) extend the angular momenta
+/// so kinetic (+2 ket) and the nuclear bra derivative have the indices they
+/// need; la0/lb0 are the ORIGINAL momenta for the output loops.
+template <class Real> struct Giao1ePairs {
+  PairTable<Kokkos::complex<Real>> tab;
+  Kokkos::View<int *> aoa, aob, la0, lb0;
+  Kokkos::View<Real *> alpha, beta;
+  int npair{0};
+};
+
+template <class Real>
+Giao1ePairs<Real> make_giao_1e_pairs(const ShellBasis<Real> &basis, const Real B[3],
+                                     int exa, int exb) {
+  const int ns = static_cast<int>(basis.shells.size());
+  std::vector<ShellPair<Kokkos::complex<Real>>> plist;
+  std::vector<int> haoa, haob, hla0, hlb0;
+  std::vector<Real> halpha, hbeta;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      PrimitiveShell<Real> sae = basis.shells[a], sbe = basis.shells[b];
+      sae.l += exa;
+      sbe.l += exb;
+      plist.push_back(to_kokkos_pair(make_giao_pair(sae, sbe, B)));
+      haoa.push_back(basis.ao_off[a]);
+      haob.push_back(basis.ao_off[b]);
+      hla0.push_back(basis.shells[a].l);
+      hlb0.push_back(basis.shells[b].l);
+      halpha.push_back(basis.shells[a].alpha);
+      hbeta.push_back(basis.shells[b].alpha);
+    }
+  Giao1ePairs<Real> gp;
+  gp.tab = make_pair_table(plist);
+  gp.npair = gp.tab.npair;
+  gp.aoa = to_device(haoa, "intti::g1e::aoa");
+  gp.aob = to_device(haob, "intti::g1e::aob");
+  gp.la0 = to_device(hla0, "intti::g1e::la0");
+  gp.lb0 = to_device(hlb0, "intti::g1e::lb0");
+  gp.alpha = to_device(halpha, "intti::g1e::alpha");
+  gp.beta = to_device(hbeta, "intti::g1e::beta");
+  return gp;
+}
+
+/// Device finite-field overlap S(B). Only E is complex; the prefactor
+/// sqrt(pi/p) is real because p = alpha+beta stays real for London pairs.
+template <class Real>
+std::vector<std::complex<Real>> giao_overlap_dev(const ShellBasis<Real> &basis,
+                                                 const Real B[3]) {
+  using KC = Kokkos::complex<Real>;
+  const int nao = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  auto gp = make_giao_1e_pairs(basis, B, 0, 0);
+  Kokkos::View<Real *> Sr("intti::g1e::Sr", n2), Si("intti::g1e::Si", n2);
+  auto pv = gp.tab.p, Ev = gp.tab.E;
+  auto lav = gp.tab.la, lbv = gp.tab.lb, eoffv = gp.tab.e_off;
+  auto aoa = gp.aoa, aob = gp.aob;
+  const Real pi = pi_v<Real>();
+  Kokkos::parallel_for(
+      "intti::g1e::ovlp", Kokkos::RangePolicy<>(0, gp.npair), KOKKOS_LAMBDA(int p) {
+        const int la = lav(p), lb = lbv(p), n1 = la + lb + 1;
+        const int esz = (la + 1) * (lb + 1) * n1;
+        const Real pref = sqrt_(pi / pv(p));
+        const Real pref3 = pref * pref * pref;
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        for (int ka = 0; ka < ncart(la); ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncart(lb); ++kb) {
+            int b3[3];
+            cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+            const KC ex = Ev(eo + 0 * esz + (a3[0] * (lb + 1) + b3[0]) * n1);
+            const KC ey = Ev(eo + 1 * esz + (a3[1] * (lb + 1) + b3[1]) * n1);
+            const KC ez = Ev(eo + 2 * esz + (a3[2] * (lb + 1) + b3[2]) * n1);
+            const KC v = ex * ey * ez * pref3;
+            const std::size_t idx = static_cast<std::size_t>(oa + ka) * nao + ob + kb;
+            Sr(idx) = v.real();
+            Si(idx) = v.imag();
+          }
+        }
+      });
+  auto hr = to_host(Sr), hi = to_host(Si);
+  std::vector<std::complex<Real>> S(n2);
+  for (std::size_t i = 0; i < n2; ++i) S[i] = std::complex<Real>(hr[i], hi[i]);
+  return S;
+}
+
+} // namespace detail
+
 /// Complex GIAO overlap matrix S(B) = <omega_mu | omega_nu> in a finite
 /// magnetic field B (nao x nao, row-major, over the primitive Cartesian AOs).
 /// London orbitals shift the product Gaussian centre into the complex plane
@@ -113,6 +224,8 @@ std::vector<std::complex<Real>> giao_overlap(const ShellBasis<Real> &basis,
                                              const Real B[3]) {
   using C = std::complex<Real>;
   static_assert(!is_complex_v<Real>, "giao_overlap takes a real basis");
+  if constexpr (kokkos_scalar_v<Kokkos::complex<Real>>)
+    return detail::giao_overlap_dev(basis, B);
   const int nao = basis.nao;
   std::vector<C> S(static_cast<std::size_t>(nao) * nao, C(0));
   const int ns = static_cast<int>(basis.shells.size());
