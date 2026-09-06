@@ -124,21 +124,25 @@ template <class Real> struct OneEPairs {
   Kokkos::View<int *> aoa, aob; ///< AO offsets of the canonical pair's shells
   Kokkos::View<int *> la0, lb0; ///< original momenta (output loop bounds)
   Kokkos::View<Real *> beta;    ///< ket exponent (kinetic recurrence)
+  Kokkos::View<Real *> alpha;   ///< bra exponent (bra-derivative shift)
   Kokkos::View<Real *[3], Kokkos::LayoutLeft> Acen; ///< bra centre (multipoles)
   int npair{0};
 };
 
-/// Canonical (a<=b) shell pairs above the screening threshold, each extended by
-/// (exa,exb), with the side arrays the device 1e kernels need.
+/// Shell pairs above the screening threshold, each extended by (exa,exb), with
+/// the side arrays the device 1e kernels need. all_pairs=false gives the
+/// canonical a<=b triangle (symmetric operators); true gives every ordered
+/// (a,b) pair (gradient / non-symmetric operators, scattered without mirror).
 template <class Real>
-OneEPairs<Real> make_1e_pairs(const ShellBasis<Real> &basis, int exa, int exb, Real tau) {
+OneEPairs<Real> make_1e_pairs(const ShellBasis<Real> &basis, int exa, int exb, Real tau,
+                              bool all_pairs = false) {
   const int ns = static_cast<int>(basis.shells.size());
   std::vector<ShellPair<Real>> plist;
   std::vector<int> haoa, haob, hla0, hlb0;
-  std::vector<Real> hbeta;
+  std::vector<Real> hbeta, halpha;
   std::vector<std::array<Real, 3>> hAcen;
   for (int a = 0; a < ns; ++a)
-    for (int b = a; b < ns; ++b) {
+    for (int b = (all_pairs ? 0 : a); b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
       if (pair_gauss_prefactor(sa, sb) <= tau) continue; // exact at tau = 0
       PrimitiveShell<Real> sae = sa, sbe = sb;
@@ -150,6 +154,7 @@ OneEPairs<Real> make_1e_pairs(const ShellBasis<Real> &basis, int exa, int exb, R
       hla0.push_back(sa.l);
       hlb0.push_back(sb.l);
       hbeta.push_back(sb.alpha);
+      halpha.push_back(sa.alpha);
       hAcen.push_back({sa.center[0], sa.center[1], sa.center[2]});
     }
   OneEPairs<Real> op;
@@ -160,6 +165,7 @@ OneEPairs<Real> make_1e_pairs(const ShellBasis<Real> &basis, int exa, int exb, R
   op.la0 = to_device(hla0, "intti::1e::la0");
   op.lb0 = to_device(hlb0, "intti::1e::lb0");
   op.beta = to_device(hbeta, "intti::1e::beta");
+  op.alpha = to_device(halpha, "intti::1e::alpha");
   op.Acen = Kokkos::View<Real *[3], Kokkos::LayoutLeft>("intti::1e::Acen", op.npair);
   {
     auto hA = Kokkos::create_mirror_view(op.Acen);
