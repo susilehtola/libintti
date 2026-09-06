@@ -1118,6 +1118,36 @@ std::vector<Real> ri_k_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
   std::vector<Real> Hess(static_cast<std::size_t>(dim) * dim, Real(0));
   auto Hadd = [&](int x, int y, Real v) { Hess[static_cast<std::size_t>(x) * dim + y] += v; };
 
+  if constexpr (kokkos_scalar_v<Real>) {
+    // device direct terms (the response term below stays on the host)
+    detail::RIHessJobs<Real> jA, jB;
+    const std::vector<int> posA{0, 1, 2}, posB{0, 2};
+    jA.build_patterns(posA);
+    for (int l = 0; l < nso; ++l)
+      for (int n = 0; n < nso; ++n)
+        for (int a = 0; a < nsa; ++a) {
+          const PrimitiveShell<Real> sh[4] = {orb.shells[l], orb.shells[n], aux.shells[a],
+                                              ghost(aux.shells[a])};
+          const int tg[3] = {cshell(false, l), cshell(false, n), cshell(true, a)};
+          jA.add(sh, tg, orb.ao_off[l], orb.ao_off[n], aux.ao_off[a]);
+        }
+    jB.build_patterns(posB);
+    for (int a = 0; a < nsa; ++a)
+      for (int b = 0; b < nsa; ++b) {
+        const PrimitiveShell<Real> sh[4] = {aux.shells[a], ghost(aux.shells[a]),
+                                            aux.shells[b], ghost(aux.shells[b])};
+        const int tg[3] = {cshell(true, a), cshell(true, b), 0};
+        jB.add(sh, tg, aux.ao_off[a], 0, aux.ao_off[b]);
+      }
+    auto c3d = detail::to_device(coeff3, "rikh::c3");
+    auto c2d = detail::to_device(coeff2, "rikh::c2");
+    Kokkos::View<const Real *> none;
+    Kokkos::View<Real *> Hd("rikh::H", static_cast<std::size_t>(dim) * dim);
+    detail::ri_hess_digest<Real, 2>(jA, posA, grid, none, nao, none, c3d, c2d, naux, dim, Hd);
+    detail::ri_hess_digest<Real, 3>(jB, posB, grid, none, nao, none, c3d, c2d, naux, dim, Hd);
+    auto hh = detail::to_host(Hd);
+    for (std::size_t i = 0; i < Hess.size(); ++i) Hess[i] += hh[i];
+  } else {
   // direct terms
   for (int l = 0; l < nso; ++l)
     for (int n = 0; n < nso; ++n)
@@ -1155,6 +1185,7 @@ std::vector<Real> ri_k_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
             for (int f = 0; f < 3; ++f) Hadd(3 * cs[pi] + e, 3 * cs[qi] + f, o[e][f]);
         }
     }
+  }
 
   // response: R_x[(a*nao+b)*naux+Q] = dH[a,b,Q]/dx - sum_R dM_QR/dx G[a,b,R]
   std::vector<Real> R(static_cast<std::size_t>(dim) * no2 * naux, Real(0));
