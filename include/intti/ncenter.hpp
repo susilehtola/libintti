@@ -157,6 +157,168 @@ std::vector<Real> coulomb_3c_dev(const ShellBasis<Real> &orb,
   return to_host(Td);
 }
 
+// contracted-basis device n-center: batch every primitive ghost-quartet once and
+// accumulate it coefficient-weighted (effective_coeff) into the contracted
+// blocks on device with atomics -- the shared-primitive contraction.
+
+/// Flat effective-coefficient table for a contracted basis: eff(shell,c,p) at
+/// eoff[shell] + c*nprim(shell) + p, plus per-shell l/nprim/nctr/ao_off arrays.
+template <class Real> struct ContractedDev {
+  Kokkos::View<Real *> eff;
+  Kokkos::View<int *> eoff, L, nprim, nctr, aoff;
+};
+template <class Real>
+ContractedDev<Real> to_contracted_dev(const ContractedBasis<Real> &b, const char *tag) {
+  const int ns = static_cast<int>(b.shells.size());
+  std::vector<int> L(ns), np(ns), nc(ns), ao(ns), eo(ns);
+  std::vector<Real> eff;
+  int tot = 0;
+  for (int s = 0; s < ns; ++s) {
+    L[s] = b.shells[s].l;
+    np[s] = b.shells[s].nprim();
+    nc[s] = b.shells[s].nctr();
+    ao[s] = b.ao_off[s];
+    eo[s] = tot;
+    tot += np[s] * nc[s];
+  }
+  eff.resize(tot);
+  for (int s = 0; s < ns; ++s)
+    for (int c = 0; c < nc[s]; ++c)
+      for (int p = 0; p < np[s]; ++p)
+        eff[eo[s] + c * np[s] + p] = effective_coeff(b.shells[s], c, p);
+  ContractedDev<Real> dv;
+  dv.eff = to_device(eff, tag);
+  dv.eoff = to_device(eo, "intti::cdev::eoff");
+  dv.L = to_device(L, "intti::cdev::L");
+  dv.nprim = to_device(np, "intti::cdev::np");
+  dv.nctr = to_device(nc, "intti::cdev::nc");
+  dv.aoff = to_device(ao, "intti::cdev::ao");
+  return dv;
+}
+
+template <class Real>
+std::vector<Real> coulomb_2c_dev(const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+  const int naux = aux.nao, ns = static_cast<int>(aux.shells.size());
+  auto dv = to_contracted_dev(aux, "intti::c2cc::eff");
+  // primitive ghost-quartets for canonical shell pairs A>=B, all (pa,pb)
+  std::vector<ShellPair<Real>> plist;
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> qA, qB, qpa, qpb;
+  for (int A = 0; A < ns; ++A)
+    for (int B = 0; B <= A; ++B)
+      for (int pa = 0; pa < aux.shells[A].nprim(); ++pa)
+        for (int pb = 0; pb < aux.shells[B].nprim(); ++pb) {
+          const int ib = static_cast<int>(plist.size());
+          plist.push_back(ghost_pair(contracted_prim(aux.shells[A], pa)));
+          const int ik = static_cast<int>(plist.size());
+          plist.push_back(ghost_pair(contracted_prim(aux.shells[B], pb)));
+          quartets.push_back({ib, ik});
+          qA.push_back(A); qB.push_back(B); qpa.push_back(pa); qpb.push_back(pb);
+        }
+  auto tab = make_pair_table(plist);
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::c2cc::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+  auto dqA = to_device(qA, "intti::c2cc::A"), dqB = to_device(qB, "intti::c2cc::B");
+  auto dqpa = to_device(qpa, "intti::c2cc::pa"), dqpb = to_device(qpb, "intti::c2cc::pb");
+  auto offv = batch.out_offset;
+  auto eff = dv.eff, Lv = dv.L, npv = dv.nprim, ncv = dv.nctr, aov = dv.aoff, eov = dv.eoff;
+  Kokkos::View<Real *> Md("intti::c2cc::M", static_cast<std::size_t>(naux) * naux);
+  Kokkos::parallel_for(
+      "intti::c2cc::scatter", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int iq) {
+        const int A = dqA(iq), B = dqB(iq), pa = dqpa(iq), pb = dqpb(iq);
+        const int lA = Lv(A), lB = Lv(B), nP = ncart(lA), nQ = ncart(lB);
+        const int base = offv(iq);
+        for (int cA = 0; cA < ncv(A); ++cA) {
+          const Real wa = eff(eov(A) + cA * npv(A) + pa);
+          if (wa == Real(0)) continue;
+          for (int cB = 0; cB < ncv(B); ++cB) {
+            const Real w = wa * eff(eov(B) + cB * npv(B) + pb);
+            if (w == Real(0)) continue;
+            for (int kP = 0; kP < nP; ++kP)
+              for (int kQ = 0; kQ < nQ; ++kQ) {
+                const std::size_t I = aov(A) + static_cast<std::size_t>(cA) * nP + kP;
+                const std::size_t J = aov(B) + static_cast<std::size_t>(cB) * nQ + kQ;
+                const Real v = w * out(base + kP * nQ + kQ);
+                Kokkos::atomic_add(&Md(I * naux + J), v);
+                if (I != J) Kokkos::atomic_add(&Md(J * naux + I), v);
+              }
+          }
+        }
+      });
+  return to_host(Md);
+}
+
+template <class Real>
+std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
+                                 const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nso = static_cast<int>(orb.shells.size()), nsa = static_cast<int>(aux.shells.size());
+  auto ov = to_contracted_dev(orb, "intti::c3cc::oeff");
+  auto av = to_contracted_dev(aux, "intti::c3cc::aeff");
+  std::vector<ShellPair<Real>> plist;
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> qM, qN, qA, qpm, qpn, qpa;
+  for (int M = 0; M < nso; ++M)
+    for (int N = 0; N <= M; ++N)
+      for (int A = 0; A < nsa; ++A)
+        for (int pm = 0; pm < orb.shells[M].nprim(); ++pm)
+          for (int pn = 0; pn < orb.shells[N].nprim(); ++pn)
+            for (int pa = 0; pa < aux.shells[A].nprim(); ++pa) {
+              const int ib = static_cast<int>(plist.size());
+              plist.push_back(make_pair(contracted_prim(orb.shells[M], pm),
+                                        contracted_prim(orb.shells[N], pn)));
+              const int ik = static_cast<int>(plist.size());
+              plist.push_back(ghost_pair(contracted_prim(aux.shells[A], pa)));
+              quartets.push_back({ib, ik});
+              qM.push_back(M); qN.push_back(N); qA.push_back(A);
+              qpm.push_back(pm); qpn.push_back(pn); qpa.push_back(pa);
+            }
+  auto tab = make_pair_table(plist);
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::c3cc::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+  auto dM = to_device(qM, "intti::c3cc::M"), dN = to_device(qN, "intti::c3cc::N");
+  auto dA = to_device(qA, "intti::c3cc::A"), dpm = to_device(qpm, "intti::c3cc::pm");
+  auto dpn = to_device(qpn, "intti::c3cc::pn"), dpa = to_device(qpa, "intti::c3cc::pa");
+  auto offv = batch.out_offset;
+  auto oeff = ov.eff, oL = ov.L, onp = ov.nprim, onc = ov.nctr, oao = ov.aoff, oeo = ov.eoff;
+  auto aeff = av.eff, aL = av.L, anp = av.nprim, anc = av.nctr, aao = av.aoff, aeo = av.eoff;
+  Kokkos::View<Real *> Td("intti::c3cc::T", static_cast<std::size_t>(nao) * nao * naux);
+  Kokkos::parallel_for(
+      "intti::c3cc::scatter", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int iq) {
+        const int M = dM(iq), N = dN(iq), A = dA(iq), pm = dpm(iq), pn = dpn(iq), pa = dpa(iq);
+        const int nm = ncart(oL(M)), nn = ncart(oL(N)), nP = ncart(aL(A));
+        const int base = offv(iq);
+        const bool offdiag = (M != N);
+        for (int cM = 0; cM < onc(M); ++cM) {
+          const Real wm = oeff(oeo(M) + cM * onp(M) + pm);
+          if (wm == Real(0)) continue;
+          for (int cN = 0; cN < onc(N); ++cN) {
+            const Real wmn = wm * oeff(oeo(N) + cN * onp(N) + pn);
+            if (wmn == Real(0)) continue;
+            for (int cA = 0; cA < anc(A); ++cA) {
+              const Real w = wmn * aeff(aeo(A) + cA * anp(A) + pa);
+              if (w == Real(0)) continue;
+              for (int km = 0; km < nm; ++km)
+                for (int kn = 0; kn < nn; ++kn)
+                  for (int kP = 0; kP < nP; ++kP) {
+                    const std::size_t I = oao(M) + static_cast<std::size_t>(cM) * nm + km;
+                    const std::size_t Jn = oao(N) + static_cast<std::size_t>(cN) * nn + kn;
+                    const std::size_t P = aao(A) + static_cast<std::size_t>(cA) * nP + kP;
+                    const Real v = w * out(base + (km * nn + kn) * nP + kP);
+                    Kokkos::atomic_add(&Td((I * nao + Jn) * naux + P), v);
+                    if (offdiag) Kokkos::atomic_add(&Td((Jn * nao + I) * naux + P), v);
+                  }
+            }
+          }
+        }
+      });
+  return to_host(Td);
+}
+
 } // namespace detail
 
 /// Two-center Coulomb metric (P|Q) over an auxiliary basis: naux x naux,
@@ -291,6 +453,8 @@ std::vector<Real> coulomb_3c_auxblock(const ShellBasis<Real> &orb,
 /// (naux x naux, PySCF cart=True normalization).
 template <class Real>
 std::vector<Real> coulomb_2c(const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+  if constexpr (kokkos_scalar_v<Real>)
+    return detail::coulomb_2c_dev(aux, grid);
   const int naux = aux.nao;
   std::vector<Real> M(static_cast<std::size_t>(naux) * naux, Real(0));
   const int ns = static_cast<int>(aux.shells.size());
@@ -340,6 +504,8 @@ std::vector<Real> coulomb_2c(const ContractedBasis<Real> &aux, const TGrid<Real>
 template <class Real>
 std::vector<Real> coulomb_3c(const ContractedBasis<Real> &orb,
                              const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+  if constexpr (kokkos_scalar_v<Real>)
+    return detail::coulomb_3c_dev(orb, aux, grid);
   const int nao = orb.nao, naux = aux.nao;
   std::vector<Real> T(static_cast<std::size_t>(nao) * nao * naux, Real(0));
   const int nso = static_cast<int>(orb.shells.size());
