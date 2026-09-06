@@ -612,9 +612,21 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (mu lambda|n s) and Y_k = eps_kij d^2/ddelta_i deta_j F -- differentiating the
   raw operator via centre shifts, an independent oracle -- to FD accuracy on all
   three components, plus the antisymmetry Y_k = -Y_k^T (full suite green).
-  Remaining M17: the SOMF/AMFI mean-field contraction (the exchange-type SO term
-  and the spin-coupling coefficients) folding {Y_k} into an effective 1e SO Fock
-  matrix, and a PySCF int2e_p1vxp1 cross-check. The Coulomb-type build here is
+  Operator pinned to PySCF/libcint (prototype/soc_pyscf.py, 2026-09-06):
+  int2e_p1vxp1 == eps_kij * int2e_ipvip1 to machine precision (s, s/p/d, and
+  H2O/cc-pVDZ; max 1.8e-15), i.e. the by-parts reduction reproduces libcint's
+  canonical SSO integral exactly. Validation chain: C++ FD shows the builder
+  computes eps_kij(d_i mu d_j lambda|nu sigma) vs coulomb_build; coulomb_build/
+  eri_quartet is facade-validated vs PySCF int2e_cart to 1e-12; this script pins
+  that reduction to int2e_p1vxp1. Exchange-type build DONE (2026-09-06):
+  spin_orbit_2e_exchange, Ke_k,us = sum_ln D_ln (u l|SO_k|n s) (density bridges
+  one e1 and one e2 index); shares detail::spin_orbit_2e_block with the Coulomb
+  build; FD-validated. Remaining M17: fold {1e SO, Y_k (Coulomb), Ke_k
+  (exchange)} into a spin-orbit mean-field (SOMF/AMFI) effective one-electron
+  operator. The mean-field linear combination + coefficients are a downstream
+  Breit-Pauli modelling choice and are NOT fixed in-library: there is no shipped
+  PySCF molecular SOMF to validate the coefficients against, and the hard-oracle
+  rule forbids asserting them untested. The Coulomb/exchange builds are
   correctness-first O(N^4); the fused/screened version is a later optimisation.
 
 - **M18 — GPU + performance engineering**: table-driven bit-packed Hermite
