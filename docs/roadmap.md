@@ -678,10 +678,17 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   KOKKOS_INLINE_FUNCTION). Exact (tau=0) -> device; screened (tau>0) + __float128
   keep the host symmetry-replay build. Validated by EriGrad force-vs-FD and
   EriGrad.ScreeningMatchesExact (device exact == host canonical+8-fold+screened).
-  Remaining M18 Tier 2: the 2e Hessian (erihess), RI gradient (rigrad), GIAO 2e
-  (giao2e), three-electron (threeel/threeel_ri) and spin-orbit (soc) -- same
-  batched-quartet-consumer pattern (LKC/SHARK #2). Production follow-ups for the
-  2e gradient: reinstate the 8-fold symmetry and stream/chunk the quartet list
+  2e spin-orbit DONE (2026-09-06): spin_orbit_2e_coulomb and
+  spin_orbit_2e_exchange ported via a shared build_so2e_batch (the 4 shifted-bra
+  blocks x unshifted ket per ordered quartet in one eri_quartets call); the
+  digestion applies eps_kij (d_i mu)(d_j lambda) (so_terms, KOKKOS_INLINE) and
+  scatters with atomics -- Coulomb contracts D over (nu,sigma) -> Y_k[mu,lambda],
+  exchange over (lambda,nu) -> Ke_k[mu,sigma]. Validated vs the reduction-free
+  centre-FD oracles + antisymmetry. Remaining M18 Tier 2: the 2e Hessian
+  (erihess), RI gradient (rigrad), GIAO 2e (giao2e), three-electron (threeel/
+  threeel_ri), and the contracted ncenter overloads -- same batched-quartet-
+  consumer pattern (LKC/SHARK #2). Production follow-ups for the 2e derivative/SO
+  builds: reinstate the 8-fold symmetry and stream/chunk the quartet list
   (materialised now, O(ns^4) at tau=0, so large systems need screening +
   streaming).
   Build note: this box's /tmp is a 25 GB tmpfs quota shared with other sessions'
