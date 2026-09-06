@@ -26,6 +26,7 @@
 #include "hermite1d.hpp"
 #include "math.hpp"
 #include "multipole.hpp"
+#include "oneel.hpp" // detail::make_1e_pairs (device pair table + side arrays)
 #include "tgrid.hpp"
 
 namespace intti {
@@ -257,6 +258,79 @@ void nuclear_moment_accumulate(const ShellBasis<Real> &basis,
     }
 }
 
+// Device (GPU) nuclear attraction, exact (no screening / FMM). Same t-quadrature
+// as attraction_pair_block, on a Kokkos parallel_for over canonical shell pairs:
+// E is precomputed on the host (make_1e_pairs); per pair the charge x t-node
+// loop computes hermite_b on device once per (charge,t) and accumulates the
+// axis-factorised block straight into V (and its transpose for a != b), so no
+// large per-thread buffer is needed. la+lb <= 2*LMAX bounds the B stack arrays.
+template <class Real>
+std::vector<Real> nuclear_matrix_dev(const ShellBasis<Real> &basis,
+                                     const std::vector<PointCharge<Real>> &charges,
+                                     const TGrid<Real> &grid) {
+  const int nao = basis.nao;
+  auto op = detail::make_1e_pairs(basis, 0, 0, Real(0)); // exact: all pairs
+  const int npair = op.npair, nt = grid.n(), npc = static_cast<int>(charges.size());
+  auto tv = detail::to_device(grid.t, "intti::nuc::t");
+  auto wv = detail::to_device(grid.w, "intti::nuc::w");
+  std::vector<Real> hcw(npc);
+  for (int c = 0; c < npc; ++c) hcw[c] = charges[c].weight;
+  auto cw = detail::to_device(hcw, "intti::nuc::cw");
+  Kokkos::View<Real *[3], Kokkos::LayoutLeft> cR("intti::nuc::cR", npc);
+  {
+    auto h = Kokkos::create_mirror_view(cR);
+    for (int c = 0; c < npc; ++c)
+      for (int d = 0; d < 3; ++d) h(c, d) = charges[c].R[d];
+    Kokkos::deep_copy(cR, h);
+  }
+  Kokkos::View<Real *> Vd("intti::nuc::V", static_cast<std::size_t>(nao) * nao);
+  auto pv = op.tab.p, Ev = op.tab.E;
+  auto Pv = op.tab.P;
+  auto lav = op.tab.la, lbv = op.tab.lb, eoffv = op.tab.e_off, aoa = op.aoa, aob = op.aob;
+  const Real pi = pi_v<Real>();
+  Kokkos::parallel_for(
+      "intti::nuc::asm", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        const int la = lav(p), lb = lbv(p), n1 = la + lb + 1;
+        const int esz = (la + 1) * (lb + 1) * n1;
+        const Real pp = pv(p);
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        const bool mirror = (oa != ob);
+        const Real Px = Pv(p, 0), Py = Pv(p, 1), Pz = Pv(p, 2);
+        Real Bx[2 * LMAX + 1], By[2 * LMAX + 1], Bz[2 * LMAX + 1];
+        for (int c = 0; c < npc; ++c) {
+          const Real Rx = cR(c, 0), Ry = cR(c, 1), Rz = cR(c, 2), wc = cw(c);
+          for (int it = 0; it < nt; ++it) {
+            const Real t = tv(it), denom = pp + t * t, theta = pp * t * t / denom;
+            const Real pref = sqrt_(pi / denom), wt = wv(it) * wc;
+            hermite_b(la + lb, theta, Px - Rx, Bx);
+            hermite_b(la + lb, theta, Py - Ry, By);
+            hermite_b(la + lb, theta, Pz - Rz, Bz);
+            for (int ka = 0; ka < ncart(la); ++ka) {
+              int a3[3];
+              cart_comp(la, ka, a3[0], a3[1], a3[2]);
+              for (int kb = 0; kb < ncart(lb); ++kb) {
+                int b3[3];
+                cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+                Real g[3];
+                for (int d = 0; d < 3; ++d) {
+                  const Real *Ed = &Ev(eo + d * esz + (a3[d] * (lb + 1) + b3[d]) * n1);
+                  const Real *B = (d == 0 ? Bx : (d == 1 ? By : Bz));
+                  Real s = 0;
+                  for (int tt = 0; tt <= a3[d] + b3[d]; ++tt) s += Ed[tt] * B[tt];
+                  g[d] = pref * s;
+                }
+                const Real val = wt * g[0] * g[1] * g[2];
+                const int r = oa + ka, cc = ob + kb;
+                Vd(static_cast<std::size_t>(r) * nao + cc) += val;
+                if (mirror) Vd(static_cast<std::size_t>(cc) * nao + r) += val;
+              }
+            }
+          }
+        }
+      });
+  return detail::to_host(Vd);
+}
+
 } // namespace detail
 
 /// Nuclear attraction matrix V_ab = -sum_C Z_C <a|1/|r-R_C||b> (matches
@@ -266,6 +340,15 @@ std::vector<Real> nuclear_matrix(const ShellBasis<Real> &basis,
                                  const std::vector<PointCharge<Real>> &charges,
                                  const TGrid<Real> &grid, Real tau = Real(0),
                                  Real far_tau = Real(0)) {
+  if constexpr (kokkos_scalar_v<Real>) {
+    // exact case -> GPU; screening / FMM / l > LMAX keep the host path
+    if (tau == Real(0) && far_tau == Real(0)) {
+      bool ok = true;
+      for (const auto &s : basis.shells)
+        if (s.l > LMAX) ok = false;
+      if (ok) return detail::nuclear_matrix_dev(basis, charges, grid);
+    }
+  }
   std::vector<Real> V(static_cast<std::size_t>(basis.nao) * basis.nao, Real(0));
   // charges here already carry weight = -Z (caller sets it); provide a helper
   detail::attraction_accumulate(basis, charges, grid, tau, V.data(), far_tau);
