@@ -659,10 +659,19 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   float/double/long double -> device, __float128/class-type -> the serial host
   loop (Kokkos cannot run float128), so arbitrary precision stays a host
   capability. nuclear keeps the host path for screening/FMM/l>LMAX. Full suite
-  229/229. Remaining M18: Tier 2 -- rewrite the derivative, GIAO, spin-orbit and
-  ncenter builders as batched-quartet consumers (enumerate all shifted quartets,
-  hand them to eri_quartets as one batch, scatter on device), the LKC-consumer
-  pattern (SHARK #2). Precision note: the analytic path in double already hits
+  229/229. ncenter RI 2c/3c DONE (2026-09-06): primitive coulomb_2c/coulomb_3c
+  batch all ghost-shell quartets into one eri_quartets call (class-sorted) and
+  scatter on device -- the last host piece of the RI-JK spine. __float128, the
+  3c far-field, and the contracted-basis overloads + coulomb_3c_auxblock keep
+  the host path (the contracted ones await an eri_quartets_accumulate coeff+
+  segment port). Remaining M18 Tier 2 -- rewrite the derivative (erigrad/
+  erihess/geoderiv/geohess/rigrad), GIAO (giao/giao2e), three-electron (threeel/
+  threeel_ri) and spin-orbit (soc) builders as batched-quartet consumers
+  (enumerate the promoted/demoted quartets, hand them to eri_quartets as one
+  batch, contract on device), the LKC-consumer pattern (SHARK #2); for the
+  derivative builds the 8-fold symmetry replay can be dropped in the first device
+  pass (evaluate all quartets, they are cheap and parallel on device) and
+  reinstated later. Precision note: the analytic path in double already hits
   ~1e-13/1e-14 (validated 1e-12 vs PySCF), well below the 1 nEh target; the
   t-grid node count grows only ~log(1/eps) so tightening is cheap; >double needs
   the host float128 path (no GPU).
