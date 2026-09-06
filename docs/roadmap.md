@@ -17,8 +17,18 @@ approved plan) is under way and mostly delivered:
   resolution -- the distinctive t-quadrature capability; analytic-Boys codes can't
   vary omega per point). Validated (2026-09-06): full-omega reduces to the global
   local_exchange at machine precision, and |E_x| grows monotonically as omega
-  admits more of the t-range (suite 228/228). Remaining M14: the KS potential
-  (Fock-like) matrix from the local-hybrid energy (a(r)-weighted K), for SCF.
+  admits more of the t-range (suite 228/228).
+  SCOPE (user, 2026-09-06): the M14 INTEGRALS side is complete -- eps_x^HF(r),
+  position-dependent omega(r) LRSH, and the potential collocation / screened
+  nuclear attraction. The full local-hybrid KS potential matrix is NOT in scope:
+  F = d/dD integral [a(r) eps_x^HF + (1-a) eps_x^DFA + eps_c^DFA] needs libxc for
+  the DFA exchange+correlation terms, and even the exact-exchange term's
+  derivative carries the local-hybrid gauge / da/drho corrections -- both are DFT-
+  program territory. libintti supplies the integrals + the grid/AO/density
+  quadrature substrate with libxc as an OPTIONAL pointwise v_xc callback; a
+  local-hybrid DFT DRIVER assembles the KS matrix from those + libxc. (Corrects an
+  earlier note that listed the KS matrix as a remaining M14 item -- that was scope
+  creep.)
 - **M16 (in progress)** — derivative integrals, `deriv.hpp`: one-electron
   gradient set complete (overlap/kinetic/nuclear, vs PySCF `int1e_ip*` and
   finite difference); two-electron gradient (`erigrad.hpp`) and arbitrary-order
