@@ -31,8 +31,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
+#include "device.hpp"
 #include "math.hpp"
 #include "tgrid.hpp"
 
@@ -49,8 +51,10 @@ namespace detail {
 
 /// Cartesian product coefficients T_u of (x-A)^la (x-D)^ld = sum_u T_u (x-P)^u,
 ///   T_u = sum_{k+m=u} C(la,k)(P-A)^{la-k} C(ld,m)(P-D)^{ld-m}.
+/// Writes T[0..la+ld]; the caller owns the storage (a std::vector on the host,
+/// a stack array in the device kernel), which is what makes this device-callable.
 template <class Real>
-void te_prod_coeffs(int la, Real PA, int ld, Real PD, std::vector<Real> &T) {
+KOKKOS_INLINE_FUNCTION void te_prod_coeffs(int la, Real PA, int ld, Real PD, Real *T) {
   auto C = [](int n, int k) {
     double r = 1;
     for (int i = 0; i < k; ++i) r = r * (n - i) / (i + 1);
@@ -61,7 +65,7 @@ void te_prod_coeffs(int la, Real PA, int ld, Real PD, std::vector<Real> &T) {
     for (int i = 0; i < n; ++i) r *= x;
     return r;
   };
-  T.assign(la + ld + 1, Real(0));
+  for (int u = 0; u <= la + ld; ++u) T[u] = Real(0);
   for (int k = 0; k <= la; ++k)
     for (int m = 0; m <= ld; ++m)
       T[k + m] += Real(C(la, k)) * ipow(PA, la - k) * Real(C(ld, m)) * ipow(PD, ld - m);
@@ -72,7 +76,7 @@ void te_prod_coeffs(int la, Real PA, int ld, Real PD, std::vector<Real> &T) {
 template <class Real> struct Mat3 {
   Real m[3][3];
 };
-template <class Real> Mat3<Real> te_inv3(const Mat3<Real> &A, Real &det) {
+template <class Real> KOKKOS_INLINE_FUNCTION Mat3<Real> te_inv3(const Mat3<Real> &A, Real &det) {
   const auto &a = A.m;
   const Real c00 = a[1][1] * a[2][2] - a[1][2] * a[2][1];
   const Real c01 = -(a[1][0] * a[2][2] - a[1][2] * a[2][0]);
@@ -95,11 +99,13 @@ template <class Real> Mat3<Real> te_inv3(const Mat3<Real> &A, Real &det) {
 /// Sigma, tabulated for i<=Im, j<=Jm, k<=Km via the Isserlis (Stein) recurrence
 /// E[e_a prod] = sum_b Sigma_ab E[d_{e_b} prod]; reducing the first positive
 /// index references only strictly earlier table entries.
+/// Written into the caller's buffer c, of at least (Im+1)(Jm+1)(Km+1) reals.
 template <class Real>
-std::vector<Real> te_central_moments(const Real Sig[3][3], int Im, int Jm, int Km) {
+KOKKOS_INLINE_FUNCTION void te_central_moments(const Real Sig[3][3], int Im, int Jm, int Km,
+                                               Real *c) {
   const int SJ = Jm + 1, SK = Km + 1;
   auto id = [&](int i, int j, int k) { return (i * SJ + j) * SK + k; };
-  std::vector<Real> c(static_cast<std::size_t>(Im + 1) * SJ * SK, Real(0));
+  for (int i = 0; i < (Im + 1) * SJ * SK; ++i) c[i] = Real(0);
   auto get = [&](int i, int j, int k) -> Real {
     if (i < 0 || j < 0 || k < 0) return Real(0);
     return c[id(i, j, k)];
@@ -121,7 +127,35 @@ std::vector<Real> te_central_moments(const Real Sig[3][3], int Im, int Jm, int K
           v = Real(k - 1) * Sig[2][2] * get(i, j, k - 2);
         c[id(i, j, k)] = v;
       }
-  return c;
+}
+
+/// Per-direction product orders of the three pair densities, and the moment
+/// table extents they induce. `moment` != 0 raises every extent by 2 (the
+/// inserted r12^2 / r12.r13 factors).
+template <class Real>
+KOKKOS_INLINE_FUNCTION void te_orders(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                                      const CartGauss<Real> &c, const CartGauss<Real> &d,
+                                      const CartGauss<Real> &e, const CartGauss<Real> &f,
+                                      int moment, int mP[3], int mQ[3], int mS[3], int &Im,
+                                      int &Jm, int &Km) {
+  auto mx3 = [](int x, int y, int z) { return x > y ? (x > z ? x : z) : (y > z ? y : z); };
+  for (int i = 0; i < 3; ++i) {
+    mP[i] = a.l[i] + d.l[i];
+    mQ[i] = b.l[i] + e.l[i];
+    mS[i] = c.l[i] + f.l[i];
+  }
+  const int ext = moment ? 2 : 0;
+  Im = mx3(mP[0], mP[1], mP[2]) + ext;
+  Jm = mx3(mQ[0], mQ[1], mQ[2]) + ext;
+  Km = mx3(mS[0], mS[1], mS[2]) + ext; // r12.r13 raises S by 1
+}
+
+/// Reals of scratch te_core_impl needs for order bound SB = max(Im,Jm,Km)+1:
+/// the central-moment table (SB^3), the binomials (SB^2), the nine per-direction
+/// product-coefficient vectors (9 SB) and the three mean-power tables.
+constexpr std::size_t te_scratch_size(int SB) {
+  return static_cast<std::size_t>(SB) * SB * SB + static_cast<std::size_t>(SB) * SB +
+         static_cast<std::size_t>(9) * SB + static_cast<std::size_t>(3) * (SB + 3);
 }
 
 /// One quadrature node for an inter-electronic operator: the operator, sampled
@@ -172,11 +206,18 @@ std::vector<OpNode<Real>> geminal_over_r_nodes(const std::vector<Real> &c,
 /// {(4 g_k g_l c_k c_l, sqrt(g_k+g_l))} give (grad_1 f12).(grad_1 f12). The
 /// r12.r13 moment gives the cross gradient (grad_1 f12).(grad_1 f13) with
 /// Gaussian nodes on both slots, an F12 commutator / B-matrix ingredient.
+/// The single implementation, shared by the host and device paths: the node
+/// lists arrive as raw arrays and all scratch as one caller-owned flat block
+/// `sc` of at least te_scratch_size(max(Im,Jm,Km)+1) reals, so the same code
+/// runs off std::vector on the host and off a stack array in a device kernel.
+/// `pi` is passed in because pi_v is host-only.
 template <class Real>
-Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss<Real> &c,
-             const CartGauss<Real> &d, const CartGauss<Real> &e, const CartGauss<Real> &f,
-             const std::vector<OpNode<Real>> &nodes12,
-             const std::vector<OpNode<Real>> &nodes13, int moment) {
+KOKKOS_INLINE_FUNCTION Real te_core_impl(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                                         const CartGauss<Real> &c, const CartGauss<Real> &d,
+                                         const CartGauss<Real> &e, const CartGauss<Real> &f,
+                                         const OpNode<Real> *nodes12, int nn12,
+                                         const OpNode<Real> *nodes13, int nn13, int moment,
+                                         Real pi, Real *sc) {
   auto pairdens = [](const CartGauss<Real> &x, const CartGauss<Real> &y, Real &alpha,
                      Real R[3], Real &K) {
     alpha = x.alpha + y.alpha;
@@ -198,34 +239,39 @@ Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss
     DPQ[i] = RP[i] - RQ[i];
     DPS[i] = RP[i] - RS[i];
   }
-  // per-direction product coefficients and max angular indices
-  std::vector<Real> TP[3], TQ[3], TS[3];
-  int mP[3], mQ[3], mS[3];
+  // per-direction max angular indices and the moment-table extents
+  int mP[3], mQ[3], mS[3], Im, Jm, Km;
+  te_orders(a, b, c, d, e, f, moment, mP, mQ, mS, Im, Jm, Km);
+  const int SB = (Im > Jm ? (Im > Km ? Im : Km) : (Jm > Km ? Jm : Km)) + 1;
+  // carve the flat scratch block (layout mirrors te_scratch_size)
+  Real *cmom = sc;
+  Real *Cb = cmom + static_cast<std::size_t>(SB) * SB * SB;
+  Real *Tb = Cb + static_cast<std::size_t>(SB) * SB;
+  Real *P0 = Tb + static_cast<std::size_t>(9) * SB, *P1 = P0 + SB + 3, *P2 = P1 + SB + 3;
+  Real *TP[3] = {Tb, Tb + SB, Tb + 2 * SB};
+  Real *TQ[3] = {Tb + 3 * SB, Tb + 4 * SB, Tb + 5 * SB};
+  Real *TS[3] = {Tb + 6 * SB, Tb + 7 * SB, Tb + 8 * SB};
+  // per-direction product coefficients
   for (int i = 0; i < 3; ++i) {
     te_prod_coeffs(a.l[i], RP[i] - a.center[i], d.l[i], RP[i] - d.center[i], TP[i]);
     te_prod_coeffs(b.l[i], RQ[i] - b.center[i], e.l[i], RQ[i] - e.center[i], TQ[i]);
     te_prod_coeffs(c.l[i], RS[i] - c.center[i], f.l[i], RS[i] - f.center[i], TS[i]);
-    mP[i] = a.l[i] + d.l[i];
-    mQ[i] = b.l[i] + e.l[i];
-    mS[i] = c.l[i] + f.l[i];
   }
-  const int ext = moment ? 2 : 0;
-  const int Im = std::max({mP[0], mP[1], mP[2]}) + ext;
-  const int Jm = std::max({mQ[0], mQ[1], mQ[2]}) + ext;
-  const int Km = std::max({mS[0], mS[1], mS[2]}) + ext; // r12.r13 raises S by 1
-  // binomials up to the orders we need
-  const int Bn = std::max({Im, Jm, Km}) + 1;
-  std::vector<std::vector<Real>> C(Bn, std::vector<Real>(Bn, Real(0)));
+  // binomials up to the orders we need (row stride SB)
+  const int Bn = SB;
+  auto C = [&](int n, int k) -> Real { return Cb[n * SB + k]; };
   for (int n = 0; n < Bn; ++n) {
-    C[n][0] = 1;
-    for (int k = 1; k <= n; ++k) C[n][k] = C[n - 1][k - 1] + C[n - 1][k];
+    for (int k = 0; k < Bn; ++k) Cb[n * SB + k] = Real(0);
+    Cb[n * SB] = 1;
+    for (int k = 1; k <= n; ++k) Cb[n * SB + k] = C(n - 1, k - 1) + C(n - 1, k);
   }
-  const Real pi = pi_v<Real>();
   const Real pi92 = pi * pi * pi * pi * sqrt_(pi);
   Real acc = 0;
-  for (const auto &n12 : nodes12) {
+  for (int i12 = 0; i12 < nn12; ++i12) {
+    const OpNode<Real> &n12 = nodes12[i12];
     const Real t2 = n12.t * n12.t;
-    for (const auto &n13 : nodes13) {
+    for (int i13 = 0; i13 < nn13; ++i13) {
+      const OpNode<Real> &n13 = nodes13[i13];
       const Real s2 = n13.t * n13.t;
       Mat3<Real> A;
       A.m[0][0] = aP + t2 + s2;
@@ -239,7 +285,7 @@ Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss
       Real Sig[3][3];
       for (int p = 0; p < 3; ++p)
         for (int q = 0; q < 3; ++q) Sig[p][q] = Ai.m[p][q] / 2;
-      const auto cmom = te_central_moments(Sig, Im, Jm, Km);
+      te_central_moments(Sig, Im, Jm, Km, cmom);
       const int SJ = Jm + 1, SK = Km + 1;
       auto cm = [&](int i, int j, int k) { return cmom[(i * SJ + j) * SK + k]; };
       const Real prefac = pi92 / (det * sqrt_(det));
@@ -254,17 +300,17 @@ Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss
         const Real c0 = t2 * dpq * dpq + s2 * dps * dps;
         const Real base = exp_(b0 * mu0 + b1 * mu1 + b2 * mu2 - c0);
         // powers of the mean
-        std::vector<Real> P0(Im + 3, Real(1)), P1(Jm + 3, Real(1)), P2(Km + 3, Real(1));
-        for (int i = 1; i < (int)P0.size(); ++i) P0[i] = P0[i - 1] * mu0;
-        for (int i = 1; i < (int)P1.size(); ++i) P1[i] = P1[i - 1] * mu1;
-        for (int i = 1; i < (int)P2.size(); ++i) P2[i] = P2[i - 1] * mu2;
+        P0[0] = P1[0] = P2[0] = Real(1);
+        for (int i = 1; i < Im + 3; ++i) P0[i] = P0[i - 1] * mu0;
+        for (int i = 1; i < Jm + 3; ++i) P1[i] = P1[i - 1] * mu1;
+        for (int i = 1; i < Km + 3; ++i) P2[i] = P2[i - 1] * mu2;
         // raw moment E[(x1-RP)^nP (x2-RQ)^nQ (x3-RS)^nS] = shift by mean + central
         auto mom = [&](int nP, int nQ, int nS) {
           Real s = 0;
           for (int k1 = 0; k1 <= nP; ++k1)
             for (int k2 = 0; k2 <= nQ; ++k2)
               for (int k3 = 0; k3 <= nS; ++k3)
-                s += C[nP][k1] * C[nQ][k2] * C[nS][k3] * P0[nP - k1] * P1[nQ - k2] *
+                s += C(nP, k1) * C(nQ, k2) * C(nS, k3) * P0[nP - k1] * P1[nQ - k2] *
                      P2[nS - k3] * cm(k1, k2, k3);
           return s;
         };
@@ -300,6 +346,22 @@ Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss
     }
   }
   return Kad * Kbe * Kcf * acc;
+}
+
+/// Host entry: sizes the scratch from the actual angular momenta (so the host
+/// path stays unbounded in l) and calls the shared implementation.
+template <class Real>
+Real te_core(const CartGauss<Real> &a, const CartGauss<Real> &b, const CartGauss<Real> &c,
+             const CartGauss<Real> &d, const CartGauss<Real> &e, const CartGauss<Real> &f,
+             const std::vector<OpNode<Real>> &nodes12,
+             const std::vector<OpNode<Real>> &nodes13, int moment) {
+  int mP[3], mQ[3], mS[3], Im, Jm, Km;
+  te_orders(a, b, c, d, e, f, moment, mP, mQ, mS, Im, Jm, Km);
+  const int SB = (Im > Jm ? (Im > Km ? Im : Km) : (Jm > Km ? Jm : Km)) + 1;
+  std::vector<Real> sc(te_scratch_size(SB), Real(0));
+  return te_core_impl(a, b, c, d, e, f, nodes12.data(), static_cast<int>(nodes12.size()),
+                      nodes13.data(), static_cast<int>(nodes13.size()), moment,
+                      pi_v<Real>(), sc.data());
 }
 
 /// Unnormalised three-electron integral of six Cartesian Gaussians with
@@ -478,6 +540,163 @@ Real three_electron_kind(const CartGauss<Real> &a, const CartGauss<Real> &b,
   }
 }
 
+namespace detail {
+
+/// One sextet on the device. MO is the compile-time per-direction order bound
+/// (max over directions of l_a + l_d, plus 2 when a moment is inserted), so the
+/// whole te_core_impl scratch -- dominated by the (MO+1)^3 central-moment table
+/// -- fits in a thread stack array. That cube is why the device path is capped:
+/// at MO = 8 (f functions with a moment) it is already ~7 kB per thread in
+/// double precision, and it grows as l^3.
+template <class Real, int MO>
+KOKKOS_INLINE_FUNCTION Real te_sextet_dev(const CartGauss<Real> &a, const CartGauss<Real> &b,
+                                          const CartGauss<Real> &c, const CartGauss<Real> &d,
+                                          const CartGauss<Real> &e, const CartGauss<Real> &f,
+                                          const OpNode<Real> *n12, int nn12,
+                                          const OpNode<Real> *n13, int nn13, int moment,
+                                          Real pi) {
+  Real sc[te_scratch_size(MO + 1)];
+  return te_core_impl(a, b, c, d, e, f, n12, nn12, n13, nn13, moment, pi, sc);
+}
+
+/// Decode a flat sextet index into the six function indices, in the host loop
+/// order (a,d,b,e,c,f) so the device and host paths visit the same sextets.
+KOKKOS_INLINE_FUNCTION void te_decode_sextet(std::int64_t idx, std::int64_t n, int &ai,
+                                             int &di, int &bi, int &ei, int &ci, int &fi) {
+  std::int64_t r = idx;
+  fi = static_cast<int>(r % n);
+  r /= n;
+  ci = static_cast<int>(r % n);
+  r /= n;
+  ei = static_cast<int>(r % n);
+  r /= n;
+  bi = static_cast<int>(r % n);
+  r /= n;
+  di = static_cast<int>(r % n);
+  r /= n;
+  ai = static_cast<int>(r);
+}
+
+/// Device three-body driver over the full sextet space, one thread per sextet.
+/// With `F` non-null it does the Fock scatter (three atomic accumulations per
+/// sextet); otherwise it reduces the energy into `E`. The screening and
+/// zero-density tests mirror the host loops exactly, so both paths prune the
+/// identical set of sextets and the 3E identity survives.
+template <class Real, int MO>
+void three_electron_dev(const std::vector<CartGauss<Real>> &basis, const std::vector<Real> &D,
+                        const std::vector<OpNode<Real>> &op12,
+                        const std::vector<OpNode<Real>> &op13, int moment, Real screen,
+                        Real *E, std::vector<Real> *F) {
+  const int n = static_cast<int>(basis.size());
+  // te_norm is host-only (std::pow, pi_v): fold it per function here and let the
+  // kernel multiply the six looked-up values.
+  std::vector<Real> hN(n);
+  for (int i = 0; i < n; ++i) hN[i] = te_norm(basis[i]);
+  const auto o = te_pair_overlap_scale(basis);
+  std::vector<Real> hq(o.size());
+  Real qmax = 0;
+  for (std::size_t i = 0; i < o.size(); ++i) {
+    hq[i] = std::abs(D[i]) * o[i];
+    qmax = std::max(qmax, hq[i]);
+  }
+  const Real cut = screen * qmax * qmax * qmax;
+  auto bs = to_device(basis, "intti::te::basis");
+  auto Nv = to_device(hN, "intti::te::norm");
+  auto Dv = to_device(D, "intti::te::D");
+  auto qv = to_device(hq, "intti::te::q");
+  auto v12 = to_device(op12, "intti::te::op12");
+  auto v13 = to_device(op13, "intti::te::op13");
+  const int nn12 = static_cast<int>(op12.size()), nn13 = static_cast<int>(op13.size());
+  const Real pi = pi_v<Real>();
+  const std::int64_t nn = n;
+  const std::int64_t total = nn * nn * nn * nn * nn * nn;
+  Kokkos::View<Real *> Fd("intti::te::F", F ? static_cast<std::size_t>(n) * n : 0);
+  if (F) {
+    Kokkos::parallel_for(
+        "intti::three_electron_fock", Kokkos::RangePolicy<std::int64_t>(0, total),
+        KOKKOS_LAMBDA(std::int64_t idx) {
+          int ai, di, bi, ei, ci, fi;
+          te_decode_sextet(idx, nn, ai, di, bi, ei, ci, fi);
+          const std::int64_t iad = ai * nn + di, ibe = bi * nn + ei, icf = ci * nn + fi;
+          const Real Dad = Dv(iad), Dbe = Dv(ibe), Dcf = Dv(icf);
+          if (Dad == Real(0) && Dbe == Real(0) && Dcf == Real(0)) return;
+          if (qv(iad) * qv(ibe) * qv(icf) < cut) return;
+          const Real N = Nv(ai) * Nv(bi) * Nv(ci) * Nv(di) * Nv(ei) * Nv(fi);
+          const Real G = N * te_sextet_dev<Real, MO>(bs(ai), bs(bi), bs(ci), bs(di), bs(ei),
+                                                     bs(fi), &v12(0), nn12, &v13(0), nn13,
+                                                     moment, pi);
+          Kokkos::atomic_add(&Fd(iad), G * Dbe * Dcf);
+          Kokkos::atomic_add(&Fd(ibe), G * Dad * Dcf);
+          Kokkos::atomic_add(&Fd(icf), G * Dad * Dbe);
+        });
+    Kokkos::fence();
+    *F = to_host(Fd);
+  } else {
+    Real acc = 0;
+    Kokkos::parallel_reduce(
+        "intti::three_electron_energy", Kokkos::RangePolicy<std::int64_t>(0, total),
+        KOKKOS_LAMBDA(std::int64_t idx, Real &sum) {
+          int ai, di, bi, ei, ci, fi;
+          te_decode_sextet(idx, nn, ai, di, bi, ei, ci, fi);
+          const std::int64_t iad = ai * nn + di, ibe = bi * nn + ei, icf = ci * nn + fi;
+          const Real Dad = Dv(iad), Dbe = Dv(ibe), Dcf = Dv(icf);
+          if (Dad == Real(0) || Dbe == Real(0) || Dcf == Real(0)) return;
+          if (qv(iad) * qv(ibe) * qv(icf) < cut) return;
+          const Real N = Nv(ai) * Nv(bi) * Nv(ci) * Nv(di) * Nv(ei) * Nv(fi);
+          sum += Dad * Dbe * Dcf *
+                 N * te_sextet_dev<Real, MO>(bs(ai), bs(bi), bs(ci), bs(di), bs(ei), bs(fi),
+                                             &v12(0), nn12, &v13(0), nn13, moment, pi);
+        },
+        acc);
+    *E = acc;
+  }
+}
+
+/// Per-direction order bound MO the device path would need for this basis and
+/// operator kind, and the te_core `moment` selector for that kind.
+template <class Real>
+int te_device_order(const std::vector<CartGauss<Real>> &basis, int moment) {
+  int mo = 0;
+  for (const auto &g : basis)
+    for (int i = 0; i < 3; ++i) mo = std::max(mo, 2 * g.l[i]);
+  return mo + (moment ? 2 : 0);
+}
+
+/// Run the sextet loop on the device if the scalar is a device type and the
+/// angular momentum fits one of the instantiated stack-scratch bounds
+/// (l <= 1, 2, 3 with room for the moment extension). Returns false when the
+/// caller must fall back to the host loop.
+template <class Real>
+bool three_electron_try_dev(const std::vector<CartGauss<Real>> &basis,
+                            const std::vector<Real> &D, const std::vector<OpNode<Real>> &op12,
+                            const std::vector<OpNode<Real>> &op13, int moment, Real screen,
+                            Real *E, std::vector<Real> *F) {
+  if constexpr (kokkos_scalar_v<Real>) {
+    const int mo = te_device_order(basis, moment);
+    if (mo <= 4)
+      three_electron_dev<Real, 4>(basis, D, op12, op13, moment, screen, E, F);
+    else if (mo <= 6)
+      three_electron_dev<Real, 6>(basis, D, op12, op13, moment, screen, E, F);
+    else if (mo <= 8)
+      three_electron_dev<Real, 8>(basis, D, op12, op13, moment, screen, E, F);
+    else
+      return false; // beyond f: the (MO+1)^3 moment cube outgrows the stack
+    return true;
+  } else {
+    (void)basis;
+    (void)D;
+    (void)op12;
+    (void)op13;
+    (void)moment;
+    (void)screen;
+    (void)E;
+    (void)F;
+    return false; // long double / __float128: host only
+  }
+}
+
+} // namespace detail
+
 /// Three-body energy from a set of normalised Cartesian Gaussians and an AO
 /// density matrix D (n x n, row-major): the fully-contracted three-electron
 /// integral
@@ -496,6 +715,10 @@ Real three_electron_energy(const std::vector<CartGauss<Real>> &basis,
                            const std::vector<detail::OpNode<Real>> &op12,
                            const std::vector<detail::OpNode<Real>> &op13,
                            ThreeElOp kind = ThreeElOp::Plain, Real screen = 0) {
+  Real Edev = 0;
+  if (detail::three_electron_try_dev(basis, D, op12, op13, static_cast<int>(kind), screen,
+                                     &Edev, static_cast<std::vector<Real> *>(nullptr)))
+    return Edev;
   const int n = static_cast<int>(basis.size());
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * n + j]; };
   const auto o = detail::te_pair_overlap_scale(basis);
@@ -547,6 +770,11 @@ std::vector<Real> three_electron_fock(const std::vector<CartGauss<Real>> &basis,
                                       const std::vector<detail::OpNode<Real>> &op12,
                                       const std::vector<detail::OpNode<Real>> &op13,
                                       ThreeElOp kind = ThreeElOp::Plain, Real screen = 0) {
+  std::vector<Real> Fdev;
+  Real Edummy = 0;
+  if (detail::three_electron_try_dev(basis, D, op12, op13, static_cast<int>(kind), screen,
+                                     &Edummy, &Fdev))
+    return Fdev;
   const int n = static_cast<int>(basis.size());
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * n + j]; };
   const auto o = detail::te_pair_overlap_scale(basis);

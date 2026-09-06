@@ -405,4 +405,95 @@ TEST(ThreeEl, ScreeningPrunesNegligibleSextets) {
   EXPECT_NEAR(trace, 3 * Eloose, 1e-9 * std::abs(Eloose)) << "Euler under screening";
 }
 
+// Reference three-body energy and Fock: the plain sextet loop over the
+// single-integral entry point three_electron_kind, which is not device
+// dispatched. Same scalar, same quadrature nodes, same te_core -- so comparing
+// the builders against this isolates the device driver (index decode, screening,
+// atomic scatter) and its fixed-size stack scratch from everything else.
+void ref_e3_f3(const std::vector<G> &b, const std::vector<double> &D,
+               const std::vector<intti::detail::OpNode<double>> &op, intti::ThreeElOp kind,
+               double &E, std::vector<double> &F) {
+  const int n = static_cast<int>(b.size());
+  E = 0;
+  F.assign(static_cast<std::size_t>(n) * n, 0.0);
+  for (int a = 0; a < n; ++a)
+    for (int d = 0; d < n; ++d)
+      for (int bb = 0; bb < n; ++bb)
+        for (int e = 0; e < n; ++e)
+          for (int c = 0; c < n; ++c)
+            for (int f = 0; f < n; ++f) {
+              const double Dad = D[a * n + d], Dbe = D[bb * n + e], Dcf = D[c * n + f];
+              const double G6 = intti::three_electron_kind(b[a], b[bb], b[c], b[d], b[e],
+                                                           b[f], op, op, kind);
+              E += Dad * Dbe * Dcf * G6;
+              F[a * n + d] += G6 * Dbe * Dcf;
+              F[bb * n + e] += G6 * Dad * Dcf;
+              F[c * n + f] += G6 * Dad * Dbe;
+            }
+}
+
+TEST(ThreeEl, DeviceSextetPathMatchesHostLoop) {
+  // three_electron_energy/_fock send a device scalar to the batched kernel (one
+  // thread per sextet, all scratch in a stack array sized by a compile-time
+  // angular momentum bound MO). This pins that driver -- the scratch
+  // partitioning and the MO-cap dispatch -- against the direct sextet loop in
+  // the same precision. The numerics themselves are pinned independently by the
+  // SymPy / Gauss-Hermite references above.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const auto op = intti::detail::coulomb_nodes(grid);
+  // Both sides consume the same node list, so this comparison is independent of
+  // the quadrature: the high-l cases below use a short prefix of the grid to keep
+  // the serial reference affordable while still driving the full angular machinery.
+  const std::vector<intti::detail::OpNode<double>> ops(op.begin(), op.begin() + 5);
+  const std::vector<double> D = {1.0, 0.3, 0.3, 0.7};
+  // l = 1 selects the MO = 4 instantiation, and l = 2 selects MO = 4 (plain) /
+  // MO = 6 (with a moment's two extra orders).
+  for (int lmax : {1, 2}) {
+    const std::vector<G> b = {G{1.0, {0.0, 0.0, 0.0}, {0, 0, 0}},
+                              G{0.8, {0.5, 0.2, 0.0}, {lmax, 0, 0}}};
+    // both moments extend the tables identically, so d functions only need one
+    // of them to reach MO = 6; the cheap s/p case exercises all three operators.
+    std::vector<intti::ThreeElOp> kinds = {intti::ThreeElOp::Plain,
+                                           intti::ThreeElOp::R12sq};
+    if (lmax == 1) kinds.push_back(intti::ThreeElOp::CrossR12R13);
+    const auto &nd = lmax == 1 ? op : ops;
+    for (auto kind : kinds) {
+      const int k = static_cast<int>(kind);
+      double Eref;
+      std::vector<double> Fref;
+      ref_e3_f3(b, D, nd, kind, Eref, Fref);
+      const double E = intti::three_electron_energy(b, D, nd, nd, kind);
+      EXPECT_NEAR(E, Eref, 1e-13 * (std::abs(Eref) + 1)) << "l=" << lmax << " kind=" << k;
+      const auto F = intti::three_electron_fock(b, D, nd, nd, kind);
+      ASSERT_EQ(F.size(), Fref.size());
+      for (std::size_t i = 0; i < F.size(); ++i)
+        EXPECT_NEAR(F[i], Fref[i], 1e-13 * (std::abs(Fref[i]) + 1))
+            << "l=" << lmax << " kind=" << k << " i=" << i;
+    }
+  }
+  // The MO = 8 instantiation: f functions with a moment (2*3 + 2 = 8), one
+  // function so the sextet loop stays a single term.
+  {
+    const std::vector<G> b = {G{1.0, {0.0, 0.0, 0.0}, {3, 0, 0}}};
+    const std::vector<double> D1 = {1.0};
+    double Eref;
+    std::vector<double> Fref;
+    ref_e3_f3(b, D1, ops, intti::ThreeElOp::R12sq, Eref, Fref);
+    const double E = intti::three_electron_energy(b, D1, ops, ops, intti::ThreeElOp::R12sq);
+    EXPECT_NEAR(E, Eref, 1e-13 * (std::abs(Eref) + 1)) << "MO=8";
+  }
+  // Above the cap the device path must fall back to the host loop rather than
+  // overrun its stack scratch: a g function plus a moment would need MO = 10,
+  // past the largest instantiation.
+  {
+    const std::vector<G> b = {G{1.0, {0.0, 0.0, 0.0}, {4, 0, 0}}};
+    const std::vector<double> D1 = {1.0};
+    double Eref;
+    std::vector<double> Fref;
+    ref_e3_f3(b, D1, ops, intti::ThreeElOp::R12sq, Eref, Fref);
+    const double E = intti::three_electron_energy(b, D1, ops, ops, intti::ThreeElOp::R12sq);
+    EXPECT_NEAR(E, Eref, 1e-13 * (std::abs(Eref) + 1)) << "above the cap";
+  }
+}
+
 } // namespace
