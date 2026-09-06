@@ -212,6 +212,173 @@ std::vector<std::complex<Real>> giao_overlap_dev(const ShellBasis<Real> &basis,
   return S;
 }
 
+/// Device finite-field kinetic T(B), momentum form
+/// 1/2 sum_c <d_c omega_mu | d_c omega_nu>. Each London-orbital gradient is
+/// d_c omega = e^{i phi}(i a_c chi + d_c chi) with a = -1/2 B x (R-O), so the
+/// 1D factor per direction mixes the phase term (imaginary, index unchanged)
+/// with the ordinary MD shift (l+-1). Bra and ket are both extended by one.
+template <class Real>
+std::vector<std::complex<Real>> giao_kinetic_dev(const ShellBasis<Real> &basis,
+                                                 const Real B[3], const Real O[3]) {
+  using KC = Kokkos::complex<Real>;
+  const int nao = basis.nao;
+  const int ns = static_cast<int>(basis.shells.size());
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  auto gp = make_giao_1e_pairs(basis, B, 1, 1);
+  // vector potential a = -1/2 B x (R - O) at the bra and ket centres of each
+  // pair; pairs are ordered p = a*ns + b, matching make_giao_1e_pairs.
+  auto avec = [&](const Real R[3], Real o[3]) {
+    const Real w[3] = {R[0] - O[0], R[1] - O[1], R[2] - O[2]};
+    o[0] = -Real(0.5) * (B[1] * w[2] - B[2] * w[1]);
+    o[1] = -Real(0.5) * (B[2] * w[0] - B[0] * w[2]);
+    o[2] = -Real(0.5) * (B[0] * w[1] - B[1] * w[0]);
+  };
+  Kokkos::View<Real *[3], Kokkos::LayoutLeft> amv("intti::g1e::am", gp.npair),
+      anv("intti::g1e::an", gp.npair);
+  {
+    auto ha = Kokkos::create_mirror_view(amv), hb = Kokkos::create_mirror_view(anv);
+    for (int a = 0; a < ns; ++a)
+      for (int b = 0; b < ns; ++b) {
+        Real am[3], an[3];
+        avec(basis.shells[a].center, am);
+        avec(basis.shells[b].center, an);
+        const int p = a * ns + b;
+        for (int d = 0; d < 3; ++d) {
+          ha(p, d) = am[d];
+          hb(p, d) = an[d];
+        }
+      }
+    Kokkos::deep_copy(amv, ha);
+    Kokkos::deep_copy(anv, hb);
+  }
+  Kokkos::View<Real *> Tr("intti::g1e::Tr", n2), Ti("intti::g1e::Ti", n2);
+  auto pv = gp.tab.p, Ev = gp.tab.E;
+  auto lav = gp.tab.la, lbv = gp.tab.lb, eoffv = gp.tab.e_off;
+  auto aoa = gp.aoa, aob = gp.aob, alv = gp.alpha, bev = gp.beta;
+  const Real pi = pi_v<Real>();
+  Kokkos::parallel_for(
+      "intti::g1e::kin", Kokkos::RangePolicy<>(0, gp.npair), KOKKOS_LAMBDA(int p) {
+        const int lap = lav(p), lbp = lbv(p), la0 = lap - 1, lb0 = lbp - 1;
+        const int n1 = lap + lbp + 1, esz = (lap + 1) * (lbp + 1) * n1;
+        const Real pref = sqrt_(pi / pv(p)), al = alv(p), be = bev(p);
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        auto sd = [&](int d, int i, int j) {
+          return pref * Ev(eo + d * esz + (i * (lbp + 1) + j) * n1);
+        };
+        for (int ka = 0; ka < ncart(la0); ++ka) {
+          int a3[3];
+          cart_comp(la0, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncart(lb0); ++kb) {
+            int b3[3];
+            cart_comp(lb0, kb, b3[0], b3[1], b3[2]);
+            auto facc = [&](int c) {
+              KC bc[3];
+              int bi[3];
+              int nb = 0;
+              bc[nb] = KC(Real(0), -amv(p, c)); bi[nb] = a3[c]; ++nb;
+              bc[nb] = KC(-2 * al, Real(0));    bi[nb] = a3[c] + 1; ++nb;
+              if (a3[c] >= 1) { bc[nb] = KC(Real(a3[c]), Real(0)); bi[nb] = a3[c] - 1; ++nb; }
+              KC kc[3];
+              int kj[3];
+              int nk = 0;
+              kc[nk] = KC(Real(0), anv(p, c)); kj[nk] = b3[c]; ++nk;
+              kc[nk] = KC(-2 * be, Real(0));   kj[nk] = b3[c] + 1; ++nk;
+              if (b3[c] >= 1) { kc[nk] = KC(Real(b3[c]), Real(0)); kj[nk] = b3[c] - 1; ++nk; }
+              KC f(Real(0), Real(0));
+              for (int q = 0; q < nb; ++q)
+                for (int r = 0; r < nk; ++r) f += bc[q] * kc[r] * sd(c, bi[q], kj[r]);
+              return f;
+            };
+            const KC bx = sd(0, a3[0], b3[0]), by = sd(1, a3[1], b3[1]), bz = sd(2, a3[2], b3[2]);
+            const KC v = (facc(0) * by * bz + bx * facc(1) * bz + bx * by * facc(2)) * Real(0.5);
+            const std::size_t idx = static_cast<std::size_t>(oa + ka) * nao + ob + kb;
+            Tr(idx) = v.real();
+            Ti(idx) = v.imag();
+          }
+        }
+      });
+  auto hr = to_host(Tr), hi = to_host(Ti);
+  std::vector<std::complex<Real>> T(n2);
+  for (std::size_t i = 0; i < n2; ++i) T[i] = std::complex<Real>(hr[i], hi[i]);
+  return T;
+}
+
+/// Device finite-field nuclear attraction V(B). Identical in structure to the
+/// real device attraction: only the product centre (and hence the hermite_b
+/// argument and the E tables) is complex; theta, the prefactor and the weights
+/// stay real because p = alpha+beta is real.
+template <class Real>
+std::vector<std::complex<Real>>
+giao_nuclear_dev(const ShellBasis<Real> &basis, const std::vector<PointCharge<Real>> &charges,
+                 const Real B[3], const TGrid<Real> &grid) {
+  using KC = Kokkos::complex<Real>;
+  const int nao = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  auto gp = make_giao_1e_pairs(basis, B, 0, 0);
+  const int nt = grid.n(), npc = static_cast<int>(charges.size());
+  auto tv = to_device(grid.t, "intti::g1e::t"), wv = to_device(grid.w, "intti::g1e::w");
+  std::vector<Real> hcw(npc);
+  for (int c = 0; c < npc; ++c) hcw[c] = charges[c].weight;
+  auto cw = to_device(hcw, "intti::g1e::cw");
+  Kokkos::View<Real *[3], Kokkos::LayoutLeft> cR("intti::g1e::cR", npc);
+  {
+    auto h = Kokkos::create_mirror_view(cR);
+    for (int c = 0; c < npc; ++c)
+      for (int d = 0; d < 3; ++d) h(c, d) = charges[c].R[d];
+    Kokkos::deep_copy(cR, h);
+  }
+  Kokkos::View<Real *> Vr("intti::g1e::Vr", n2), Vi("intti::g1e::Vi", n2);
+  auto pv = gp.tab.p, Ev = gp.tab.E;
+  auto Pv = gp.tab.P;
+  auto lav = gp.tab.la, lbv = gp.tab.lb, eoffv = gp.tab.e_off;
+  auto aoa = gp.aoa, aob = gp.aob;
+  const Real pi = pi_v<Real>();
+  Kokkos::parallel_for(
+      "intti::g1e::nuc", Kokkos::RangePolicy<>(0, gp.npair), KOKKOS_LAMBDA(int p) {
+        const int la = lav(p), lb = lbv(p), n1 = la + lb + 1;
+        const int esz = (la + 1) * (lb + 1) * n1;
+        const Real pp = pv(p);
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        const KC Px = Pv(p, 0), Py = Pv(p, 1), Pz = Pv(p, 2);
+        KC Bx[2 * LMAX + 1], By[2 * LMAX + 1], Bz[2 * LMAX + 1];
+        for (int c = 0; c < npc; ++c) {
+          const KC Rx = Px - cR(c, 0), Ry = Py - cR(c, 1), Rz = Pz - cR(c, 2);
+          const Real wc = cw(c);
+          for (int it = 0; it < nt; ++it) {
+            const Real t = tv(it), denom = pp + t * t, theta = pp * t * t / denom;
+            const Real pref = sqrt_(pi / denom), wt = wv(it) * wc;
+            hermite_b(la + lb, theta, Rx, Bx);
+            hermite_b(la + lb, theta, Ry, By);
+            hermite_b(la + lb, theta, Rz, Bz);
+            for (int ka = 0; ka < ncart(la); ++ka) {
+              int a3[3];
+              cart_comp(la, ka, a3[0], a3[1], a3[2]);
+              for (int kb = 0; kb < ncart(lb); ++kb) {
+                int b3[3];
+                cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+                KC g[3];
+                for (int d = 0; d < 3; ++d) {
+                  const int base = eo + d * esz + (a3[d] * (lb + 1) + b3[d]) * n1;
+                  const KC *Bd = (d == 0 ? Bx : (d == 1 ? By : Bz));
+                  KC s(Real(0), Real(0));
+                  for (int tt = 0; tt <= a3[d] + b3[d]; ++tt) s += Ev(base + tt) * Bd[tt];
+                  g[d] = s * pref;
+                }
+                const KC v = g[0] * g[1] * g[2] * wt;
+                const std::size_t idx = static_cast<std::size_t>(oa + ka) * nao + ob + kb;
+                Vr(idx) += v.real();
+                Vi(idx) += v.imag();
+              }
+            }
+          }
+        }
+      });
+  auto hr = to_host(Vr), hi = to_host(Vi);
+  std::vector<std::complex<Real>> V(n2);
+  for (std::size_t i = 0; i < n2; ++i) V[i] = std::complex<Real>(hr[i], hi[i]);
+  return V;
+}
+
 } // namespace detail
 
 /// Complex GIAO overlap matrix S(B) = <omega_mu | omega_nu> in a finite
@@ -335,6 +502,8 @@ std::vector<std::complex<Real>> giao_kinetic(const ShellBasis<Real> &basis,
                                              const Real B[3], const Real O[3]) {
   using C = std::complex<Real>;
   static_assert(!is_complex_v<Real>, "giao_kinetic takes a real basis");
+  if constexpr (kokkos_scalar_v<Kokkos::complex<Real>>)
+    return detail::giao_kinetic_dev(basis, B, O);
   const int nao = basis.nao;
   std::vector<C> T(static_cast<std::size_t>(nao) * nao, C(0));
   const int ns = static_cast<int>(basis.shells.size());
@@ -451,6 +620,12 @@ giao_nuclear(const ShellBasis<Real> &basis,
              const TGrid<Real> &grid, const Real B[3]) {
   using C = std::complex<Real>;
   static_assert(!is_complex_v<Real>, "giao_nuclear takes a real basis");
+  if constexpr (kokkos_scalar_v<Kokkos::complex<Real>>) {
+    bool ok = true;
+    for (const auto &s : basis.shells)
+      if (s.l > LMAX) ok = false; // B stack arrays are 2*LMAX+1
+    if (ok) return detail::giao_nuclear_dev(basis, charges, B, grid);
+  }
   const int nao = basis.nao, nt = grid.n();
   const Real pi = pi_v<Real>();
   std::vector<C> V(static_cast<std::size_t>(nao) * nao, C(0));
