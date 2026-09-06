@@ -74,10 +74,14 @@ def main():
     mf0.conv_tol = 1e-12
     e0 = mf0.kernel()
     assert mf0.converged, "PySCF RHF did not converge"
+    g0 = mf0.nuc_grad_method().kernel()
     print(f"E(df.RHF)  = {e:.15f}")
     print(f"E(RHF)     = {e0:.15f}")
     print(f"RI error   = {e - e0:.3e}")
-    return e, e0
+    print("grad(RHF) = dE/dR in Ha/bohr, one row per atom:")
+    for row in np.asarray(g0):
+        print("    {" + ", ".join(f"{x:.15f}" for x in row) + "},")
+    return e, e0, g0
 
 
 if __name__ == "__main__":

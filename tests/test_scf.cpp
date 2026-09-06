@@ -29,6 +29,8 @@
 #include <gtest/gtest.h>
 
 #include "intti/cholesky.hpp" // detail::syevd
+#include "intti/deriv.hpp"
+#include "intti/erigrad.hpp"
 #include "intti/fock.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/oneel.hpp"
@@ -154,7 +156,7 @@ Scf rhf(const std::vector<Shell> &orb_sh, const std::vector<Atom> &atoms, int no
   out.D.assign(n2, 0.0);
   std::vector<double> F(n2), J(n2), K(n2), Fp(n2), Dnew(n2);
   double Eprev = 0;
-  for (int it = 0; it < 200; ++it) {
+  for (int it = 0; it < 500; ++it) {
     jk(orb, out.D.data(), J.data(), K.data());
     for (std::size_t i = 0; i < n2; ++i) F[i] = H[i] + J[i] - 0.5 * K[i];
     double E = Enuc;
@@ -194,7 +196,10 @@ Scf rhf(const std::vector<Shell> &orb_sh, const std::vector<Atom> &atoms, int no
     const double mix = 0.6;
     for (std::size_t i = 0; i < n2; ++i) out.D[i] = mix * Dnew[i] + (1 - mix) * out.D[i];
     out.iters = it + 1;
-    if (it > 0 && std::abs(E - Eprev) < 1e-11 && dmax < 1e-7) {
+    // tight: an RHF gradient at a non-stationary density carries an error
+    // LINEAR in the density error, so a 1e-7 density is only good for ~1e-8
+    // forces -- far too loose for the 1e-9 the gradient test asks for.
+    if (it > 0 && std::abs(E - Eprev) < 1e-13 && dmax < 1e-11) {
       out.E = E;
       out.converged = true;
       return out;
@@ -203,6 +208,100 @@ Scf rhf(const std::vector<Shell> &orb_sh, const std::vector<Atom> &atoms, int no
     out.E = E;
   }
   return out;
+}
+
+/// Atom index of each shell returned by orbital_shells().
+std::vector<int> orbital_shell_atoms() {
+  std::vector<int> a;
+  for (int i = 0; i < 8; ++i) a.push_back(0); // O: 5 s + 3 p
+  for (int i = 0; i < 3; ++i) a.push_back(1); // H1: 3 s
+  for (int i = 0; i < 3; ++i) a.push_back(2); // H2: 3 s
+  return a;
+}
+
+/// Analytic RHF gradient, assembled from the library's derivative builders.
+///
+///   dE/dR_A = sum_mn D_mn dH_mn/dR_A + dE_2e/dR_A - sum_mn W_mn dS_mn/dR_A
+///             + dE_nuc/dR_A,   W_mn = 2 sum_i^occ eps_i C_mi C_ni.
+///
+/// The 1e builders return the BRA gradient <grad mu|..|nu> (PySCF's int1e_ip*),
+/// and d/dR_A of a function of (r - R_A) is minus the electronic gradient, so
+/// dX_mn/dR_A = -Xip[m][n] when mu sits on A, -Xip[n][m] when nu does. The
+/// Hellmann-Feynman term -- the nuclear attraction moving with its own charge --
+/// comes from translational invariance of the one-charge integral,
+/// d/dR_C = -(d/dR_bra + d/dR_ket), so it is one nuclear_deriv per atom with
+/// that atom as the only charge.
+std::vector<std::array<double, 3>> rhf_gradient(const std::vector<Shell> &orb_sh,
+                                                const std::vector<int> &shell_atom,
+                                                const std::vector<Atom> &atoms,
+                                                int nocc, const Scf &scf,
+                                                const intti::TGrid<double> &grid) {
+  auto orb = intti::make_basis(orb_sh);
+  const int n = orb.nao, na = static_cast<int>(atoms.size());
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  // AO -> atom
+  std::vector<int> ao_atom(n);
+  for (std::size_t s = 0; s < orb_sh.size(); ++s) {
+    const int off = orb.ao_off[s], nc = intti::ncart(orb_sh[s].l);
+    for (int k = 0; k < nc; ++k) ao_atom[off + k] = shell_atom[s];
+  }
+  std::vector<double> Z;
+  std::vector<std::array<double, 3>> R;
+  for (const auto &a : atoms) {
+    Z.push_back(a.Z);
+    R.push_back(a.R);
+  }
+  // energy-weighted density
+  std::vector<double> W(n2, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double s = 0;
+      for (int k = 0; k < nocc; ++k) s += scf.eps[k] * scf.C[i * n + k] * scf.C[j * n + k];
+      W[i * n + j] = 2.0 * s;
+    }
+  const auto Sip = intti::overlap_deriv(orb);
+  const auto Tip = intti::kinetic_deriv(orb);
+  const auto Vip = intti::nuclear_deriv(orb, intti::nuclei_as_charges(Z, R), grid);
+
+  std::vector<std::array<double, 3>> g(na, {0.0, 0.0, 0.0});
+  for (int c = 0; c < 3; ++c)
+    for (int m = 0; m < n; ++m)
+      for (int p = 0; p < n; ++p) {
+        const std::size_t mp = static_cast<std::size_t>(m) * n + p;
+        const std::size_t pm = static_cast<std::size_t>(p) * n + m;
+        const double hb = -scf.D[mp] * (Tip[c][mp] + Vip[c][mp]) + W[mp] * Sip[c][mp];
+        const double hk = -scf.D[mp] * (Tip[c][pm] + Vip[c][pm]) + W[mp] * Sip[c][pm];
+        g[ao_atom[m]][c] += hb;
+        g[ao_atom[p]][c] += hk;
+      }
+  // Hellmann-Feynman: one charge at a time
+  for (int A = 0; A < na; ++A) {
+    const std::vector<double> ZA = {Z[A]};
+    const std::vector<std::array<double, 3>> RA = {R[A]};
+    const auto VA = intti::nuclear_deriv(orb, intti::nuclei_as_charges(ZA, RA), grid);
+    for (int c = 0; c < 3; ++c) {
+      double s = 0;
+      for (std::size_t i = 0; i < n2; ++i) s += scf.D[i] * VA[c][i];
+      g[A][c] += 2.0 * s; // D symmetric: sum D (V + V^T) = 2 sum D V
+    }
+  }
+  // two-electron part, per shell -> per atom
+  const auto g2 = intti::two_electron_gradient(orb, scf.D.data(), grid);
+  for (std::size_t s = 0; s < g2.size(); ++s)
+    for (int c = 0; c < 3; ++c) g[shell_atom[s]][c] += g2[s][c];
+  // nuclear repulsion
+  for (int A = 0; A < na; ++A)
+    for (int B = 0; B < na; ++B) {
+      if (A == B) continue;
+      double r2 = 0, d[3];
+      for (int c = 0; c < 3; ++c) {
+        d[c] = atoms[A].R[c] - atoms[B].R[c];
+        r2 += d[c] * d[c];
+      }
+      const double r3 = r2 * std::sqrt(r2);
+      for (int c = 0; c < 3; ++c) g[A][c] -= Z[A] * Z[B] * d[c] / r3;
+    }
+  return g;
 }
 
 // PySCF references: prototype/pyscf_scf_validation.py, same molecule, the same
@@ -244,6 +343,42 @@ TEST(Scf, ExactRhfEnergyMatchesPyscf) {
   const double dRI = std::abs(kPyscfRIRHF - kPyscfRHF); // 5.5e-3 for this aux set
   EXPECT_GT(dRI, 1e-6) << "auxiliary basis is not actually approximating anything";
   EXPECT_LT(dRI, 5e-2) << "auxiliary basis is too poor to be a meaningful fit";
+}
+
+// PySCF reference gradient, dE/dR in Ha/bohr, one row per atom (same script).
+constexpr double kPyscfGrad[3][3] = {
+    {-0.000000000000000, 0.000000000000001, 0.012969965273731},
+    {0.000000000000000, -0.014363854679873, -0.006484982636865},
+    {-0.000000000000000, 0.014363854679869, -0.006484982636865}};
+
+TEST(Scf, RhfGradientMatchesPyscf) {
+  // Capstone stage B: the analytic force, assembled from the derivative
+  // builders on top of a converged SCF. This is the first EXTERNAL reference
+  // for the two-electron derivatives -- until now they were pinned only against
+  // our own finite differences, which cannot catch a shared convention error.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const auto scf =
+      rhf(orbital_shells(), kAtoms, 5, grid,
+          [&](const intti::ShellBasis<double> &orb, const double *D, double *J, double *K) {
+            intti::coulomb_build(orb, D, grid, J, 1e-14);
+            intti::exchange_build(orb, D, grid, K, 1e-14);
+          });
+  ASSERT_TRUE(scf.converged);
+  const auto g = rhf_gradient(orbital_shells(), orbital_shell_atoms(), kAtoms, 5, scf, grid);
+  ASSERT_EQ(g.size(), 3u);
+  double mag = 0;
+  for (int a = 0; a < 3; ++a)
+    for (int c = 0; c < 3; ++c) mag = std::max(mag, std::abs(kPyscfGrad[a][c]));
+  ASSERT_GT(mag, 1e-3) << "reference gradient is trivially zero";
+  for (int a = 0; a < 3; ++a)
+    for (int c = 0; c < 3; ++c)
+      EXPECT_NEAR(g[a][c], kPyscfGrad[a][c], 1e-9) << "atom " << a << " comp " << c;
+  // translational invariance: the total force on the molecule must vanish
+  for (int c = 0; c < 3; ++c) {
+    double t = 0;
+    for (int a = 0; a < 3; ++a) t += g[a][c];
+    EXPECT_NEAR(t, 0.0, 1e-9) << "net force, component " << c;
+  }
 }
 
 TEST(Scf, NuclearRepulsionMatchesPyscf) {
