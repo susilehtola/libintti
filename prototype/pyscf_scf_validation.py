@@ -78,8 +78,12 @@ def main():
     print(f"E(df.RHF)  = {e:.15f}")
     print(f"E(RHF)     = {e0:.15f}")
     print(f"RI error   = {e - e0:.3e}")
+    gdf = mf.nuc_grad_method().kernel()
     print("grad(RHF) = dE/dR in Ha/bohr, one row per atom:")
     for row in np.asarray(g0):
+        print("    {" + ", ".join(f"{x:.15f}" for x in row) + "},")
+    print("grad(df.RHF):")
+    for row in np.asarray(gdf):
         print("    {" + ", ".join(f"{x:.15f}" for x in row) + "},")
     return e, e0, g0
 

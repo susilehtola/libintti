@@ -35,6 +35,7 @@
 #include "intti/nuclear.hpp"
 #include "intti/oneel.hpp"
 #include "intti/ri.hpp"
+#include "intti/rigrad.hpp"
 #include "intti/tgrid.hpp"
 
 namespace {
@@ -219,6 +220,15 @@ std::vector<int> orbital_shell_atoms() {
   return a;
 }
 
+/// Atom index of each shell returned by auxiliary_shells().
+std::vector<int> auxiliary_shell_atoms() {
+  std::vector<int> a;
+  for (int i = 0; i < 10; ++i) a.push_back(0); // O: 5 s + 3 p + 2 d
+  for (int i = 0; i < 4; ++i) a.push_back(1);  // H1: 3 s + 1 p
+  for (int i = 0; i < 4; ++i) a.push_back(2);  // H2: 3 s + 1 p
+  return a;
+}
+
 /// Analytic RHF gradient, assembled from the library's derivative builders.
 ///
 ///   dE/dR_A = sum_mn D_mn dH_mn/dR_A + dE_2e/dR_A - sum_mn W_mn dS_mn/dR_A
@@ -231,11 +241,13 @@ std::vector<int> orbital_shell_atoms() {
 /// comes from translational invariance of the one-charge integral,
 /// d/dR_C = -(d/dR_bra + d/dR_ket), so it is one nuclear_deriv per atom with
 /// that atom as the only charge.
+template <class Grad2e>
 std::vector<std::array<double, 3>> rhf_gradient(const std::vector<Shell> &orb_sh,
                                                 const std::vector<int> &shell_atom,
                                                 const std::vector<Atom> &atoms,
                                                 int nocc, const Scf &scf,
-                                                const intti::TGrid<double> &grid) {
+                                                const intti::TGrid<double> &grid,
+                                                Grad2e &&grad2e) {
   auto orb = intti::make_basis(orb_sh);
   const int n = orb.nao, na = static_cast<int>(atoms.size());
   const std::size_t n2 = static_cast<std::size_t>(n) * n;
@@ -285,10 +297,8 @@ std::vector<std::array<double, 3>> rhf_gradient(const std::vector<Shell> &orb_sh
       g[A][c] += 2.0 * s; // D symmetric: sum D (V + V^T) = 2 sum D V
     }
   }
-  // two-electron part, per shell -> per atom
-  const auto g2 = intti::two_electron_gradient(orb, scf.D.data(), grid);
-  for (std::size_t s = 0; s < g2.size(); ++s)
-    for (int c = 0; c < 3; ++c) g[shell_atom[s]][c] += g2[s][c];
+  // two-electron part -- whichever engine is under test, accumulated per atom
+  grad2e(orb, scf.D.data(), g);
   // nuclear repulsion
   for (int A = 0; A < na; ++A)
     for (int B = 0; B < na; ++B) {
@@ -364,7 +374,15 @@ TEST(Scf, RhfGradientMatchesPyscf) {
             intti::exchange_build(orb, D, grid, K, 1e-14);
           });
   ASSERT_TRUE(scf.converged);
-  const auto g = rhf_gradient(orbital_shells(), orbital_shell_atoms(), kAtoms, 5, scf, grid);
+  const auto sa = orbital_shell_atoms();
+  const auto g = rhf_gradient(
+      orbital_shells(), sa, kAtoms, 5, scf, grid,
+      [&](const intti::ShellBasis<double> &orb, const double *D,
+          std::vector<std::array<double, 3>> &acc) {
+        const auto g2 = intti::two_electron_gradient(orb, D, grid);
+        for (std::size_t s = 0; s < g2.size(); ++s)
+          for (int c = 0; c < 3; ++c) acc[sa[s]][c] += g2[s][c];
+      });
   ASSERT_EQ(g.size(), 3u);
   double mag = 0;
   for (int a = 0; a < 3; ++a)
@@ -374,6 +392,55 @@ TEST(Scf, RhfGradientMatchesPyscf) {
     for (int c = 0; c < 3; ++c)
       EXPECT_NEAR(g[a][c], kPyscfGrad[a][c], 1e-9) << "atom " << a << " comp " << c;
   // translational invariance: the total force on the molecule must vanish
+  for (int c = 0; c < 3; ++c) {
+    double t = 0;
+    for (int a = 0; a < 3; ++a) t += g[a][c];
+    EXPECT_NEAR(t, 0.0, 1e-9) << "net force, component " << c;
+  }
+}
+
+// PySCF reference gradient for the DENSITY-FITTED SCF (same script).
+constexpr double kPyscfDfGrad[3][3] = {
+    {0.000000000000002, -0.000000000000000, 0.015577724938646},
+    {-0.000000000000001, -0.015219419166869, -0.007788862469326},
+    {0.000000000000001, 0.015219419166862, -0.007788862469325}};
+
+TEST(Scf, RiRhfGradientMatchesPyscfDensityFitting) {
+  // The RI force is what a density-fitted geometry optimisation actually runs
+  // on. Unlike the exact gradient it also carries forces on the AUXILIARY
+  // shells: those are atom-centred, so they move with their atom and must be
+  // accumulated into the same per-atom total. Dropping them silently would look
+  // almost right -- hence an external reference rather than our own FD.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto orbb = intti::make_basis(orbital_shells());
+  auto auxb = intti::make_basis(auxiliary_shells());
+  const auto fit = intti::ri_fit(orbb, auxb, grid);
+  const auto scf =
+      rhf(orbital_shells(), kAtoms, 5, grid,
+          [&](const intti::ShellBasis<double> &, const double *D, double *J, double *K) {
+            intti::ri_jk(fit, D, J, K);
+          });
+  ASSERT_TRUE(scf.converged);
+  const auto sa = orbital_shell_atoms();
+  const auto xa = auxiliary_shell_atoms();
+  const auto g = rhf_gradient(
+      orbital_shells(), sa, kAtoms, 5, scf, grid,
+      [&](const intti::ShellBasis<double> &orb, const double *D,
+          std::vector<std::array<double, 3>> &acc) {
+        const auto gj = intti::ri_j_gradient(orb, auxb, D, grid);
+        const auto gk = intti::ri_k_gradient(orb, auxb, D, grid);
+        for (std::size_t s = 0; s < gj.forb.size(); ++s)
+          for (int c = 0; c < 3; ++c) acc[sa[s]][c] += gj.forb[s][c] + gk.forb[s][c];
+        for (std::size_t s = 0; s < gj.faux.size(); ++s)
+          for (int c = 0; c < 3; ++c) acc[xa[s]][c] += gj.faux[s][c] + gk.faux[s][c];
+      });
+  double mag = 0;
+  for (int a = 0; a < 3; ++a)
+    for (int c = 0; c < 3; ++c) mag = std::max(mag, std::abs(kPyscfDfGrad[a][c]));
+  ASSERT_GT(mag, 1e-3) << "reference gradient is trivially zero";
+  for (int a = 0; a < 3; ++a)
+    for (int c = 0; c < 3; ++c)
+      EXPECT_NEAR(g[a][c], kPyscfDfGrad[a][c], 1e-9) << "atom " << a << " comp " << c;
   for (int c = 0; c < 3; ++c) {
     double t = 0;
     for (int a = 0; a < 3; ++a) t += g[a][c];
