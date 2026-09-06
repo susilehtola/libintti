@@ -24,12 +24,246 @@
 #include <map>
 #include <vector>
 
-#include "erigrad.hpp" // detail::comp_index, detail::eri_block4, permute_block, eri_perms
+#include "batch.hpp"   // PairTable, make_batch, eri_quartets
+#include "device.hpp"  // detail::to_device / to_host
+#include "erigrad.hpp" // detail::comp_index, detail::eri_block4, pair_schwarz_margin
 #include "fock.hpp"
 #include "gto.hpp"
 #include "tgrid.hpp"
 
 namespace intti {
+
+namespace detail {
+
+// device (GPU) 2e Hessian: same drop-symmetry batched-consumer pattern as the
+// gradient. Each ordered quartet is a member directly (no orbit replay, so no
+// block permutation); the second-derivative digestion requests the quartet at
+// 33 distinct per-position l-offset patterns (single +-2, and pairs of +-1),
+// which are batched (those with all l+o >= 0) and looked up by a key table.
+// tau > 0 applies the host Schwarz(+2 margin)+density screen. l <= LMAX-2.
+template <class Real>
+std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const Real *D,
+                                           const TGrid<Real> &grid, Real tau) {
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao, dim = 3 * ns;
+  std::vector<int> hL(ns), hOff(ns);
+  std::vector<Real> hAl(ns);
+  for (int i = 0; i < ns; ++i) {
+    hL[i] = basis.shells[i].l;
+    hOff[i] = basis.ao_off[i];
+    hAl[i] = basis.shells[i].alpha;
+  }
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
+  std::vector<Real> Q, Dmax;
+  if (tau > Real(0)) {
+    Q.assign(static_cast<std::size_t>(ns) * ns, Real(0));
+    Dmax.assign(static_cast<std::size_t>(ns) * ns, Real(0));
+    for (int i = 0; i < ns; ++i)
+      for (int j = 0; j < ns; ++j) {
+        PrimitiveShell<Real> ai = basis.shells[i], aj = basis.shells[j];
+        ai.l += 2;
+        aj.l += 2;
+        Q[i * ns + j] = pair_schwarz_margin(ai, aj, grid);
+        Real m = 0;
+        for (int ki = 0; ki < ncart(basis.shells[i].l); ++ki)
+          for (int kj = 0; kj < ncart(basis.shells[j].l); ++kj)
+            m = std::max(m, std::abs(Dm(basis.ao_off[i] + ki, basis.ao_off[j] + kj)));
+        Dmax[i * ns + j] = m;
+      }
+  }
+  // 33 offset patterns: {0}, single +-2 at each p, and each pair {p<q} x 4 signs
+  std::vector<std::array<int, 4>> pats;
+  pats.push_back({0, 0, 0, 0});
+  for (int p = 0; p < 4; ++p) {
+    std::array<int, 4> a{}, b{};
+    a[p] = 2; b[p] = -2;
+    pats.push_back(a); pats.push_back(b);
+  }
+  const int sgn[4][2] = {{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+  for (int p = 0; p < 4; ++p)
+    for (int q = p + 1; q < 4; ++q)
+      for (int s = 0; s < 4; ++s) {
+        std::array<int, 4> o{};
+        o[p] = sgn[s][0];
+        o[q] = sgn[s][1];
+        pats.push_back(o);
+      }
+  const int NP = static_cast<int>(pats.size()); // 33
+  auto enc = [](const std::array<int, 4> &o) {
+    return (((o[0] + 2) * 5 + (o[1] + 2)) * 5 + (o[2] + 2)) * 5 + (o[3] + 2);
+  };
+  std::vector<int> idxkey(625, -1);
+  for (int pi = 0; pi < NP; ++pi) idxkey[enc(pats[pi])] = pi;
+
+  std::vector<ShellPair<Real>> plist;
+  auto add_pair = [&](int si, int di, int sj, int dj) {
+    PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
+    a.l += di;
+    b.l += dj;
+    plist.push_back(make_pair(a, b));
+    return static_cast<int>(plist.size()) - 1;
+  };
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> qa, qb, qc, qd, jobEnt;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b)
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          if (tau > Real(0)) {
+            const int sh[4] = {a, b, c, d};
+            Real dw = 0;
+            for (int i = 0; i < 4; ++i)
+              for (int jj = 0; jj < 4; ++jj) dw = std::max(dw, Dmax[sh[i] * ns + sh[jj]]);
+            const Real almax = std::max({hAl[a], hAl[b], hAl[c], hAl[d]});
+            if (4 * almax * almax * Q[a * ns + b] * Q[c * ns + d] * dw * dw < tau) continue;
+          }
+          const int L[4] = {hL[a], hL[b], hL[c], hL[d]};
+          const int sh[4] = {a, b, c, d};
+          qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
+          for (int pi = 0; pi < NP; ++pi) {
+            const auto &o = pats[pi];
+            bool ok = true;
+            for (int p = 0; p < 4; ++p)
+              if (L[p] + o[p] < 0) ok = false;
+            if (!ok) {
+              jobEnt.push_back(-1);
+              continue;
+            }
+            jobEnt.push_back(static_cast<int>(quartets.size()));
+            quartets.push_back({add_pair(sh[0], o[0], sh[1], o[1]),
+                                add_pair(sh[2], o[2], sh[3], o[3])});
+          }
+        }
+  const int njob = static_cast<int>(qa.size());
+  auto tab = make_pair_table(plist);
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::h2::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+
+  auto shL = to_device(hL, "intti::h2::L"), shOff = to_device(hOff, "intti::h2::off");
+  auto shAlv = to_device(hAl, "intti::h2::al");
+  auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "intti::h2::D");
+  auto dqa = to_device(qa, "intti::h2::qa"), dqb = to_device(qb, "intti::h2::qb");
+  auto dqc = to_device(qc, "intti::h2::qc"), dqd = to_device(qd, "intti::h2::qd");
+  auto dEnt = to_device(jobEnt, "intti::h2::ent"), didx = to_device(idxkey, "intti::h2::idx");
+  auto offv = batch.out_offset;
+  Kokkos::View<Real *> Hd("intti::h2::H", static_cast<std::size_t>(dim) * dim);
+  Kokkos::parallel_for(
+      "intti::h2::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+        const int mem[4] = {dqa(j), dqb(j), dqc(j), dqd(j)};
+        const int L[4] = {shL(mem[0]), shL(mem[1]), shL(mem[2]), shL(mem[3])};
+        const Real al[4] = {shAlv(mem[0]), shAlv(mem[1]), shAlv(mem[2]), shAlv(mem[3])};
+        const int off[4] = {shOff(mem[0]), shOff(mem[1]), shOff(mem[2]), shOff(mem[3])};
+        auto Dmk = [&](int i, int k) { return Dd(static_cast<std::size_t>(i) * nao + k); };
+        auto rawval = [&](const int o[4], const int m[4][3]) -> Real {
+          const int key = (((o[0] + 2) * 5 + (o[1] + 2)) * 5 + (o[2] + 2)) * 5 + (o[3] + 2);
+          const int pi = didx(key);
+          if (pi < 0) return Real(0);
+          const int ent = dEnt(j * NP + pi);
+          if (ent < 0) return Real(0);
+          int nn[4], id[4];
+          for (int p = 0; p < 4; ++p) {
+            const int lp = L[p] + o[p];
+            if (m[p][0] < 0 || m[p][1] < 0 || m[p][2] < 0 || m[p][0] + m[p][1] + m[p][2] != lp)
+              return Real(0);
+            nn[p] = ncart(lp);
+            id[p] = comp_index(lp, m[p][0], m[p][1]);
+          }
+          return out(offv(ent) +
+                     (((static_cast<std::size_t>(id[0]) * nn[1] + id[1]) * nn[2] + id[2]) * nn[3] +
+                      id[3]));
+        };
+        const int nb = ncart(L[1]), ncc = ncart(L[2]), nd = ncart(L[3]);
+        int bm[4][3];
+        for (int ka = 0; ka < ncart(L[0]); ++ka) {
+          cart_comp(L[0], ka, bm[0][0], bm[0][1], bm[0][2]);
+          for (int kb = 0; kb < nb; ++kb) {
+            cart_comp(L[1], kb, bm[1][0], bm[1][1], bm[1][2]);
+            for (int kc = 0; kc < ncc; ++kc) {
+              cart_comp(L[2], kc, bm[2][0], bm[2][1], bm[2][2]);
+              for (int kd = 0; kd < nd; ++kd) {
+                cart_comp(L[3], kd, bm[3][0], bm[3][1], bm[3][2]);
+                const Real coeff =
+                    Real(0.5) * Dmk(off[0] + ka, off[1] + kb) * Dmk(off[2] + kc, off[3] + kd) -
+                    Real(0.25) * Dmk(off[0] + ka, off[2] + kc) * Dmk(off[1] + kb, off[3] + kd);
+                if (coeff == Real(0)) continue;
+                auto mset = [&](int p, const int mp[3], int q, const int mq[3], int mm[4][3]) {
+                  for (int r = 0; r < 4; ++r)
+                    for (int t = 0; t < 3; ++t) mm[r][t] = bm[r][t];
+                  for (int t = 0; t < 3; ++t) mm[p][t] = mp[t];
+                  if (q != p)
+                    for (int t = 0; t < 3; ++t) mm[q][t] = mq[t];
+                };
+                for (int p = 0; p < 4; ++p)
+                  for (int q = 0; q < 4; ++q) {
+                    const Real ap = al[p], aq = al[q];
+                    for (int e = 0; e < 3; ++e)
+                      for (int fdir = 0; fdir < 3; ++fdir) {
+                        Real d2 = 0;
+                        int mm[4][3];
+                        if (p == q) {
+                          const int *mp = bm[p];
+                          const int de = (e == fdir) ? 1 : 0;
+                          int T[4][3];
+                          for (int t = 0; t < 3; ++t)
+                            T[0][t] = T[1][t] = T[2][t] = T[3][t] = mp[t];
+                          T[0][e] += 1; T[0][fdir] += 1;
+                          T[1][fdir] += 1; T[1][e] -= 1;
+                          T[2][e] += 1; T[2][fdir] -= 1;
+                          T[3][e] -= 1; T[3][fdir] -= 1;
+                          const int o2[4] = {p == 0 ? 2 : 0, p == 1 ? 2 : 0, p == 2 ? 2 : 0,
+                                             p == 3 ? 2 : 0};
+                          const int o0[4] = {0, 0, 0, 0};
+                          const int om2[4] = {p == 0 ? -2 : 0, p == 1 ? -2 : 0, p == 2 ? -2 : 0,
+                                              p == 3 ? -2 : 0};
+                          mset(p, T[0], q, T[0], mm);
+                          d2 += 2 * ap * (2 * ap * rawval(o2, mm));
+                          mset(p, T[1], q, T[1], mm);
+                          d2 += 2 * ap * (-(Real(mp[e]) + de) * rawval(o0, mm));
+                          mset(p, T[2], q, T[2], mm);
+                          d2 += -Real(mp[fdir]) * (2 * ap * rawval(o0, mm));
+                          mset(p, T[3], q, T[3], mm);
+                          d2 += -Real(mp[fdir]) * (-(Real(mp[e]) - de) * rawval(om2, mm));
+                        } else {
+                          const int *mp = bm[p], *mq = bm[q];
+                          int Pe1[3], Pe0[3], Qf1[3], Qf0[3];
+                          for (int t = 0; t < 3; ++t) {
+                            Pe1[t] = mp[t]; Pe0[t] = mp[t];
+                            Qf1[t] = mq[t]; Qf0[t] = mq[t];
+                          }
+                          Pe1[e] += 1; Pe0[e] -= 1;
+                          Qf1[fdir] += 1; Qf0[fdir] -= 1;
+                          auto oo = [&](int dp, int dq, int out4[4]) {
+                            for (int t = 0; t < 4; ++t) out4[t] = 0;
+                            out4[p] += dp; out4[q] += dq;
+                          };
+                          int oarr[4];
+                          mset(p, Pe1, q, Qf1, mm); oo(1, 1, oarr);
+                          d2 += 4 * ap * aq * rawval(oarr, mm);
+                          mset(p, Pe1, q, Qf0, mm); oo(1, -1, oarr);
+                          d2 += -2 * ap * Real(mq[fdir]) * rawval(oarr, mm);
+                          mset(p, Pe0, q, Qf1, mm); oo(-1, 1, oarr);
+                          d2 += -Real(mp[e]) * 2 * aq * rawval(oarr, mm);
+                          mset(p, Pe0, q, Qf0, mm); oo(-1, -1, oarr);
+                          d2 += Real(mp[e]) * Real(mq[fdir]) * rawval(oarr, mm);
+                        }
+                        if (d2 != Real(0))
+                          Kokkos::atomic_add(
+                              &Hd((3 * mem[p] + e) * static_cast<std::size_t>(dim) + 3 * mem[q] +
+                                  fdir),
+                              coeff * d2);
+                      }
+                  }
+              }
+            }
+          }
+        }
+      });
+  return to_host(Hd);
+}
+
+} // namespace detail
 
 /// d^2 E_2e / dR_{p,e} dR_{q,f} for
 ///   E_2e = 1/2 sum D_mn D_ls (mn|ls) - 1/4 sum D_ml D_ns (mn|ls),
@@ -39,6 +273,12 @@ namespace intti {
 template <class Real>
 std::vector<Real> two_electron_hessian(const ShellBasis<Real> &basis, const Real *D,
                                        const TGrid<Real> &grid, Real tau = Real(0)) {
+  if constexpr (kokkos_scalar_v<Real>) {
+    bool ok = true;
+    for (const auto &s : basis.shells)
+      if (s.l > LMAX - 2) ok = false; // second derivative promotes by 2
+    if (ok) return detail::two_electron_hessian_dev(basis, D, grid, tau);
+  }
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao, dim = 3 * ns;
   std::vector<Real> H(static_cast<std::size_t>(dim) * dim, Real(0));
