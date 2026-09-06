@@ -664,14 +664,22 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   scatter on device -- the last host piece of the RI-JK spine. __float128, the
   3c far-field, and the contracted-basis overloads + coulomb_3c_auxblock keep
   the host path (the contracted ones await an eri_quartets_accumulate coeff+
-  segment port). Remaining M18 Tier 2 -- rewrite the derivative (erigrad/
-  erihess/geoderiv/geohess/rigrad), GIAO (giao/giao2e), three-electron (threeel/
-  threeel_ri) and spin-orbit (soc) builders as batched-quartet consumers
-  (enumerate the promoted/demoted quartets, hand them to eri_quartets as one
-  batch, contract on device), the LKC-consumer pattern (SHARK #2); for the
-  derivative builds the 8-fold symmetry replay can be dropped in the first device
-  pass (evaluate all quartets, they are cheap and parallel on device) and
-  reinstated later. Precision note: the analytic path in double already hits
+  segment port). 1e geometry-derivative integrals DONE (2026-09-06):
+  overlap_deriv/kinetic_deriv/nuclear_deriv (PySCF int1e_ip{ovlp,kin,nuc})
+  ported via make_1e_pairs (bra +1 for the d/dR_bra shift; +alpha exponent and
+  an all_pairs mode added -- gradients are not symmetric, so every ordered pair
+  is assembled with no transpose). geoderiv/geohess higher orders ride these via
+  FD. Remaining M18 Tier 2 is now the TWO-electron quartet-derivative surface --
+  rewrite the 2e derivative (erigrad/erihess/rigrad), GIAO 2e (giao2e),
+  three-electron (threeel/threeel_ri) and spin-orbit (soc) builders as batched-
+  quartet consumers (enumerate the promoted/demoted quartets, hand them to
+  eri_quartets as one batch, contract on device), the LKC-consumer pattern
+  (SHARK #2); for the derivative builds the 8-fold symmetry replay can be dropped
+  in the first device pass (evaluate all quartets, they are cheap and parallel on
+  device) and reinstated later.
+  Build note: this box's /tmp is a 25 GB tmpfs quota shared with other sessions'
+  scratch; if the compiler hits "Disk quota exceeded", build with
+  TMPDIR=<repo>/build/ctmp (on /home, 143 GB free). Precision note: the analytic path in double already hits
   ~1e-13/1e-14 (validated 1e-12 vs PySCF), well below the 1 nEh target; the
   t-grid node count grows only ~log(1/eps) so tightening is cheap; >double needs
   the host float128 path (no GPU).
