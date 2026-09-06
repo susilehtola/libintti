@@ -695,9 +695,15 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   of +-1), batched and looked up by a 625-entry key table, digested on device
   with atomics into the (3ns)x(3ns) Hessian; tau>0 screened, l<=LMAX-2. So both
   forces AND frequencies (1e+2e gradients + Hessians) are GPU-resident -- the
-  geometry-opt/frequency capstone. Remaining M18 Tier 2: RI gradient (rigrad,
-  ~769 lines), GIAO 2e (giao2e), three-electron (threeel/threeel_ri) -- same
-  batched-quartet-consumer pattern (LKC/SHARK #2). Production follow-ups for the 2e derivative/SO
+  geometry-opt/frequency capstone. GIAO 2e DONE (2026-09-06): giao_jk_dB ported
+  -- at B=0 the ERIs are real so dJ/dB, dK/dB are i times a real combination;
+  the digestion (London phase-vector cross products, base + bra+1 + ket+1 blocks
+  per quartet) runs on the real device path with atomics, wrapped in i on host.
+  Validated vs the JK field-derivative FD. Remaining M18 Tier 2: RI gradient/
+  Hessian (rigrad, ~769 lines) and three-electron (threeel/threeel_ri, ~587) --
+  same batched-quartet-consumer pattern (LKC/SHARK #2); both are large focused
+  ports. (giao2e is real on the device because only the imaginary part is
+  computed; a fully complex device path would need Kokkos::complex.) Production follow-ups for the 2e derivative/SO
   builds: reinstate the 8-fold symmetry and stream/chunk the quartet list
   (materialised now, O(ns^4) at tau=0, so large systems need screening +
   streaming).
