@@ -239,12 +239,247 @@ std::vector<Real> spin_orbit_2e_block(const PrimitiveShell<Real> &sa,
   return out;
 }
 
+// ---- device (GPU) two-electron spin-orbit -----------------------------------
+// Same drop-symmetry batched-quartet-consumer pattern as the 2e gradient: for
+// every ordered quartet (mu,lambda|nu,sigma) batch the 4 shifted-bra blocks
+// (a+-1, b+-1) x the unshifted ket into one eri_quartets call, then run the SO
+// digestion -- eps_kij (d_i mu)(d_j lambda) with the MD centre-shift terms --
+// on device, contracting the density and scattering with atomics.
+
+/// d/dir terms for one Cartesian component of a shell of momentum l (device):
+/// sgn 0 -> (l+1) block coeff -2 alpha; sgn 1 -> (l-1) block coeff the power.
+template <class Real>
+KOKKOS_INLINE_FUNCTION int so_terms(int l, const int c3[3], Real alpha, int dir,
+                                    int sgn[2], int ci[2], Real co[2]) {
+  int nt = 0;
+  int t[3] = {c3[0], c3[1], c3[2]};
+  t[dir] += 1;
+  sgn[nt] = 0;
+  ci[nt] = comp_index(l + 1, t[0], t[1]);
+  co[nt] = -2 * alpha;
+  ++nt;
+  if (c3[dir] >= 1) {
+    int u[3] = {c3[0], c3[1], c3[2]};
+    u[dir] -= 1;
+    sgn[nt] = 1;
+    ci[nt] = comp_index(l - 1, u[0], u[1]);
+    co[nt] = static_cast<Real>(c3[dir]);
+    ++nt;
+  }
+  return nt;
+}
+
+/// Shared batch: the 4 shifted-bra x unshifted-ket quartets per ordered quartet.
+template <class Real> struct SO2eBatch {
+  Kokkos::View<Real *> out, shAl;
+  Kokkos::View<int *> qa, qb, qc, qd, e00, e01, e10, e11, shL, shOff, boff;
+  int njob{0}, nao{0};
+};
+
+template <class Real>
+SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real> &grid) {
+  const int ns = static_cast<int>(basis.shells.size());
+  SO2eBatch<Real> B;
+  B.nao = basis.nao;
+  std::vector<int> hL(ns), hOff(ns);
+  std::vector<Real> hAl(ns);
+  for (int i = 0; i < ns; ++i) {
+    hL[i] = basis.shells[i].l;
+    hOff[i] = basis.ao_off[i];
+    hAl[i] = basis.shells[i].alpha;
+  }
+  std::vector<ShellPair<Real>> plist;
+  auto add_pair = [&](int si, int di, int sj, int dj) {
+    PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
+    a.l += di;
+    b.l += dj;
+    plist.push_back(make_pair(a, b));
+    return static_cast<int>(plist.size()) - 1;
+  };
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> qa, qb, qc, qd, e00, e01, e10, e11;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b)
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          const int la = hL[a], lb = hL[b];
+          const int ket = add_pair(c, 0, d, 0);
+          qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
+          auto emit = [&](int bp) {
+            int e = static_cast<int>(quartets.size());
+            quartets.push_back({bp, ket});
+            return e;
+          };
+          e00.push_back(emit(add_pair(a, 1, b, 1)));
+          e01.push_back(lb >= 1 ? emit(add_pair(a, 1, b, -1)) : -1);
+          e10.push_back(la >= 1 ? emit(add_pair(a, -1, b, 1)) : -1);
+          e11.push_back((la >= 1 && lb >= 1) ? emit(add_pair(a, -1, b, -1)) : -1);
+        }
+  auto tab = make_pair_table(plist);
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  B.out = Kokkos::View<Real *>("intti::so2e::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, B.out, ws);
+  B.boff = batch.out_offset;
+  B.shL = to_device(hL, "intti::so2e::L");
+  B.shOff = to_device(hOff, "intti::so2e::off");
+  B.shAl = to_device(hAl, "intti::so2e::al");
+  B.qa = to_device(qa, "intti::so2e::qa");
+  B.qb = to_device(qb, "intti::so2e::qb");
+  B.qc = to_device(qc, "intti::so2e::qc");
+  B.qd = to_device(qd, "intti::so2e::qd");
+  B.e00 = to_device(e00, "intti::so2e::e00");
+  B.e01 = to_device(e01, "intti::so2e::e01");
+  B.e10 = to_device(e10, "intti::so2e::e10");
+  B.e11 = to_device(e11, "intti::so2e::e11");
+  B.njob = static_cast<int>(qa.size());
+  return B;
+}
+
+template <class Real>
+std::array<std::vector<Real>, 3>
+spin_orbit_2e_coulomb_dev(const ShellBasis<Real> &basis, const Real *D,
+                          const TGrid<Real> &grid) {
+  const int nao = basis.nao;
+  auto B = build_so2e_batch(basis, grid);
+  auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "intti::so2e::D");
+  Kokkos::View<Real *> Yd("intti::so2e::Y", static_cast<std::size_t>(3) * nao * nao);
+  const std::size_t plane = static_cast<std::size_t>(nao) * nao;
+  auto out = B.out, shAl = B.shAl;
+  auto shL = B.shL, shOff = B.shOff, boff = B.boff;
+  auto qa = B.qa, qb = B.qb, qc = B.qc, qd = B.qd, e00 = B.e00, e01 = B.e01, e10 = B.e10, e11 = B.e11;
+  Kokkos::parallel_for(
+      "intti::so2e::coulomb", Kokkos::RangePolicy<>(0, B.njob), KOKKOS_LAMBDA(int j) {
+        const int a = qa(j), b = qb(j), c = qc(j), d = qd(j);
+        const int la = shL(a), lb = shL(b), lc = shL(c), ld = shL(d);
+        const int nc = ncart(lc), nd = ncart(ld);
+        const Real ala = shAl(a), alb = shAl(b);
+        const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
+        const int base[2][2] = {{boff(e00(j)), e01(j) >= 0 ? boff(e01(j)) : 0},
+                                {e10(j) >= 0 ? boff(e10(j)) : 0, e11(j) >= 0 ? boff(e11(j)) : 0}};
+        for (int ka = 0; ka < ncart(la); ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncart(lb); ++kb) {
+            int b3[3];
+            cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+            Real yx = 0, yy = 0, yz = 0;
+            auto val = [&](int i, int jj, int kc, int kd) -> Real {
+              int as[2], aci[2], bs[2], bci[2];
+              Real aco[2], bco[2];
+              const int na = so_terms(la, a3, ala, i, as, aci, aco);
+              const int nb = so_terms(lb, b3, alb, jj, bs, bci, bco);
+              Real v = 0;
+              for (int u = 0; u < na; ++u)
+                for (int w = 0; w < nb; ++w) {
+                  const int lbp = bs[w] == 0 ? lb + 1 : lb - 1;
+                  const int nbc = ncart(lbp);
+                  const std::size_t idx =
+                      (((static_cast<std::size_t>(aci[u]) * nbc + bci[w]) * nc + kc) * nd + kd);
+                  v += aco[u] * bco[w] * out(base[as[u]][bs[w]] + idx);
+                }
+              return v;
+            };
+            for (int kc = 0; kc < nc; ++kc)
+              for (int kd = 0; kd < nd; ++kd) {
+                const Real Dcd = Dd(static_cast<std::size_t>(oc + kc) * nao + od + kd);
+                if (Dcd == Real(0)) continue;
+                yx += Dcd * (val(1, 2, kc, kd) - val(2, 1, kc, kd));
+                yy += Dcd * (val(2, 0, kc, kd) - val(0, 2, kc, kd));
+                yz += Dcd * (val(0, 1, kc, kd) - val(1, 0, kc, kd));
+              }
+            const std::size_t mu = static_cast<std::size_t>(oa + ka) * nao + ob + kb;
+            Kokkos::atomic_add(&Yd(0 * plane + mu), yx);
+            Kokkos::atomic_add(&Yd(1 * plane + mu), yy);
+            Kokkos::atomic_add(&Yd(2 * plane + mu), yz);
+          }
+        }
+      });
+  auto flat = to_host(Yd);
+  std::array<std::vector<Real>, 3> Y;
+  for (int k = 0; k < 3; ++k)
+    Y[k].assign(flat.begin() + k * plane, flat.begin() + (k + 1) * plane);
+  return Y;
+}
+
+template <class Real>
+std::array<std::vector<Real>, 3>
+spin_orbit_2e_exchange_dev(const ShellBasis<Real> &basis, const Real *D,
+                           const TGrid<Real> &grid) {
+  const int nao = basis.nao;
+  auto B = build_so2e_batch(basis, grid);
+  auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "intti::so2ex::D");
+  Kokkos::View<Real *> Ked("intti::so2ex::Ke", static_cast<std::size_t>(3) * nao * nao);
+  const std::size_t plane = static_cast<std::size_t>(nao) * nao;
+  auto out = B.out, shAl = B.shAl;
+  auto shL = B.shL, shOff = B.shOff, boff = B.boff;
+  auto qa = B.qa, qb = B.qb, qc = B.qc, qd = B.qd, e00 = B.e00, e01 = B.e01, e10 = B.e10, e11 = B.e11;
+  Kokkos::parallel_for(
+      "intti::so2e::exchange", Kokkos::RangePolicy<>(0, B.njob), KOKKOS_LAMBDA(int j) {
+        const int a = qa(j), b = qb(j), c = qc(j), d = qd(j);
+        const int la = shL(a), lb = shL(b), lc = shL(c), ld = shL(d);
+        const int nc = ncart(lc), nd = ncart(ld);
+        const Real ala = shAl(a), alb = shAl(b);
+        const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
+        const int base[2][2] = {{boff(e00(j)), e01(j) >= 0 ? boff(e01(j)) : 0},
+                                {e10(j) >= 0 ? boff(e10(j)) : 0, e11(j) >= 0 ? boff(e11(j)) : 0}};
+        for (int ka = 0; ka < ncart(la); ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncart(lb); ++kb) {
+            int b3[3];
+            cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+            auto val = [&](int i, int jj, int kc, int kd) -> Real {
+              int as[2], aci[2], bs[2], bci[2];
+              Real aco[2], bco[2];
+              const int na = so_terms(la, a3, ala, i, as, aci, aco);
+              const int nb = so_terms(lb, b3, alb, jj, bs, bci, bco);
+              Real v = 0;
+              for (int u = 0; u < na; ++u)
+                for (int w = 0; w < nb; ++w) {
+                  const int lbp = bs[w] == 0 ? lb + 1 : lb - 1;
+                  const int nbc = ncart(lbp);
+                  const std::size_t idx =
+                      (((static_cast<std::size_t>(aci[u]) * nbc + bci[w]) * nc + kc) * nd + kd);
+                  v += aco[u] * bco[w] * out(base[as[u]][bs[w]] + idx);
+                }
+              return v;
+            };
+            for (int kc = 0; kc < nc; ++kc) {
+              const Real Dbc = Dd(static_cast<std::size_t>(ob + kb) * nao + oc + kc);
+              if (Dbc == Real(0)) continue;
+              for (int kd = 0; kd < nd; ++kd) {
+                const Real vx = val(1, 2, kc, kd) - val(2, 1, kc, kd);
+                const Real vy = val(2, 0, kc, kd) - val(0, 2, kc, kd);
+                const Real vz = val(0, 1, kc, kd) - val(1, 0, kc, kd);
+                const std::size_t ms = static_cast<std::size_t>(oa + ka) * nao + od + kd;
+                Kokkos::atomic_add(&Ked(0 * plane + ms), Dbc * vx);
+                Kokkos::atomic_add(&Ked(1 * plane + ms), Dbc * vy);
+                Kokkos::atomic_add(&Ked(2 * plane + ms), Dbc * vz);
+              }
+            }
+          }
+        }
+      });
+  auto flat = to_host(Ked);
+  std::array<std::vector<Real>, 3> Ke;
+  for (int k = 0; k < 3; ++k)
+    Ke[k].assign(flat.begin() + k * plane, flat.begin() + (k + 1) * plane);
+  return Ke;
+}
+
 } // namespace detail
 
 template <class Real>
 std::array<std::vector<Real>, 3>
 spin_orbit_2e_coulomb(const ShellBasis<Real> &basis, const Real *D,
                       const TGrid<Real> &grid) {
+  if constexpr (kokkos_scalar_v<Real>) {
+    bool ok = true;
+    for (const auto &s : basis.shells)
+      if (s.l >= LMAX) ok = false; // bra shells are promoted to l+1
+    if (ok) return detail::spin_orbit_2e_coulomb_dev(basis, D, grid);
+  }
   const int nao = basis.nao;
   std::array<std::vector<Real>, 3> Y;
   for (auto &m : Y) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
@@ -292,6 +527,12 @@ template <class Real>
 std::array<std::vector<Real>, 3>
 spin_orbit_2e_exchange(const ShellBasis<Real> &basis, const Real *D,
                        const TGrid<Real> &grid) {
+  if constexpr (kokkos_scalar_v<Real>) {
+    bool ok = true;
+    for (const auto &s : basis.shells)
+      if (s.l >= LMAX) ok = false; // bra shells are promoted to l+1
+    if (ok) return detail::spin_orbit_2e_exchange_dev(basis, D, grid);
+  }
   const int nao = basis.nao;
   std::array<std::vector<Real>, 3> Ke;
   for (auto &m : Ke) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
