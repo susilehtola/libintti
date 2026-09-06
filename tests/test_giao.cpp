@@ -543,4 +543,54 @@ TEST(GIAO, FiniteFieldJKFieldReversalConjugates) {
   EXPECT_LT(rev, 1e-12 * mx) << "B -> -B must conjugate J,K";
 }
 
+// ---- structure of the finite-B pair space (prerequisite for a CD path) ------
+// A Cholesky decomposition needs a HERMITIAN POSITIVE-DEFINITE matrix. At
+// finite B the matrix the real CD code would form, M_PQ = (mn|ls), is complex
+// SYMMETRIC (M_PQ = M_QP by electron exchange) but NOT Hermitian, so it admits
+// no Cholesky. The Hermitian Gram matrix is instead
+//   H_PQ = <rho_P|rho_Q> = (nm|ls),   rho_P = omega_mu^* omega_nu,
+// i.e. the ERI with the BRA PAIR SWAPPED (because rho_P^* = rho_(nu mu)).
+// This test pins both facts, so a future finite-B CD knows which object to
+// decompose. s-only basis, so AO index == shell index.
+TEST(GIAO, FiniteFieldPairGramIsHermitianPositive) {
+  const double Bf[3] = {0.2, -0.3, 0.7};
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const double alph[3] = {0.9, 1.3, 0.6};
+  const double *cen[3] = {kA, kB, kC};
+  auto sh = [&](int i) { return shell(alph[i], cen[i], 0); };
+  const int n = 3, np = n * n; // pairs P = (mu,nu)
+  auto eri = [&](int m, int nu, int l, int s) {
+    C v;
+    intti::eri_quartet(intti::make_giao_pair(sh(m), sh(nu), Bf),
+                       intti::make_giao_pair(sh(l), sh(s), Bf), grid, &v);
+    return v;
+  };
+  std::vector<C> H(np * np), M(np * np);
+  for (int P = 0; P < np; ++P) {
+    const int m = P / n, nu = P % n;
+    for (int Q = 0; Q < np; ++Q) {
+      const int l = Q / n, s = Q % n;
+      H[P * np + Q] = eri(nu, m, l, s); // bra pair swapped -> Gram
+      M[P * np + Q] = eri(m, nu, l, s); // what the real CD would form
+    }
+  }
+  double mx = 0, herm = 0, sym = 0, nonherm = 0, diagimag = 0, mindiag = 1e300;
+  for (int P = 0; P < np; ++P) {
+    mx = std::max(mx, std::abs(H[P * np + P]));
+    diagimag = std::max(diagimag, std::abs(H[P * np + P].imag()));
+    mindiag = std::min(mindiag, H[P * np + P].real());
+    for (int Q = 0; Q < np; ++Q) {
+      herm = std::max(herm, std::abs(H[P * np + Q] - std::conj(H[Q * np + P])));
+      sym = std::max(sym, std::abs(M[P * np + Q] - M[Q * np + P]));
+      nonherm = std::max(nonherm, std::abs(M[P * np + Q] - std::conj(M[Q * np + P])));
+    }
+  }
+  ASSERT_GT(mx, 1e-6);
+  EXPECT_LT(herm, 1e-13 * mx) << "the Gram matrix (nm|ls) must be Hermitian";
+  EXPECT_LT(diagimag, 1e-14 * mx) << "its diagonal must be real";
+  EXPECT_GT(mindiag, 1e-8) << "its diagonal must be positive (a CD can pivot on it)";
+  EXPECT_LT(sym, 1e-13 * mx) << "(mn|ls) is complex symmetric";
+  EXPECT_GT(nonherm, 1e-6 * mx) << "(mn|ls) is NOT Hermitian -- no Cholesky of it";
+}
+
 } // namespace
