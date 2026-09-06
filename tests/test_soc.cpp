@@ -90,4 +90,97 @@ TEST(SpinOrbit, Antisymmetric) {
   EXPECT_LT(asym, 1e-12 * (mag + 1)) << "W not antisymmetric";
 }
 
+// Two-electron spin-orbit (Coulomb-type), M17 second half. Independent oracle:
+// the mixed finite difference of the ordinary Coulomb build in the electron-1
+// centres. With mu at A_mu+delta and lambda at A_lambda+delta+eta (delta shifts
+// both, eta only lambda), F(delta,eta) = [coulomb_build]_{mu,lambda} satisfies
+//   d^2/ddelta_i deta_j F|0 = <mu (d_{1,j} lambda) (r12)_i/r12^3 nu sigma> D_ns,
+// so Y_k = eps_kij d^2/ddelta_i deta_j F -- the operator differentiated directly
+// (no by-parts reduction assumed), a genuine check of the reduced builder.
+
+TEST(SpinOrbit, TwoElectronCoulombVsFiniteDifference) {
+  // four s primitives: mu, lambda on electron 1; the whole basis is the density
+  const std::array<std::array<double, 3>, 4> A{
+      {{0.0, 0.0, 0.0}, {0.4, 0.1, -0.3}, {-0.2, 0.5, 0.7}, {0.6, -0.4, 0.2}}};
+  const std::array<double, 4> al{1.3, 0.9, 1.1, 0.7};
+  auto mk = [&](const std::array<std::array<double, 3>, 4> &cen) {
+    std::vector<intti::PrimitiveShell<double>> sh;
+    for (int i = 0; i < 4; ++i) sh.push_back({al[i], {cen[i][0], cen[i][1], cen[i][2]}, 0});
+    return intti::make_basis(sh);
+  };
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  auto base = mk(A);
+  const int n = base.nao; // 4
+  // a nontrivial symmetric density
+  std::vector<double> D(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = 0.3 + 0.1 * i - 0.05 * j + 0.02 * i * j;
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) D[j * n + i] = D[i * n + j];
+
+  auto Y = intti::spin_orbit_2e_coulomb(base, D.data(), grid);
+
+  // F(delta,eta) = sum_{c,d} D_cd (mu lambda | c d) with ONLY the electron-1 bra
+  // pair shifted (mu at A0+delta, lambda at A1+delta+eta) and the electron-2 ket
+  // shells c,d fixed -- differentiating exactly what the builder differentiates
+  // (coulomb_build would also move shells 0,1 where they appear in the ket sum).
+  const double h = 3e-3;
+  auto Fval = [&](const std::array<double, 3> &delta, const std::array<double, 3> &eta) {
+    intti::PrimitiveShell<double> mu{al[0], {A[0][0] + delta[0], A[0][1] + delta[1], A[0][2] + delta[2]}, 0};
+    intti::PrimitiveShell<double> lam{
+        al[1], {A[1][0] + delta[0] + eta[0], A[1][1] + delta[1] + eta[1], A[1][2] + delta[2] + eta[2]}, 0};
+    double f = 0;
+    for (int c = 0; c < 4; ++c)
+      for (int d = 0; d < 4; ++d) {
+        intti::PrimitiveShell<double> sc{al[c], {A[c][0], A[c][1], A[c][2]}, 0};
+        intti::PrimitiveShell<double> sd{al[d], {A[d][0], A[d][1], A[d][2]}, 0};
+        f += D[c * n + d] * intti::detail::eri_block4(mu, lam, sc, sd, grid)[0];
+      }
+    return f;
+  };
+  auto e = [](int ax) { std::array<double, 3> v{0, 0, 0}; v[ax] = 1.0; return v; };
+  auto mixed = [&](int i, int j) {
+    auto pi = e(i), pj = e(j);
+    auto sc = [&](double si, double sj) {
+      std::array<double, 3> dl{si * h * pi[0], si * h * pi[1], si * h * pi[2]};
+      std::array<double, 3> et{sj * h * pj[0], sj * h * pj[1], sj * h * pj[2]};
+      return Fval(dl, et);
+    };
+    return (sc(1, 1) - sc(1, -1) - sc(-1, 1) + sc(-1, -1)) / (4 * h * h);
+  };
+  const double yx = mixed(1, 2) - mixed(2, 1);
+  const double yy = mixed(2, 0) - mixed(0, 2);
+  const double yz = mixed(0, 1) - mixed(1, 0);
+  // second-order centre FD: accuracy floor ~ h^2 ~ 1e-5 relative
+  EXPECT_NEAR(Y[0][0 * n + 1], yx, 1e-4 * (std::abs(yx) + 1)) << "Y_x";
+  EXPECT_NEAR(Y[1][0 * n + 1], yy, 1e-4 * (std::abs(yy) + 1)) << "Y_y";
+  EXPECT_NEAR(Y[2][0 * n + 1], yz, 1e-4 * (std::abs(yz) + 1)) << "Y_z";
+  EXPECT_GT(std::abs(yx) + std::abs(yy) + std::abs(yz), 1e-5) << "trivially zero";
+}
+
+TEST(SpinOrbit, TwoElectronAntisymmetric) {
+  // s + p on two centres -> nontrivial antisymmetric Y_k
+  std::vector<intti::PrimitiveShell<double>> shells = {
+      {1.0, {0.0, 0.0, 0.0}, 0}, {0.7, {0.2, -0.1, 0.4}, 1},
+      {0.9, {-0.3, 0.5, 0.1}, 0}};
+  auto bas = intti::make_basis(shells);
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  const int n = bas.nao;
+  std::vector<double> D(static_cast<std::size_t>(n) * n, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = 0.2 + 0.03 * (i + 1) * (j + 1);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) D[j * n + i] = D[i * n + j];
+  auto Y = intti::spin_orbit_2e_coulomb(bas, D.data(), grid);
+  double asym = 0, mag = 0;
+  for (int d = 0; d < 3; ++d)
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) {
+        asym = std::max(asym, std::abs(Y[d][i * n + j] + Y[d][j * n + i]));
+        mag = std::max(mag, std::abs(Y[d][i * n + j]));
+      }
+  EXPECT_GT(mag, 1e-3) << "Y vanished";
+  EXPECT_LT(asym, 1e-11 * (mag + 1)) << "Y not antisymmetric";
+}
+
 } // namespace

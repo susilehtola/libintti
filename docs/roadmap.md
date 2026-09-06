@@ -600,8 +600,22 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   (tests/test_soc.cpp) against a mixed finite difference of nuclear_matrix
   (W_k = -eps_kij sum_A Z_A d^2/dR_A,i dR_nu,j <mu|1/r_A|nu>, an independent
   oracle) to 1e-5 on all three components, plus the required antisymmetry
-  W_k = -W_k^T (suite 230/230). Remaining M17: the 2e spin-orbit (SOMF/Breit-
-  Pauli) as a new operator on the quartet machinery.
+  W_k = -W_k^T. 2e SO (Coulomb-type) DONE (2026-09-06): spin_orbit_2e_coulomb
+  returns {Y_x,Y_y,Y_z}, Y_k,ul = sum_ns D_ns (u l|SO_k|n s) for the spin-same-
+  orbit operator (r12 x grad_1)/r12^3 contracted with a density over electron 2.
+  Same by-parts trick on the ERI: (r12)_i/r12^3 = -d_{1,i}(1/r12), integrated by
+  parts in r1 the symmetric mu d_i d_j lambda term dies against eps_kij, leaving
+  (u l|SO_k|n s) = eps_kij (d_i u  d_j l|n s) -- plain Coulomb integrals with the
+  electron-1 pair promoted/demoted (detail::eri_block4), no 1/r12^3 kernel.
+  Validated (tests/test_soc.cpp) against a reduction-free mixed centre finite
+  difference: with mu at A_mu+delta, lambda at A_lambda+delta+eta, F=sum D_ns
+  (mu lambda|n s) and Y_k = eps_kij d^2/ddelta_i deta_j F -- differentiating the
+  raw operator via centre shifts, an independent oracle -- to FD accuracy on all
+  three components, plus the antisymmetry Y_k = -Y_k^T (full suite green).
+  Remaining M17: the SOMF/AMFI mean-field contraction (the exchange-type SO term
+  and the spin-coupling coefficients) folding {Y_k} into an effective 1e SO Fock
+  matrix, and a PySCF int2e_p1vxp1 cross-check. The Coulomb-type build here is
+  correctness-first O(N^4); the fused/screened version is a later optimisation.
 
 - **M18 — GPU + performance engineering**: table-driven bit-packed Hermite
   recurrence and batched-GEMM contractions (libintX-style, architecture only
