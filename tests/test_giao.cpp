@@ -451,4 +451,96 @@ TEST(GIAO, NuclearFieldDerivativeVsFiniteDiff) {
   EXPECT_LT(worst, 1e-7 * (scale + 1)) << "analytic dV/dB != finite difference";
 }
 
+// ---- finite-field two-electron J/K (giao_jk) --------------------------------
+// A small s/p basis and a Hermitian complex density.
+intti::ShellBasis<double> jk_basis() {
+  return intti::make_basis<double>({{0.9, {kA[0], kA[1], kA[2]}, 0},
+                                    {1.3, {kB[0], kB[1], kB[2]}, 1},
+                                    {0.6, {kC[0], kC[1], kC[2]}, 0}});
+}
+
+std::vector<C> hermitian_density(int nao) {
+  std::vector<C> D(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j)
+      D[i * nao + j] = C(0.2 + 0.05 * (i + j), 0.03 * (i - j)); // Hermitian
+  return D;
+}
+
+TEST(GIAO, FiniteFieldJKZeroFieldMatchesRealJK) {
+  auto bas = jk_basis();
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  // real symmetric density (imaginary part zero) so the B=0 limit is the real J/K
+  std::vector<double> Dr(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) Dr[i * nao + j] = 0.2 + 0.05 * (i + j);
+  std::vector<C> Dc(Dr.size());
+  for (std::size_t i = 0; i < Dr.size(); ++i) Dc[i] = C(Dr[i], 0.0);
+
+  const double B0[3] = {0.0, 0.0, 0.0};
+  auto jk = intti::giao_jk(bas, Dc.data(), B0, grid);
+
+  std::vector<double> Jr(static_cast<std::size_t>(nao) * nao),
+      Kr(static_cast<std::size_t>(nao) * nao);
+  intti::coulomb_build(bas, Dr.data(), grid, Jr.data());
+  intti::exchange_build(bas, Dr.data(), grid, Kr.data(), 0.0);
+  double mx = 0;
+  for (std::size_t i = 0; i < Jr.size(); ++i) mx = std::max(mx, std::abs(Jr[i]));
+  ASSERT_GT(mx, 1e-6);
+  for (std::size_t i = 0; i < Jr.size(); ++i) {
+    EXPECT_LT(std::abs(jk.J[i].real() - Jr[i]), 1e-12 * mx) << "J real at B=0, i=" << i;
+    EXPECT_LT(std::abs(jk.J[i].imag()), 1e-13 * mx) << "J imag at B=0";
+    EXPECT_LT(std::abs(jk.K[i].real() - Kr[i]), 1e-12 * mx) << "K real at B=0, i=" << i;
+    EXPECT_LT(std::abs(jk.K[i].imag()), 1e-13 * mx) << "K imag at B=0";
+  }
+}
+
+TEST(GIAO, FiniteFieldJKHermitian) {
+  auto bas = jk_basis();
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto D = hermitian_density(nao); // complex Hermitian
+  const double Bp[3] = {0.2, -0.3, 0.7};
+  auto jk = intti::giao_jk(bas, D.data(), Bp, grid);
+  double mx = 0, herm = 0, imag = 0;
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      const std::size_t ij = static_cast<std::size_t>(i) * nao + j;
+      const std::size_t ji = static_cast<std::size_t>(j) * nao + i;
+      mx = std::max(mx, std::abs(jk.J[ij]));
+      herm = std::max(herm, std::abs(jk.J[ij] - std::conj(jk.J[ji])));
+      herm = std::max(herm, std::abs(jk.K[ij] - std::conj(jk.K[ji])));
+      imag = std::max(imag, std::abs(jk.J[ij].imag()));
+    }
+  ASSERT_GT(mx, 1e-6);
+  EXPECT_GT(imag, 1e-6 * mx) << "the field must make J genuinely complex";
+  EXPECT_LT(herm, 1e-12 * mx) << "J,K must be Hermitian for a Hermitian density";
+}
+
+// B -> -B conjugates the London phases, so with a REAL density (which is its
+// own conjugate) the Fock pieces must conjugate. (With a complex density the
+// physical density conjugates too, so this is the clean statement.)
+TEST(GIAO, FiniteFieldJKFieldReversalConjugates) {
+  auto bas = jk_basis();
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<C> D(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) D[i * nao + j] = C(0.2 + 0.05 * (i + j), 0.0);
+  const double Bp[3] = {0.2, -0.3, 0.7}, Bm[3] = {-0.2, 0.3, -0.7};
+  auto jp = intti::giao_jk(bas, D.data(), Bp, grid);
+  auto jm = intti::giao_jk(bas, D.data(), Bm, grid);
+  double mx = 0, rev = 0, imag = 0;
+  for (std::size_t i = 0; i < D.size(); ++i) {
+    mx = std::max(mx, std::abs(jp.J[i]));
+    rev = std::max(rev, std::abs(jm.J[i] - std::conj(jp.J[i])));
+    rev = std::max(rev, std::abs(jm.K[i] - std::conj(jp.K[i])));
+    imag = std::max(imag, std::abs(jp.J[i].imag()));
+  }
+  ASSERT_GT(mx, 1e-6);
+  EXPECT_GT(imag, 1e-6 * mx) << "the field must do something";
+  EXPECT_LT(rev, 1e-12 * mx) << "B -> -B must conjugate J,K";
+}
+
 } // namespace

@@ -36,11 +36,72 @@
 #include "device.hpp"  // detail::to_device / to_host
 #include "erigrad.hpp" // detail::comp_index, detail::eri_block4, permute_block, eri_perms
 #include "fock.hpp"
+#include "giao.hpp" // make_giao_pair (finite-field London pairs)
 #include "gto.hpp"
 #include "quartet.hpp"
 #include "tgrid.hpp"
 
 namespace intti {
+
+/// Complex Coulomb and exchange matrices in a FINITE magnetic field B -- the
+/// two-electron half of the London/GIAO Fock matrix, the piece a finite-field
+/// SCF needs (as opposed to the dJ/dB, dK/dB response derivatives below).
+/// A GIAO ERI is just eri_quartet() on complex scalars (make_giao_pair shifts
+/// the product centre into the complex plane; the t quadrature never forms a
+/// Boys function, so nothing else changes). With the FIRST index of each London
+/// pair conjugated (make_giao_pair),
+///   J_mn = sum_ls (mn|ls)_B D_ls,   K_mn = sum_ls (ml|sn)_B D_ls.
+/// NOTE the exchange index order (ml|sn), NOT the (ml|ns) of giao_jk_dB: for a
+/// real ERI the two coincide (which is why the B=0 derivative may use either),
+/// but at finite B only (ml|sn) gives a Hermitian K. Using (ab|cd)* = (ba|dc)
+/// and (ab|cd) = (cd|ab), both J and K are Hermitian for Hermitian D.
+/// D is the complex (Hermitian) AO density, row-major.
+///
+/// The London phases break the 8-fold ERI symmetry ((mn|ls) != (nm|ls); it
+/// conjugates instead), so all ordered shell quartets are evaluated.
+template <class Real> struct GiaoJK {
+  std::vector<std::complex<Real>> J, K;
+};
+
+template <class Real>
+GiaoJK<Real> giao_jk(const ShellBasis<Real> &basis, const std::complex<Real> *D,
+                     const Real B[3], const TGrid<Real> &grid) {
+  using C = std::complex<Real>;
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  GiaoJK<Real> out;
+  out.J.assign(n2, C(0));
+  out.K.assign(n2, C(0));
+  std::vector<C> blk;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      const auto bra = make_giao_pair(basis.shells[a], basis.shells[b], B);
+      const int na = ncart(basis.shells[a].l), nb = ncart(basis.shells[b].l);
+      const int oa = basis.ao_off[a], ob = basis.ao_off[b];
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          const auto ket = make_giao_pair(basis.shells[c], basis.shells[d], B);
+          const int nc = ncart(basis.shells[c].l), nd = ncart(basis.shells[d].l);
+          const int oc = basis.ao_off[c], od = basis.ao_off[d];
+          blk.assign(static_cast<std::size_t>(na) * nb * nc * nd, C(0));
+          eri_quartet(bra, ket, grid, blk.data());
+          for (int ka = 0; ka < na; ++ka)
+            for (int kb = 0; kb < nb; ++kb)
+              for (int kc = 0; kc < nc; ++kc)
+                for (int kd = 0; kd < nd; ++kd) {
+                  const C v = blk[((static_cast<std::size_t>(ka) * nb + kb) * nc + kc) * nd + kd];
+                  // J_mn = sum (mn|ls) D_ls with (m,n)=(a,b), (l,s)=(c,d)
+                  out.J[static_cast<std::size_t>(oa + ka) * nao + ob + kb] +=
+                      v * D[static_cast<std::size_t>(oc + kc) * nao + od + kd];
+                  // K_mn = sum (ml|sn) D_ls with (m,l)=(a,b), (s,n)=(c,d)
+                  out.K[static_cast<std::size_t>(oa + ka) * nao + od + kd] +=
+                      v * D[static_cast<std::size_t>(ob + kb) * nao + oc + kc];
+                }
+        }
+    }
+  return out;
+}
 
 namespace detail {
 
