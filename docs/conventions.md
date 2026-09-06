@@ -164,3 +164,35 @@ Differentiating a LIP expansion loses roughly one order of accuracy per
 derivative and is worst at element boundaries, which would silently cap the
 precision of a pillar whose whole point is being convergent to near machine
 precision.
+
+### If derivatives are added to the grid route
+
+The FE grid is geometry-dependent (it is built from the AO-product envelopes),
+so a naive dE/dR picks up a grid-motion term
+
+```
+dE/dR = sum_g w_g df/dR  +  sum_g [ (dw_g/dR) f + w_g grad f . (dr_g/dR) ]
+```
+
+the second group being the Pulay analogue. Three rules:
+
+1. **Freeze the grid while differentiating** (perturbation-independent grid).
+   The grid-motion term then vanishes identically and dE/dR is the quadrature of
+   the analytically differentiated integrand -- exactly why the t-quadrature
+   derivatives work, since the t grid is perturbation-independent. It also makes
+   the force the exact derivative of the energy actually computed, so forces are
+   consistent with the surface being optimised on; a grid that moves with
+   geometry gives energy and gradient from different discretisations (the "grid
+   noise" pathology of Becke grids in DFT).
+
+2. **Raise the resolved degree.** The hp construction resolves
+   (x-c)^d exp(-a(x-c)^2) for d = 0..2*lmax; the MD shift raises the Cartesian
+   degree by one per derivative, so use pdeg = 2*lmax + n_deriv. Grid size grows
+   slowly with degree, so this is a refinement, not a new grid.
+
+3. **Validate against the analytic derivative, not finite differences.** The
+   exact MD-shift derivative integrals are available, so grid-derivative
+   completeness is directly measurable. Converge on
+   ||grad_grid - grad_analytic||, NOT on the energy: derivative precision lags
+   energy precision on a given grid, so an energy-converged grid does not imply
+   a derivative-converged one.
