@@ -23,7 +23,10 @@
 
 #include <array>
 #include <cmath>
+#include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -54,35 +57,35 @@ const std::vector<Atom> kAtoms = {{8.0, {0.0, 0.0, -0.1230376}},
 
 // Uncontracted s/p orbital basis: no contraction question, and s/p span the
 // same space in Cartesian and spherical form.
-std::vector<Shell> orbital_shells() {
+std::vector<Shell> orbital_shells(const std::vector<Atom> &at = kAtoms) {
   const std::vector<double> os = {130.70932, 23.808861, 6.4436083, 1.1695961, 0.3803890};
   const std::vector<double> op = {5.0331513, 1.1695961, 0.3803890};
   const std::vector<double> hs = {3.4252509, 0.6239137, 0.1688554};
   std::vector<Shell> sh;
-  const auto &O = kAtoms[0].R;
+  const auto &O = at[0].R;
   for (double a : os) sh.push_back({a, {O[0], O[1], O[2]}, 0});
   for (double a : op) sh.push_back({a, {O[0], O[1], O[2]}, 1});
   for (int h = 1; h <= 2; ++h) {
-    const auto &H = kAtoms[h].R;
+    const auto &H = at[h].R;
     for (double a : hs) sh.push_back({a, {H[0], H[1], H[2]}, 0});
   }
   return sh;
 }
 
 // Auxiliary basis spanning the orbital products (s x s, s x p, p x p -> up to d).
-std::vector<Shell> auxiliary_shells() {
+std::vector<Shell> auxiliary_shells(const std::vector<Atom> &at = kAtoms) {
   const std::vector<double> as = {52.0, 13.0, 3.2, 0.8, 0.25};
   const std::vector<double> ap = {6.4, 1.6, 0.4};
   const std::vector<double> ad = {2.4, 0.6};
   const std::vector<double> bs = {6.8, 1.7, 0.42};
   const std::vector<double> bp = {1.4};
   std::vector<Shell> sh;
-  const auto &O = kAtoms[0].R;
+  const auto &O = at[0].R;
   for (double a : as) sh.push_back({a, {O[0], O[1], O[2]}, 0});
   for (double a : ap) sh.push_back({a, {O[0], O[1], O[2]}, 1});
   for (double a : ad) sh.push_back({a, {O[0], O[1], O[2]}, 2});
   for (int h = 1; h <= 2; ++h) {
-    const auto &H = kAtoms[h].R;
+    const auto &H = at[h].R;
     for (double a : bs) sh.push_back({a, {H[0], H[1], H[2]}, 0});
     for (double a : bp) sh.push_back({a, {H[0], H[1], H[2]}, 1});
   }
@@ -314,6 +317,148 @@ std::vector<std::array<double, 3>> rhf_gradient(const std::vector<Shell> &orb_sh
   return g;
 }
 
+
+/// RI-RHF energy and per-atom force at a given geometry: the whole stack --
+/// basis placement, RI fit, SCF, analytic gradient -- rebuilt from scratch, as a
+/// geometry step must. The basis rides with the atoms, so orbital AND auxiliary
+/// shells are re-placed every step.
+double ri_energy_and_force(const std::vector<Atom> &at, int nocc,
+                           const intti::TGrid<double> &grid, std::vector<double> &g) {
+  const auto osh = orbital_shells(at);
+  const auto ash = auxiliary_shells(at);
+  auto orbb = intti::make_basis(osh);
+  auto auxb = intti::make_basis(ash);
+  const auto fit = intti::ri_fit(orbb, auxb, grid);
+  const auto scf =
+      rhf(osh, at, nocc, grid,
+          [&](const intti::ShellBasis<double> &, const double *D, double *J, double *K) {
+            intti::ri_jk(fit, D, J, K);
+          });
+  if (!scf.converged) return std::numeric_limits<double>::quiet_NaN();
+  const auto sa = orbital_shell_atoms();
+  const auto xa = auxiliary_shell_atoms();
+  const auto f = rhf_gradient(
+      osh, sa, at, nocc, scf, grid,
+      [&](const intti::ShellBasis<double> &orb, const double *D,
+          std::vector<std::array<double, 3>> &acc) {
+        const auto gj = intti::ri_j_gradient(orb, auxb, D, grid);
+        const auto gk = intti::ri_k_gradient(orb, auxb, D, grid);
+        for (std::size_t i = 0; i < gj.forb.size(); ++i)
+          for (int c = 0; c < 3; ++c) acc[sa[i]][c] += gj.forb[i][c] + gk.forb[i][c];
+        for (std::size_t i = 0; i < gj.faux.size(); ++i)
+          for (int c = 0; c < 3; ++c) acc[xa[i]][c] += gj.faux[i][c] + gk.faux[i][c];
+      });
+  g.assign(3 * at.size(), 0.0);
+  for (std::size_t a = 0; a < at.size(); ++a)
+    for (int c = 0; c < 3; ++c) g[3 * a + c] = f[a][c];
+  return scf.E;
+}
+
+struct Opt {
+  std::vector<Atom> atoms;
+  double E{0}, gmax{0};
+  int steps{0};
+  bool converged{false};
+};
+
+/// BFGS geometry optimisation in Cartesian coordinates. The three translational
+/// and three rotational directions are exact null directions of the energy, so
+/// the gradient has no component along them and the iteration simply never moves
+/// there -- no projection needed.
+Opt optimize_ri_rhf(std::vector<Atom> at, int nocc, const intti::TGrid<double> &grid) {
+  const int n = 3 * static_cast<int>(at.size());
+  auto flat = [&](const std::vector<Atom> &a) {
+    std::vector<double> x(n);
+    for (std::size_t i = 0; i < a.size(); ++i)
+      for (int c = 0; c < 3; ++c) x[3 * i + c] = a[i].R[c];
+    return x;
+  };
+  auto place = [&](const std::vector<double> &x) {
+    std::vector<Atom> a = at;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      for (int c = 0; c < 3; ++c) a[i].R[c] = x[3 * i + c];
+    return a;
+  };
+  std::vector<double> x = flat(at), g, xn, gn;
+  double E = ri_energy_and_force(at, nocc, grid, g);
+  // inverse Hessian, initialised to a plausible Cartesian scale (bohr^2/Ha)
+  std::vector<double> H(static_cast<std::size_t>(n) * n, 0.0);
+  for (int i = 0; i < n; ++i) H[i * n + i] = 0.5;
+  Opt out;
+  for (int it = 0; it < 60; ++it) {
+    double gmax = 0;
+    for (double v : g) gmax = std::max(gmax, std::abs(v));
+    if (gmax < 1e-7) {
+      out.atoms = place(x);
+      out.E = E;
+      out.gmax = gmax;
+      out.steps = it;
+      out.converged = true;
+      return out;
+    }
+    std::vector<double> p(n, 0.0); // search direction -H g
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) p[i] -= H[i * n + j] * g[j];
+    double slope = 0;
+    for (int i = 0; i < n; ++i) slope += p[i] * g[i];
+    if (slope > 0) { // not a descent direction: reset to steepest descent
+      for (int i = 0; i < n; ++i) p[i] = -g[i];
+      slope = 0;
+      for (int i = 0; i < n; ++i) slope += p[i] * g[i];
+      std::fill(H.begin(), H.end(), 0.0);
+      for (int i = 0; i < n; ++i) H[i * n + i] = 0.5;
+    }
+    double step = 1.0, En = 0;
+    bool ok = false;
+    // Armijo, with an absolute slack at the energy noise floor. The J/K digests
+    // scatter with atomics, so the summation order -- and hence the energy at
+    // the last couple of digits -- varies between runs of identical code. Close
+    // to the minimum the true energy change per step falls below that noise, and
+    // a strict Armijo test then rejects every backtrack and reports a spurious
+    // stall. The gradient is still meaningful there, so let the step through.
+    const double kEnergyNoise = 1e-11;
+    for (int ls = 0; ls < 20; ++ls) {
+      xn = x;
+      for (int i = 0; i < n; ++i) xn[i] += step * p[i];
+      En = ri_energy_and_force(place(xn), nocc, grid, gn);
+      if (std::isfinite(En) && En <= E + 1e-4 * step * slope + kEnergyNoise) {
+        ok = true;
+        break;
+      }
+      step *= 0.5;
+    }
+    if (!ok) break;
+    // BFGS update of the inverse Hessian
+    std::vector<double> sv(n), yv(n);
+    for (int i = 0; i < n; ++i) {
+      sv[i] = xn[i] - x[i];
+      yv[i] = gn[i] - g[i];
+    }
+    double sy = 0;
+    for (int i = 0; i < n; ++i) sy += sv[i] * yv[i];
+    if (sy > 1e-12) {
+      std::vector<double> Hy(n, 0.0);
+      for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) Hy[i] += H[i * n + j] * yv[j];
+      double yHy = 0;
+      for (int i = 0; i < n; ++i) yHy += yv[i] * Hy[i];
+      for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+          H[i * n + j] += ((sy + yHy) * sv[i] * sv[j]) / (sy * sy) -
+                          (Hy[i] * sv[j] + sv[i] * Hy[j]) / sy;
+    }
+    x = xn;
+    g = gn;
+    E = En;
+    out.steps = it + 1;
+  }
+  out.atoms = place(x);
+  out.E = E;
+  out.gmax = 0;
+  for (double v : g) out.gmax = std::max(out.gmax, std::abs(v));
+  return out;
+}
+
 // PySCF references: prototype/pyscf_scf_validation.py, same molecule, the same
 // uncontracted s/p orbital basis and s/p/d auxiliary basis, cart=True (20 AOs,
 // 38 auxiliary functions, E_nuc = 9.220256432808192). The milestone asks for
@@ -446,6 +591,72 @@ TEST(Scf, RiRhfGradientMatchesPyscfDensityFitting) {
     for (int a = 0; a < 3; ++a) t += g[a][c];
     EXPECT_NEAR(t, 0.0, 1e-9) << "net force, component " << c;
   }
+}
+
+// PySCF references for the optimised structure (prototype/pyscf_scf_validation.py).
+// geomeTRIC's own RI-RHF optimum: r(OH) = 1.832819602711 bohr, 105.691328365 deg.
+// PySCF re-evaluated AT libintti's optimum: E = -75.155334879290081 with
+// |grad|max = 1.8e-08, i.e. PySCF agrees the structure is stationary.
+constexpr double kPyscfOptROH = 1.832819602711;
+constexpr double kPyscfOptAngle = 105.691328365;
+constexpr double kPyscfEnergyAtOurOptimum = -75.155334879290081;
+
+TEST(Scf, RiRhfGeometryOptimizationMatchesPyscf) {
+  // Capstone stage C: a geometry optimisation driven end to end by libintti --
+  // energy, analytic force, basis re-placement at every step -- validated
+  // externally.
+  //
+  // The primary assertion is NOT "our Cartesians equal geomeTRIC's". geomeTRIC
+  // converges on a combination of displacement and energy change as well as the
+  // gradient, and here it stopped first: its structure sits 2e-11 Ha ABOVE the
+  // one found below, and its r(OH) differs by 7e-6 bohr. Comparing to it tightly
+  // would be measuring geomeTRIC's convergence, not our correctness.
+  //
+  // What is asserted instead: our optimiser drives OUR force to < 1e-7, and
+  // PySCF, evaluated at the structure we return, reproduces the energy to 1e-9
+  // (and independently finds |grad| = 1.8e-8 there -- see the script). The
+  // internal coordinates are then compared to geomeTRIC's at ITS convergence.
+  //
+  // Geometries are compared as INTERNAL coordinates: a stationary point is a
+  // six-parameter family under translation and rotation, so raw Cartesians would
+  // differ even for identical structures.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const auto opt = optimize_ri_rhf(kAtoms, 5, grid);
+  ASSERT_TRUE(opt.converged) << "optimisation stalled after " << opt.steps
+                             << " steps, |g|max = " << opt.gmax;
+  EXPECT_LT(opt.gmax, 1e-7) << "residual force at the reported minimum";
+  // regenerate the PySCF cross-check from this line if the basis ever changes
+  std::printf("OPTGEOM %.12f %.12f %.12f | %.12f %.12f %.12f | %.12f %.12f %.12f | E %.15f\n",
+              opt.atoms[0].R[0], opt.atoms[0].R[1], opt.atoms[0].R[2], opt.atoms[1].R[0],
+              opt.atoms[1].R[1], opt.atoms[1].R[2], opt.atoms[2].R[0], opt.atoms[2].R[1],
+              opt.atoms[2].R[2], opt.E);
+
+  auto dist = [](const Atom &a, const Atom &b) {
+    double r2 = 0;
+    for (int c = 0; c < 3; ++c) {
+      const double d = a.R[c] - b.R[c];
+      r2 += d * d;
+    }
+    return std::sqrt(r2);
+  };
+  const double r1 = dist(opt.atoms[0], opt.atoms[1]);
+  const double r2 = dist(opt.atoms[0], opt.atoms[2]);
+  double dot = 0;
+  for (int c = 0; c < 3; ++c)
+    dot += (opt.atoms[1].R[c] - opt.atoms[0].R[c]) * (opt.atoms[2].R[c] - opt.atoms[0].R[c]);
+  const double ang = std::acos(dot / (r1 * r2)) * 180.0 / std::acos(-1.0);
+
+  // the external check: PySCF's energy at the structure we returned
+  EXPECT_NEAR(opt.E, kPyscfEnergyAtOurOptimum, 1e-9) << "energy at our stationary point";
+  // C2v is not imposed anywhere -- the two bonds must come out equal on their own
+  EXPECT_NEAR(r1, r2, 1e-9) << "the two OH bonds should optimise to the same length";
+  // vs geomeTRIC, at geomeTRIC's convergence (not ours)
+  EXPECT_NEAR(r1, kPyscfOptROH, 5e-5) << "r(OH) vs geomeTRIC";
+  EXPECT_NEAR(ang, kPyscfOptAngle, 1e-3) << "angle(HOH) vs geomeTRIC";
+  // the structure genuinely moved from the starting geometry
+  const double r_start = std::sqrt(1.4300472 * 1.4300472 + (0.9762012 + 0.1230376) *
+                                                               (0.9762012 + 0.1230376));
+  EXPECT_GT(std::abs(r1 - r_start), 1e-3) << "optimiser did not move the structure";
 }
 
 TEST(Scf, NuclearRepulsionMatchesPyscf) {

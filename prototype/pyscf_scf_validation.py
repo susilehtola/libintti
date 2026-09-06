@@ -41,6 +41,15 @@ B_S = [6.8, 1.7, 0.42]
 B_P = [1.4]
 
 
+# libintti's optimised structure, from the OPTGEOM line printed by
+# Scf.RiRhfGeometryOptimizationMatchesPyscf in tests/test_scf.cpp
+INTTI_OPT_GEOM = [
+    ["O", (0.000000000000, -0.000000000001, -0.128179628927)],
+    ["H", (-0.000000000001, 1.460774327312, 0.978772214463)],
+    ["H", (0.000000000000, -1.460774327311, 0.978772214464)],
+]
+
+
 def uncontracted(*shells):
     """[(l, [exponents]), ...] -> PySCF basis entry, one primitive per shell."""
     out = []
@@ -85,6 +94,45 @@ def main():
     print("grad(df.RHF):")
     for row in np.asarray(gdf):
         print("    {" + ", ".join(f"{x:.15f}" for x in row) + "},")
+    # capstone stage C: independently optimised geometry (geomeTRIC), RI-RHF
+    from pyscf.geomopt.geometric_solver import optimize as geom_optimize
+
+    conv = {"convergence_grms": 1e-7, "convergence_gmax": 1e-7,
+            "convergence_drms": 1e-6, "convergence_dmax": 1e-6,
+            "convergence_energy": 1e-10}
+    mol_eq = geom_optimize(df.density_fit(scf.RHF(mol), auxbasis=auxbasis),
+                           **{"conv_params": conv})
+    assert mol_eq.cart, "optimised molecule lost cart=True"
+    coords = mol_eq.atom_coords()  # bohr
+    mf_eq = df.density_fit(scf.RHF(mol_eq), auxbasis=auxbasis)
+    mf_eq.conv_tol = 1e-12
+    e_eq = mf_eq.kernel()
+    print("optimised geometry (bohr, RI-RHF):")
+    for row in np.asarray(coords):
+        print("    {" + ", ".join(f"{x:.12f}" for x in row) + "},")
+    roh = np.linalg.norm(coords[1] - coords[0])
+    roh2 = np.linalg.norm(coords[2] - coords[0])
+    v1 = (coords[1] - coords[0]) / roh
+    v2 = (coords[2] - coords[0]) / roh2
+    ang = np.degrees(np.arccos(np.dot(v1, v2)))
+    print(f"r(OH)      = {roh:.12f} bohr  ({roh2:.12f})")
+    print(f"angle(HOH) = {ang:.9f} deg")
+    print(f"E(opt)     = {e_eq:.15f}")
+
+    # Cross-check at libintti's OWN optimised structure (the OPTGEOM line printed
+    # by Scf.RiRhfGeometryOptimizationMatchesPyscf). This is the assertion that
+    # matters for stage C: geomeTRIC converges on displacement/energy as well as
+    # gradient and here stopped first, so its geometry is NOT the tighter of the
+    # two -- comparing to it closely would measure its convergence, not ours.
+    mol_i = gto.M(atom=INTTI_OPT_GEOM, basis=basis, unit="Bohr", cart=True, verbose=0)
+    mf_i = df.density_fit(scf.RHF(mol_i), auxbasis=auxbasis)
+    mf_i.conv_tol = 1e-12
+    e_i = mf_i.kernel()
+    g_i = mf_i.nuc_grad_method().kernel()
+    print(f"E at libintti optimum   = {e_i:.15f}")
+    print(f"|grad| there            = {np.abs(g_i).max():.3e}")
+    print(f"E(geomeTRIC) - E(intti) = {e_eq - e_i:.3e}")
+    assert np.abs(g_i).max() < 1e-7, "PySCF does not agree libintti's structure is stationary"
     return e, e0, g0
 
 
