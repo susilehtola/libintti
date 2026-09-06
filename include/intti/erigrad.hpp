@@ -113,12 +113,15 @@ Real pair_schwarz_margin(const PrimitiveShell<Real> &a, const PrimitiveShell<Rea
 // promoted/demoted blocks through eri_quartets (one device pass) and run the
 // gradient contraction on device with atomic accumulation into the per-shell
 // forces. Exact (tau = 0) path only; correctness-first, so it materialises the
-// full quartet list (fine for the validation sizes; screened/streamed + symmetry
-// reinstated is the production follow-up). l <= LMAX-1 (each shell is promoted).
+// materialised quartet list. tau > 0 applies the same Schwarz + density screen
+// as the host build during enumeration (host-side), so large systems produce a
+// feasible O(ns^2)-ish list; tau = 0 is the full O(ns^4) exact list (validation
+// sizes). The 8-fold symmetry is still dropped (8x work) -- reinstating it and
+// streaming the batch are the remaining production follow-ups. l <= LMAX-1.
 template <class Real>
 std::vector<std::array<Real, 3>>
 two_electron_gradient_dev(const ShellBasis<Real> &basis, const Real *D,
-                          const TGrid<Real> &grid) {
+                          const TGrid<Real> &grid, Real tau) {
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao;
   // per-shell device data
@@ -133,6 +136,24 @@ two_electron_gradient_dev(const ShellBasis<Real> &basis, const Real *D,
   auto shOff = to_device(hOff, "intti::g2::off");
   auto shAl = to_device(hAl, "intti::g2::al");
   auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "intti::g2::D");
+
+  // Schwarz margins + per-pair density maxima for screening (host, as the host
+  // build does); empty when tau == 0 (exact).
+  auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
+  std::vector<Real> Q, Dmax;
+  if (tau > Real(0)) {
+    Q.assign(static_cast<std::size_t>(ns) * ns, Real(0));
+    Dmax.assign(static_cast<std::size_t>(ns) * ns, Real(0));
+    for (int i = 0; i < ns; ++i)
+      for (int j = 0; j < ns; ++j) {
+        Q[i * ns + j] = pair_schwarz_margin(basis.shells[i], basis.shells[j], grid);
+        Real m = 0;
+        for (int ki = 0; ki < ncart(basis.shells[i].l); ++ki)
+          for (int kj = 0; kj < ncart(basis.shells[j].l); ++kj)
+            m = std::max(m, std::abs(Dm(basis.ao_off[i] + ki, basis.ao_off[j] + kj)));
+        Dmax[i * ns + j] = m;
+      }
+  }
 
   // build the pair list, the batch (bra,ket) list, and per-quartet block entries
   std::vector<ShellPair<Real>> plist;
@@ -151,6 +172,14 @@ two_electron_gradient_dev(const ShellBasis<Real> &basis, const Real *D,
       for (int c = 0; c < ns; ++c)
         for (int d = 0; d < ns; ++d) {
           const int L[4] = {hL[a], hL[b], hL[c], hL[d]};
+          if (tau > Real(0)) {
+            const int sh[4] = {a, b, c, d};
+            Real dw = 0;
+            for (int i = 0; i < 4; ++i)
+              for (int jj = 0; jj < 4; ++jj) dw = std::max(dw, Dmax[sh[i] * ns + sh[jj]]);
+            const Real almax = std::max({hAl[a], hAl[b], hAl[c], hAl[d]});
+            if (2 * almax * Q[a * ns + b] * Q[c * ns + d] * dw * dw < tau) continue;
+          }
           qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
           for (int pos = 0; pos < 4; ++pos) {
             // plus: shell at pos promoted
@@ -271,13 +300,11 @@ std::vector<std::array<Real, 3>>
 two_electron_gradient(const ShellBasis<Real> &basis, const Real *D,
                       const TGrid<Real> &grid, Real tau = Real(0)) {
   if constexpr (kokkos_scalar_v<Real>) {
-    // exact (unscreened) case -> GPU; screened path keeps the host symmetry replay
-    if (tau == Real(0)) {
-      bool ok = true;
-      for (const auto &s : basis.shells)
-        if (s.l >= LMAX) ok = false; // each shell is promoted to l+1
-      if (ok) return detail::two_electron_gradient_dev(basis, D, grid);
-    }
+    // device path handles both exact (tau=0) and screened (tau>0) enumeration
+    bool ok = true;
+    for (const auto &s : basis.shells)
+      if (s.l >= LMAX) ok = false; // each shell is promoted to l+1
+    if (ok) return detail::two_electron_gradient_dev(basis, D, grid, tau);
   }
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao;
