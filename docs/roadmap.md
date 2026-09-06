@@ -662,9 +662,14 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   229/229. ncenter RI 2c/3c DONE (2026-09-06): primitive coulomb_2c/coulomb_3c
   batch all ghost-shell quartets into one eri_quartets call (class-sorted) and
   scatter on device -- the last host piece of the RI-JK spine. __float128, the
-  3c far-field, and the contracted-basis overloads + coulomb_3c_auxblock keep
-  the host path (the contracted ones await an eri_quartets_accumulate coeff+
-  segment port). 1e geometry-derivative integrals DONE (2026-09-06):
+  3c far-field, and coulomb_3c_auxblock keep the host path. Contracted
+  coulomb_2c/3c (ContractedBasis) are ALSO device (2026-09-06): to_contracted_dev
+  flattens the effective coeffs + per-shell data, every primitive ghost-quartet
+  is evaluated once in a batched call, and a parallel_for accumulates it
+  coeff-weighted into the contracted blocks with atomics (I<->J fill for 2c,
+  mu<->nu mirror for 3c) -- shared-primitive contraction, validated vs
+  decontract/recontract. Whole RI spine (primitive + contracted) is now device.
+  1e geometry-derivative integrals DONE (2026-09-06):
   overlap_deriv/kinetic_deriv/nuclear_deriv (PySCF int1e_ip{ovlp,kin,nuc})
   ported via make_1e_pairs (bra +1 for the d/dR_bra shift; +alpha exponent and
   an all_pairs mode added -- gradients are not symmetric, so every ordered pair
