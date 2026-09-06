@@ -35,6 +35,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "erigrad.hpp" // detail::eri_block4, detail::comp_index
@@ -272,7 +273,8 @@ KOKKOS_INLINE_FUNCTION int so_terms(int l, const int c3[3], Real alpha, int dir,
 /// Shared batch: the 4 shifted-bra x unshifted-ket quartets per ordered quartet.
 template <class Real> struct SO2eBatch {
   Kokkos::View<Real *> out, shAl;
-  Kokkos::View<int *> qa, qb, qc, qd, e00, e01, e10, e11, shL, shOff, boff;
+  Kokkos::View<int *> qa, qb, qc, qd, e00, e01, e10, e11, shL, shOff;
+  Kokkos::View<std::int64_t *> boff; ///< 64-bit: see QuartetBatch::out_offset
   int njob{0}, nao{0};
 };
 
@@ -355,8 +357,9 @@ spin_orbit_2e_coulomb_dev(const ShellBasis<Real> &basis, const Real *D,
         const int nc = ncart(lc), nd = ncart(ld);
         const Real ala = shAl(a), alb = shAl(b);
         const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
-        const int base[2][2] = {{boff(e00(j)), e01(j) >= 0 ? boff(e01(j)) : 0},
-                                {e10(j) >= 0 ? boff(e10(j)) : 0, e11(j) >= 0 ? boff(e11(j)) : 0}};
+        const std::int64_t base[2][2] = {
+            {boff(e00(j)), e01(j) >= 0 ? boff(e01(j)) : 0},
+            {e10(j) >= 0 ? boff(e10(j)) : 0, e11(j) >= 0 ? boff(e11(j)) : 0}};
         for (int ka = 0; ka < ncart(la); ++ka) {
           int a3[3];
           cart_comp(la, ka, a3[0], a3[1], a3[2]);
@@ -421,8 +424,9 @@ spin_orbit_2e_exchange_dev(const ShellBasis<Real> &basis, const Real *D,
         const int nc = ncart(lc), nd = ncart(ld);
         const Real ala = shAl(a), alb = shAl(b);
         const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
-        const int base[2][2] = {{boff(e00(j)), e01(j) >= 0 ? boff(e01(j)) : 0},
-                                {e10(j) >= 0 ? boff(e10(j)) : 0, e11(j) >= 0 ? boff(e11(j)) : 0}};
+        const std::int64_t base[2][2] = {
+            {boff(e00(j)), e01(j) >= 0 ? boff(e01(j)) : 0},
+            {e10(j) >= 0 ? boff(e10(j)) : 0, e11(j) >= 0 ? boff(e11(j)) : 0}};
         for (int ka = 0; ka < ncart(la); ++ka) {
           int a3[3];
           cart_comp(la, ka, a3[0], a3[1], a3[2]);

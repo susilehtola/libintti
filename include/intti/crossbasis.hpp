@@ -28,6 +28,7 @@
 // across distinct bases anyway).
 
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -113,7 +114,7 @@ std::vector<Real> coulomb_cross(const ShellBasis<Real> &bra, const ShellBasis<Re
         const int ib = qb(iq), ik = qk(iq);
         const int na = ncart(la(ib)), nb = ncart(lb(ib));
         const int nc = ncart(lc(ik)), nd = ncart(ld(ik));
-        const int base = offv(iq);
+        const std::int64_t base = offv(iq);
         for (int ka = 0; ka < na; ++ka)
           for (int kb = 0; kb < nb; ++kb) {
             Real acc = 0;
@@ -189,7 +190,7 @@ std::vector<Real> exchange_cross(const ShellBasis<Real> &bra, const ShellBasis<R
         const int ib = qb(iq), ik = qk(iq);
         const int nm = ncart(lm(ib)), nl = ncart(ll(ib));
         const int nss = ncart(ls(ik)), nn = ncart(ln(ik));
-        const int base = offv(iq);
+        const std::int64_t base = offv(iq);
         for (int km = 0; km < nm; ++km)
           for (int kn = 0; kn < nn; ++kn) {
             Real acc = 0;

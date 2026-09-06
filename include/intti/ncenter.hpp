@@ -11,6 +11,7 @@
 // Matrix/tensor-level API only: whole (P|Q) matrix and (mu nu|P) tensor.
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "batch.hpp"      // PairTable, make_batch, eri_quartets (device driver)
@@ -83,7 +84,8 @@ std::vector<Real> coulomb_2c_dev(const ShellBasis<Real> &aux, const TGrid<Real> 
       "intti::c2c::scatter", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int iq) {
         const int a = qv(iq, 0), b = qv(iq, 1);
         const int nP = ncart(lav(a)), nQ = ncart(lav(b));
-        const int off = offv(iq), oa = auxoff(a), ob = auxoff(b);
+        const std::int64_t off = offv(iq);
+        const int oa = auxoff(a), ob = auxoff(b);
         for (int kP = 0; kP < nP; ++kP)
           for (int kQ = 0; kQ < nQ; ++kQ) {
             const Real v = out(off + kP * nQ + kQ);
@@ -141,7 +143,7 @@ std::vector<Real> coulomb_3c_dev(const ShellBasis<Real> &orb,
         const int ib = qv(iq, 0), ik = qv(iq, 1);      // bra pair id, ket (ghost) pair id
         const int aidx = ik - nbra;                    // aux shell = ket pair id - nbra
         const int nm = ncart(lav(ib)), nn = ncart(lbv(ib)), nP = ncart(lav(ik));
-        const int off = offv(iq);
+        const std::int64_t off = offv(iq);
         const int om = moff(ib), on = noff(ib), oP = auxoff(aidx);
         const bool offdiag = (om != on); // distinct orbital shells -> mu<->nu mirror
         for (int km = 0; km < nm; ++km)
@@ -229,7 +231,7 @@ std::vector<Real> coulomb_2c_dev(const ContractedBasis<Real> &aux, const TGrid<R
       "intti::c2cc::scatter", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int iq) {
         const int A = dqA(iq), B = dqB(iq), pa = dqpa(iq), pb = dqpb(iq);
         const int lA = Lv(A), lB = Lv(B), nP = ncart(lA), nQ = ncart(lB);
-        const int base = offv(iq);
+        const std::int64_t base = offv(iq);
         for (int cA = 0; cA < ncv(A); ++cA) {
           const Real wa = eff(eov(A) + cA * npv(A) + pa);
           if (wa == Real(0)) continue;
@@ -291,7 +293,7 @@ std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
       "intti::c3cc::scatter", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int iq) {
         const int M = dM(iq), N = dN(iq), A = dA(iq), pm = dpm(iq), pn = dpn(iq), pa = dpa(iq);
         const int nm = ncart(oL(M)), nn = ncart(oL(N)), nP = ncart(aL(A));
-        const int base = offv(iq);
+        const std::int64_t base = offv(iq);
         const bool offdiag = (M != N);
         for (int cM = 0; cM < onc(M); ++cM) {
           const Real wm = oeff(oeo(M) + cM * onp(M) + pm);

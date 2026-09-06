@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <vector>
 
@@ -115,9 +116,9 @@ void ri_grad_digest(RIGradJobs<Real> &jobs, const TGrid<Real> &grid,
         const int nc[4] = {ncart(L[0]), ncart(L[1]), ncart(L[2]), ncart(L[3])};
         const int p = posv(j), lp = L[p], tgt = tgtv(j);
         const Real ap = alv(j);
-        const int pb = offv(pE(j));
+        const std::int64_t pb = offv(pE(j));
         const bool hasm = mE(j) >= 0;
-        const int mb = hasm ? offv(mE(j)) : 0;
+        const std::int64_t mb = hasm ? offv(mE(j)) : 0;
         int npl[4], nmi[4];
         for (int i = 0; i < 4; ++i) { npl[i] = nc[i]; nmi[i] = nc[i]; }
         npl[p] = ncart(lp + 1);

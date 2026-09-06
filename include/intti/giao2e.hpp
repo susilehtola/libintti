@@ -29,6 +29,7 @@
 
 #include <array>
 #include <complex>
+#include <cstdint>
 #include <cstddef>
 #include <vector>
 
@@ -142,7 +143,7 @@ GiaoJK<Real> giao_jk_dev(const ShellBasis<Real> &basis, const std::complex<Real>
         const int na = ncart(lav(ib)), nb = ncart(lbv(ib));
         const int nc = ncart(lav(ik)), nd = ncart(lbv(ik));
         const int oa = oav(ib), ob = obv(ib), oc = oav(ik), od = obv(ik);
-        const int base = offv(iq);
+        const std::int64_t base = offv(iq);
         for (int ka = 0; ka < na; ++ka)
           for (int kb = 0; kb < nb; ++kb)
             for (int kc = 0; kc < nc; ++kc)
@@ -287,7 +288,7 @@ void giao_jk_dB_dev(const ShellBasis<Real> &basis, const Real *D, const TGrid<Re
         const int nbase[4] = {na, nb, nc, nd};
         const int npA[4] = {ncart(la + 1), nb, nc, nd};
         const int npC[4] = {na, nb, ncart(lc + 1), nd};
-        const int bB = offv(dB(j)), bBra = offv(dBra(j)), bKet = offv(dKet(j));
+        const std::int64_t bB = offv(dB(j)), bBra = offv(dBra(j)), bKet = offv(dKet(j));
         const Real w1[3] = {shC(a, 0) - shC(b, 0), shC(a, 1) - shC(b, 1), shC(a, 2) - shC(b, 2)};
         const Real w2[3] = {shC(c, 0) - shC(d, 0), shC(c, 1) - shC(d, 1), shC(c, 2) - shC(d, 2)};
         const Real Ra[3] = {shC(a, 0), shC(a, 1), shC(a, 2)};

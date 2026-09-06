@@ -114,7 +114,7 @@ std::vector<Real> schwarz(const PairTable<Real> &pairs,
   eri_quartets(pairs, batch, grid, out, ws);
   auto oh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, out);
   std::vector<Real> Q(npair);
-  int off = 0;
+  std::size_t off = 0;
   for (int ip = 0; ip < npair; ++ip) {
     const int nc = ncart(pair_list[ip].la) * ncart(pair_list[ip].lb);
     Real qmax = 0;

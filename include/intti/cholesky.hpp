@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -161,7 +162,7 @@ std::vector<Real> run_batch(const PairTable<Real> &pairs,
   eri_quartets(pairs, batch, grid, out, ws);
   auto oh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, out);
   std::vector<Real> res(batch.nout_total);
-  for (int i = 0; i < batch.nout_total; ++i)
+  for (std::size_t i = 0; i < batch.nout_total; ++i)
     res[i] = oh(i);
   return res;
 }

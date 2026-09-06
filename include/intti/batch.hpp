@@ -3,6 +3,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -95,12 +97,14 @@ PairTable<Real> make_pair_table(const std::vector<ShellPair<Real>> &pairs) {
 /// A batch of quartets, as (bra pair, ket pair) index lists into a PairTable.
 template <class Real> struct QuartetBatch {
   Kokkos::View<int *[2], Kokkos::LayoutLeft> quartets;
-  Kokkos::View<int *> out_offset; ///< exclusive scan of per-quartet ncart products
+  /// Exclusive scan of per-quartet ncart products. 64-bit: a large batch can
+  /// exceed 2^31 materialised integrals, and an int scan would wrap silently.
+  Kokkos::View<std::int64_t *> out_offset;
   int nq{0};
-  int nout_total{0};
+  std::size_t nout_total{0};
   // host planning data
   std::vector<std::pair<int, int>> h_quartets;
-  std::vector<int> h_offset;
+  std::vector<std::size_t> h_offset;
 };
 
 template <class Real>
@@ -113,13 +117,14 @@ QuartetBatch<Real> make_batch(const PairTable<Real> &pairs,
   b.h_offset[0] = 0;
   for (int iq = 0; iq < b.nq; ++iq) {
     const auto [ib, ik] = quartets[iq];
-    const int nout = ncart(pairs.h_la[ib]) * ncart(pairs.h_lb[ib]) *
-                     ncart(pairs.h_la[ik]) * ncart(pairs.h_lb[ik]);
+    const std::size_t nout = static_cast<std::size_t>(ncart(pairs.h_la[ib])) *
+                             ncart(pairs.h_lb[ib]) * ncart(pairs.h_la[ik]) *
+                             ncart(pairs.h_lb[ik]);
     b.h_offset[iq + 1] = b.h_offset[iq] + nout;
   }
   b.nout_total = b.h_offset[b.nq];
   b.quartets = Kokkos::View<int *[2], Kokkos::LayoutLeft>("intti::batch::q", b.nq);
-  b.out_offset = Kokkos::View<int *>("intti::batch::off", b.nq + 1);
+  b.out_offset = Kokkos::View<std::int64_t *>("intti::batch::off", b.nq + 1);
   auto hq = Kokkos::create_mirror_view(b.quartets);
   auto ho = Kokkos::create_mirror_view(b.out_offset);
   for (int iq = 0; iq < b.nq; ++iq) {
@@ -180,7 +185,7 @@ template <class Real, bool Accumulate>
 void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &batch,
                        const TGrid<real_t<Real>> &grid, Kokkos::View<Real *> out,
                        QuartetWorkspace<Real> &ws, Kokkos::View<const Real *> coeff,
-                       Kokkos::View<const int *> segment) {
+                       Kokkos::View<const std::int64_t *> segment) {
   static_assert(kokkos_scalar_v<Real>,
                 "batched driver requires a builtin floating-point type or "
                 "Kokkos::complex; use eri_quartet() for class-type scalars");
@@ -370,7 +375,7 @@ template <class Real>
 void eri_quartets_accumulate(const PairTable<Real> &pairs,
                              const QuartetBatch<Real> &batch,
                              Kokkos::View<const Real *> coeff,
-                             Kokkos::View<const int *> segment,
+                             Kokkos::View<const std::int64_t *> segment,
                              const TGrid<real_t<Real>> &grid, Kokkos::View<Real *> out,
                              QuartetWorkspace<Real> &ws) {
   detail::eri_quartets_impl<Real, true>(pairs, batch, grid, out, ws, coeff, segment);

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstddef>
 #include <vector>
 
@@ -261,8 +262,8 @@ two_electron_gradient_dev(const ShellBasis<Real> &basis, const Real *D,
           const int cp = pm[pos]; // canonical slot carrying this derivative
           const int Lp = Lc[cp];
           const int pe = dje(j * 8 + cp), me = dje(j * 8 + 4 + cp);
-          const int pbase = offv(pe);
-          const int mbase = (me >= 0) ? offv(me) : 0;
+          const std::int64_t pbase = offv(pe);
+          const std::int64_t mbase = (me >= 0) ? offv(me) : 0;
           int dP[4], dM[4];
           for (int t = 0; t < 4; ++t) {
             dP[t] = ncart(Lc[t]);

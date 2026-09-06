@@ -41,7 +41,7 @@ void eri_quartet(const ShellPair<Scalar> &bra, const ShellPair<Scalar> &ket,
     Kokkos::View<Scalar *> outv("intti::quartet::out", batch.nout_total);
     eri_quartets(tab, batch, grid, outv, ws);
     auto oh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, outv);
-    for (int k = 0; k < batch.nout_total; ++k)
+    for (std::size_t k = 0; k < batch.nout_total; ++k)
       out[k] = oh(k);
     return;
   } else {

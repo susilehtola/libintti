@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Susi Lehtola
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -118,7 +119,7 @@ TEST(Batch, AccumulateContractedBlock) {
   const int nout = 9;
   Kokkos::View<double *> out("out", nout);
   Kokkos::View<double *> cv("coeff", quartets.size());
-  Kokkos::View<int *> seg("seg", quartets.size());
+  Kokkos::View<std::int64_t *> seg("seg", quartets.size());
   {
     auto hc = Kokkos::create_mirror_view(cv);
     auto hs = Kokkos::create_mirror_view(seg);
@@ -171,6 +172,34 @@ TEST(Batch, LinLogGridWithTail) {
     for (int k = 0; k < nout; ++k)
       EXPECT_NEAR(oh(batch.h_offset[iq] + k), ref[k], 1e-14 * (std::abs(ref[k]) + 1e-3));
   }
+}
+
+
+TEST(Batch, OutputScanIsSixtyFourBit) {
+  // The per-quartet output scan is the one quantity in the batch planner that
+  // grows without bound: with d functions a quartet already materialises 6^4 =
+  // 1296 integrals, so a batch of a few million quartets passes 2^31 and an int
+  // scan would wrap to a negative offset -- a silent out-of-bounds write rather
+  // than a diagnosable failure. Plan such a batch (the quartet list and the scan
+  // only; the output itself is never allocated) and check the arithmetic holds.
+  const std::vector<Shell> shells = {{2.1, {1.0, 0.8, 0.0}, 2}, {1.7, {0.0, 0.2, 0.3}, 2}};
+  std::vector<intti::ShellPair<double>> pairs = {intti::make_pair(shells[0], shells[1])};
+  auto tab = intti::make_pair_table(pairs);
+  const std::size_t per = 6 * 6 * 6 * 6; // (dd|dd)
+  const std::size_t nq = (std::size_t(1) << 31) / per + 1000;
+  std::vector<std::pair<int, int>> quartets(nq, {0, 0});
+  auto batch = intti::make_batch(tab, quartets);
+  ASSERT_EQ(batch.h_offset.size(), nq + 1);
+  EXPECT_GT(batch.nout_total, std::size_t(1) << 31) << "batch must cross the int boundary";
+  EXPECT_EQ(batch.nout_total, nq * per);
+  // the scan stays monotone across the boundary (an int scan turns negative here)
+  const std::size_t at = (std::size_t(1) << 31) / per;
+  EXPECT_LT(batch.h_offset[at], batch.h_offset[at + 1]);
+  EXPECT_EQ(batch.h_offset[at + 1], (at + 1) * per);
+  // and the device copy carries the same value, not a truncation of it
+  auto ho = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, batch.out_offset);
+  EXPECT_EQ(static_cast<std::size_t>(ho(nq)), batch.nout_total);
+  EXPECT_GT(ho(nq), std::int64_t(0));
 }
 
 } // namespace
