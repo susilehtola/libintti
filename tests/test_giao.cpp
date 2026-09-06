@@ -697,6 +697,40 @@ TEST(GIAO, ComplexDensityJSeesOnlyRealPartButKDoesNot) {
   EXPECT_LT(Kherm, 1e-12 * mx) << "K must stay Hermitian for a Hermitian D";
 }
 
+// complex_jk is the field-free complex-MO alias: with a REAL density it must
+// reproduce the ordinary real coulomb_build/exchange_build exactly, and it must
+// agree with giao_jk at zero field.
+TEST(GIAO, ComplexJKAliasMatchesRealBuildsAndZeroFieldGiao) {
+  auto bas = jk_basis();
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<double> Dr(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) Dr[i * nao + j] = 0.2 + 0.05 * (i + j);
+  std::vector<C> Dc(Dr.size());
+  for (std::size_t i = 0; i < Dr.size(); ++i) Dc[i] = C(Dr[i], 0.0);
+
+  auto cj = intti::complex_jk(bas, Dc.data(), grid);
+  const double B0[3] = {0.0, 0.0, 0.0};
+  auto gj = intti::giao_jk(bas, Dc.data(), B0, grid);
+  std::vector<double> J(Dr.size()), K(Dr.size());
+  intti::coulomb_build(bas, Dr.data(), grid, J.data());
+  intti::exchange_build(bas, Dr.data(), grid, K.data(), 0.0);
+
+  double mx = 0, eJ = 0, eK = 0, eAlias = 0;
+  for (std::size_t i = 0; i < Dr.size(); ++i) {
+    mx = std::max(mx, std::abs(J[i]));
+    eJ = std::max(eJ, std::abs(cj.J[i] - C(J[i], 0.0)));
+    eK = std::max(eK, std::abs(cj.K[i] - C(K[i], 0.0)));
+    eAlias = std::max(eAlias, std::abs(cj.J[i] - gj.J[i]));
+    eAlias = std::max(eAlias, std::abs(cj.K[i] - gj.K[i]));
+  }
+  ASSERT_GT(mx, 1e-6);
+  EXPECT_LT(eJ, 1e-12 * mx) << "complex_jk J != coulomb_build for a real density";
+  EXPECT_LT(eK, 1e-12 * mx) << "complex_jk K != exchange_build for a real density";
+  EXPECT_LT(eAlias, 1e-15 * (mx + 1)) << "complex_jk != giao_jk at zero field";
+}
+
 // ---- structure of the finite-B pair space (prerequisite for a CD path) ------
 // A Cholesky decomposition needs a HERMITIAN POSITIVE-DEFINITE matrix. At
 // finite B the matrix the real CD code would form, M_PQ = (mn|ls), is complex

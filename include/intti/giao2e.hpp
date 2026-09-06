@@ -63,6 +63,32 @@ template <class Real> struct GiaoJK {
   std::vector<std::complex<Real>> J, K;
 };
 
+/// Field-free J/K for a COMPLEX (Hermitian) density -- the complex-MO path,
+/// e.g. complex/generalised HF or spin-orbit-coupled densities. This is exactly
+/// giao_jk at zero field: real integrals contracted with a complex density.
+///
+/// Use this rather than coulomb_build/exchange_build when the MO coefficients
+/// are complex. The real builders cannot serve that case:
+///   * exchange_build assumes K_ab = K_ba, which holds only for a SYMMETRIC
+///     density -- so even splitting K(D) = K(Re D) + i K(Im D) is unsafe, since
+///     Im D of a Hermitian D is antisymmetric;
+///   * coulomb_build applies a symmetry fold (D_ij + D_ji), i.e. it sees only
+///     the symmetric part by construction.
+/// Here no permutational symmetry is assumed (all ordered quartets), and the
+/// exchange uses the Hermitian-correct K_mn = sum_ls (ml|sn) D_ls.
+///
+/// Physically J and K differ: the real ERI is symmetric under the ket-pair
+/// swap, so the antisymmetric Im D cancels and J depends only on Re D (and is
+/// real), while K genuinely depends on Im D. Both are Hermitian for Hermitian D.
+template <class Real> using ComplexJK = GiaoJK<Real>;
+
+template <class Real>
+ComplexJK<Real> complex_jk(const ShellBasis<Real> &basis, const std::complex<Real> *D,
+                           const TGrid<Real> &grid) {
+  const Real zero_field[3] = {Real(0), Real(0), Real(0)};
+  return giao_jk(basis, D, zero_field, grid);
+}
+
 namespace detail {
 
 /// Device finite-field J/K: the London pairs are built on the host (complex
