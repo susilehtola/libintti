@@ -63,9 +63,111 @@ template <class Real> struct GiaoJK {
   std::vector<std::complex<Real>> J, K;
 };
 
+namespace detail {
+
+/// std::complex ShellPair -> Kokkos::complex ShellPair (device-runnable).
+template <class Real>
+ShellPair<Kokkos::complex<Real>> to_kokkos_pair(const ShellPair<std::complex<Real>> &sp) {
+  ShellPair<Kokkos::complex<Real>> o;
+  o.p = sp.p;
+  o.la = sp.la;
+  o.lb = sp.lb;
+  for (int d = 0; d < 3; ++d) {
+    o.P[d] = Kokkos::complex<Real>(sp.P[d].real(), sp.P[d].imag());
+    o.K[d] = Kokkos::complex<Real>(sp.K[d].real(), sp.K[d].imag());
+    o.A[d] = sp.A[d];
+    o.B[d] = sp.B[d];
+  }
+  return o;
+}
+
+/// Device finite-field J/K: the London pairs are built on the host (complex
+/// centres), pushed through the batched ERI driver instantiated on
+/// Kokkos::complex, and digested on device. Real and imaginary parts are
+/// accumulated into separate real Views so only real atomics are needed.
+template <class Real>
+GiaoJK<Real> giao_jk_dev(const ShellBasis<Real> &basis, const std::complex<Real> *D,
+                         const Real B[3], const TGrid<Real> &grid) {
+  using KC = Kokkos::complex<Real>;
+  using C = std::complex<Real>;
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  // all ordered shell pairs (the London phases break the 8-fold symmetry)
+  std::vector<ShellPair<KC>> plist;
+  std::vector<int> hpa, hpb, hoa, hob;
+  plist.reserve(static_cast<std::size_t>(ns) * ns);
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      plist.push_back(to_kokkos_pair(make_giao_pair(basis.shells[a], basis.shells[b], B)));
+      hpa.push_back(a);
+      hpb.push_back(b);
+      hoa.push_back(basis.ao_off[a]);
+      hob.push_back(basis.ao_off[b]);
+    }
+  const int npair = static_cast<int>(plist.size());
+  auto tab = make_pair_table(plist);
+  std::vector<std::pair<int, int>> quartets;
+  quartets.reserve(static_cast<std::size_t>(npair) * npair);
+  for (int ib = 0; ib < npair; ++ib)
+    for (int ik = 0; ik < npair; ++ik) quartets.push_back({ib, ik});
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<KC> ws;
+  Kokkos::View<KC *> out("intti::gjk::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+
+  Kokkos::View<KC *> Dd("intti::gjk::D", n2);
+  {
+    auto h = Kokkos::create_mirror_view(Dd);
+    for (std::size_t i = 0; i < n2; ++i) h(i) = KC(D[i].real(), D[i].imag());
+    Kokkos::deep_copy(Dd, h);
+  }
+  auto lav = tab.la, lbv = tab.lb;
+  auto oav = to_device(hoa, "intti::gjk::oa"), obv = to_device(hob, "intti::gjk::ob");
+  auto qv = batch.quartets, offv = batch.out_offset;
+  Kokkos::View<Real *> Jr("Jr", n2), Ji("Ji", n2), Kr("Kr", n2), Ki("Ki", n2);
+  Kokkos::parallel_for(
+      "intti::gjk::digest", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int iq) {
+        const int ib = qv(iq, 0), ik = qv(iq, 1);
+        const int na = ncart(lav(ib)), nb = ncart(lbv(ib));
+        const int nc = ncart(lav(ik)), nd = ncart(lbv(ik));
+        const int oa = oav(ib), ob = obv(ib), oc = oav(ik), od = obv(ik);
+        const int base = offv(iq);
+        for (int ka = 0; ka < na; ++ka)
+          for (int kb = 0; kb < nb; ++kb)
+            for (int kc = 0; kc < nc; ++kc)
+              for (int kd = 0; kd < nd; ++kd) {
+                const KC v = out(base + (((static_cast<std::size_t>(ka) * nb + kb) * nc + kc) * nd + kd));
+                // J_mn = sum (mn|ls) D_ls : (m,n)=(a,b), (l,s)=(c,d)
+                const KC dJ = v * Dd(static_cast<std::size_t>(oc + kc) * nao + od + kd);
+                const std::size_t ij = static_cast<std::size_t>(oa + ka) * nao + ob + kb;
+                Kokkos::atomic_add(&Jr(ij), dJ.real());
+                Kokkos::atomic_add(&Ji(ij), dJ.imag());
+                // K_mn = sum (ml|sn) D_ls : (m,l)=(a,b), (s,n)=(c,d)
+                const KC dK = v * Dd(static_cast<std::size_t>(ob + kb) * nao + oc + kc);
+                const std::size_t ik2 = static_cast<std::size_t>(oa + ka) * nao + od + kd;
+                Kokkos::atomic_add(&Kr(ik2), dK.real());
+                Kokkos::atomic_add(&Ki(ik2), dK.imag());
+              }
+      });
+  auto hJr = to_host(Jr), hJi = to_host(Ji), hKr = to_host(Kr), hKi = to_host(Ki);
+  GiaoJK<Real> outjk;
+  outjk.J.resize(n2);
+  outjk.K.resize(n2);
+  for (std::size_t i = 0; i < n2; ++i) {
+    outjk.J[i] = C(hJr[i], hJi[i]);
+    outjk.K[i] = C(hKr[i], hKi[i]);
+  }
+  return outjk;
+}
+
+} // namespace detail
+
 template <class Real>
 GiaoJK<Real> giao_jk(const ShellBasis<Real> &basis, const std::complex<Real> *D,
                      const Real B[3], const TGrid<Real> &grid) {
+  if constexpr (kokkos_scalar_v<Kokkos::complex<Real>>)
+    return detail::giao_jk_dev(basis, D, B, grid);
   using C = std::complex<Real>;
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao;

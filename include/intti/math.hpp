@@ -55,7 +55,11 @@ KOKKOS_INLINE_FUNCTION Scalar sqrt_(Scalar x) {
 /// |x| in the real type of Scalar.
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION real_t<Scalar> abs_(Scalar x) {
-  if constexpr (is_complex_v<Scalar>) {
+  // Kokkos scalars first: that branch now also covers Kokkos::complex, which
+  // std::abs cannot take (and which must stay device-callable).
+  if constexpr (kokkos_scalar_v<Scalar>) {
+    return Kokkos::abs(x);
+  } else if constexpr (is_complex_v<Scalar>) {
     return std::abs(x);
   } else if constexpr (is_quad_v<Scalar>) {
 #ifdef INTTI_HAVE_QUADMATH
@@ -63,8 +67,6 @@ KOKKOS_INLINE_FUNCTION real_t<Scalar> abs_(Scalar x) {
 #else
     return real_t<Scalar>(0);
 #endif
-  } else if constexpr (kokkos_scalar_v<Scalar>) {
-    return Kokkos::abs(x);
   } else {
     using std::abs;
     return abs(x);
