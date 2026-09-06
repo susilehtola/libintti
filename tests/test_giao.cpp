@@ -564,6 +564,98 @@ TEST(GIAO, FiniteFieldOverlapHermitian) {
   EXPECT_LT(herm, 1e-13 * mx) << "S(B) must be Hermitian";
 }
 
+// ---- end-to-end: the finite-field Fock matrix ------------------------------
+// The capstone for the complex path: S(B), T(B), V(B), J(B), K(B) must compose
+// into the complex Fock matrix a finite-field SCF consumes. Checks that the
+// COMPOSITION (not just each piece) is right: at B = 0 it reproduces the real
+// Fock exactly, at finite B it is Hermitian and genuinely complex, and B -> -B
+// conjugates it.
+namespace {
+struct FockPieces {
+  std::vector<C> F, S;
+};
+FockPieces finite_field_fock(const intti::ShellBasis<double> &bas,
+                             const std::vector<intti::PointCharge<double>> &chg,
+                             const std::vector<C> &D, const double B[3],
+                             const intti::TGrid<double> &grid) {
+  const double O[3] = {0.0, 0.0, 0.0}; // gauge origin
+  auto T = intti::giao_kinetic(bas, B, O);
+  auto V = intti::giao_nuclear(bas, chg, grid, B);
+  auto jk = intti::giao_jk(bas, D.data(), B, grid);
+  FockPieces out;
+  out.S = intti::giao_overlap(bas, B);
+  out.F.assign(T.size(), C(0));
+  for (std::size_t i = 0; i < T.size(); ++i)
+    out.F[i] = T[i] + V[i] + jk.J[i] - C(0.5) * jk.K[i];
+  return out;
+}
+} // namespace
+
+TEST(GIAO, FiniteFieldFockZeroFieldMatchesRealFock) {
+  auto bas = jk_basis();
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PointCharge<double>> chg = {{-1.0, {0.1, 0.0, -0.2}},
+                                                {-2.0, {-0.3, 0.4, 0.5}}};
+  // real symmetric density, and its complex image
+  std::vector<double> Dr(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) Dr[i * nao + j] = 0.2 + 0.04 * (i + j);
+  std::vector<C> Dc(Dr.size());
+  for (std::size_t i = 0; i < Dr.size(); ++i) Dc[i] = C(Dr[i], 0.0);
+
+  const double B0[3] = {0.0, 0.0, 0.0};
+  auto got = finite_field_fock(bas, chg, Dc, B0, grid);
+
+  // the real Fock from the ordinary builders
+  auto T = intti::kinetic_matrix(bas);
+  auto V = intti::nuclear_matrix(bas, chg, grid);
+  std::vector<double> J(Dr.size()), K(Dr.size());
+  intti::coulomb_build(bas, Dr.data(), grid, J.data());
+  intti::exchange_build(bas, Dr.data(), grid, K.data(), 0.0);
+  auto Sreal = intti::overlap_matrix(bas);
+
+  double mx = 0, errF = 0, errS = 0;
+  for (std::size_t i = 0; i < Dr.size(); ++i) {
+    const double f = T[i] + V[i] + J[i] - 0.5 * K[i];
+    mx = std::max(mx, std::abs(f));
+    errF = std::max(errF, std::abs(got.F[i] - C(f, 0.0)));
+    errS = std::max(errS, std::abs(got.S[i] - C(Sreal[i], 0.0)));
+  }
+  ASSERT_GT(mx, 1e-6);
+  EXPECT_LT(errF, 1e-11 * mx) << "finite-field Fock at B=0 != real Fock";
+  EXPECT_LT(errS, 1e-12 * (mx + 1)) << "finite-field S at B=0 != real overlap";
+}
+
+TEST(GIAO, FiniteFieldFockHermitianAndConjugatesUnderFieldReversal) {
+  auto bas = jk_basis();
+  const int nao = bas.nao;
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PointCharge<double>> chg = {{-1.0, {0.1, 0.0, -0.2}}};
+  // real density so field reversal is the clean statement
+  std::vector<C> D(static_cast<std::size_t>(nao) * nao);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) D[i * nao + j] = C(0.2 + 0.04 * (i + j), 0.0);
+  const double Bp[3] = {0.25, -0.3, 0.6}, Bm[3] = {-0.25, 0.3, -0.6};
+  auto fp = finite_field_fock(bas, chg, D, Bp, grid);
+  auto fm = finite_field_fock(bas, chg, D, Bm, grid);
+  double mx = 0, herm = 0, rev = 0, imag = 0;
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      const std::size_t ij = static_cast<std::size_t>(i) * nao + j;
+      const std::size_t ji = static_cast<std::size_t>(j) * nao + i;
+      mx = std::max(mx, std::abs(fp.F[ij]));
+      herm = std::max(herm, std::abs(fp.F[ij] - std::conj(fp.F[ji])));
+      herm = std::max(herm, std::abs(fp.S[ij] - std::conj(fp.S[ji])));
+      rev = std::max(rev, std::abs(fm.F[ij] - std::conj(fp.F[ij])));
+      imag = std::max(imag, std::abs(fp.F[ij].imag()));
+    }
+  ASSERT_GT(mx, 1e-6);
+  EXPECT_GT(imag, 1e-6 * mx) << "the field must make F genuinely complex";
+  EXPECT_LT(herm, 1e-12 * mx) << "F(B) and S(B) must be Hermitian";
+  EXPECT_LT(rev, 1e-12 * mx) << "B -> -B must conjugate F";
+}
+
 // ---- structure of the finite-B pair space (prerequisite for a CD path) ------
 // A Cholesky decomposition needs a HERMITIAN POSITIVE-DEFINITE matrix. At
 // finite B the matrix the real CD code would form, M_PQ = (mn|ls), is complex
