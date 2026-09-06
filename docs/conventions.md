@@ -201,3 +201,45 @@ Two rules follow:
    derivative precision lags energy precision on a given grid, so an
    energy-converged grid does not imply a derivative-converged one. That
    criterion is also what certifies "practically exact" in the sense above.
+
+## Why a general numerical t quadrature and not Rys
+
+Rys quadrature is also a quadrature; its virtue is that it is a FINITE, EXACT
+one. For a two-electron integral the transform variable enters as a polynomial
+in t^2 times a known weight, so Gauss quadrature against the Rys polynomials is
+exact with n_roots = floor(L/2)+1 nodes. That exactness rests on two things:
+ONE transform variable, and a weight with a known orthogonal-polynomial family.
+
+Both assumptions fail outside the two-electron real case.
+
+**Coupled multi-electron transforms.** For a three-electron integral the
+Cartesian factorisation survives (threeel.hpp still factorises over x/y/z), but
+the two transform variables do not separate: electron 1 is shared between r12
+and r13, so with L_Q = aQ t^2/(aQ+t^2) and L_S = aS s^2/(aS+s^2),
+
+```
+det A = (aP + L_Q + L_S)(aQ+t^2)(aS+s^2)
+Phi   = [aP L_Q R_PQ^2 + aP L_S R_PS^2 + L_Q L_S R_QS^2] / (aP + L_Q + L_S)
+```
+
+L_Q(t) and L_S(s) share a denominator and multiply each other, so the 2D
+integrand is not (function of t) x (function of s). Rys cannot be applied
+independently in each variable and there is no orthogonal-polynomial family for
+the coupled 2D weight: no finite exact rule exists.
+
+**Complex arguments.** Rys roots depend on T = rho R^2, so a finite magnetic
+field would need Rys roots of a COMPLEX argument -- the same wall as the complex
+Boys function.
+
+The general numerical t grid gives up finite-exactness (it is convergent
+instead, to machine precision at ~64 nodes) and gets both cases back. Two
+further consequences favour it:
+
+- The grid is UNIVERSAL: one shared node set for every quartet, so the E
+  coefficients are precomputed once per pair and reused across all quartets and
+  all t nodes (the pair-level reuse economy). Rys needs per-quartet root finding
+  -- data-dependent work with divergent iteration counts, a poor fit for wide
+  SIMD/GPU.
+- It never forms a Boys function at all, which is exactly why complex product
+  centres flow through unchanged and a GIAO ERI is just eri_quartet()
+  instantiated on a complex scalar.
