@@ -38,6 +38,122 @@ template <class Real> struct RIGrad {
 
 namespace detail {
 
+/// Device digestion shared by the RI gradient terms: a list of (quartet, pos)
+/// jobs whose promoted/demoted blocks have been batched, contracted with a
+/// per-job coefficient pattern and accumulated into a force array with atomics.
+/// This is the quartet_pos_grad body on device -- same MD centre shift
+/// 2 alpha [pos+1] - m_e [pos-1], same ghost-shell quartets.
+template <class Real> struct RIGradJobs {
+  std::vector<ShellPair<Real>> plist;
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> plusE, minusE; ///< batch entry per job (-1 if absent)
+  std::vector<int> jl0, jl1, jl2, jl3;   ///< the four base momenta per job
+  std::vector<int> jpos, jtgt;           ///< differentiated slot, force target
+  std::vector<Real> jalpha;              ///< exponent of the differentiated shell
+  std::vector<int> jo0, jo1, jo2;        ///< AO offsets used by the coefficient
+  int njob{0};
+
+  /// Add one (quartet, pos) job. `sh` are the four shells, `tgt` the index into
+  /// the force array the derivative accumulates to.
+  void add(const PrimitiveShell<Real> sh[4], int pos, int tgt, int o0, int o1, int o2) {
+    auto mk = [&](int dl) {
+      PrimitiveShell<Real> s[4] = {sh[0], sh[1], sh[2], sh[3]};
+      s[pos].l += dl;
+      const int ib = static_cast<int>(plist.size());
+      plist.push_back(make_pair(s[0], s[1]));
+      const int ik = static_cast<int>(plist.size());
+      plist.push_back(make_pair(s[2], s[3]));
+      const int e = static_cast<int>(quartets.size());
+      quartets.push_back({ib, ik});
+      return e;
+    };
+    plusE.push_back(mk(1));
+    minusE.push_back(sh[pos].l >= 1 ? mk(-1) : -1);
+    jl0.push_back(sh[0].l); jl1.push_back(sh[1].l);
+    jl2.push_back(sh[2].l); jl3.push_back(sh[3].l);
+    jpos.push_back(pos);
+    jtgt.push_back(tgt);
+    jalpha.push_back(sh[pos].alpha);
+    jo0.push_back(o0); jo1.push_back(o1); jo2.push_back(o2);
+    ++njob;
+  }
+};
+
+/// Run the batched jobs and accumulate the forces. Mode 0 is the three-centre
+/// coefficient D_mn gamma_P (Term A); Mode 1 is the two-centre
+/// -1/2 gamma_P gamma_Q (Term B). Forces are indexed shell-major over the
+/// concatenated [orbital shells, auxiliary shells] list.
+template <class Real, int Mode>
+void ri_grad_digest(RIGradJobs<Real> &jobs, const TGrid<Real> &grid,
+                    Kokkos::View<const Real *> Dd, int nao,
+                    Kokkos::View<const Real *> gam,
+                    Kokkos::View<Real *[3], Kokkos::LayoutLeft> force) {
+  if (jobs.njob == 0) return;
+  auto tab = make_pair_table(jobs.plist);
+  auto batch = make_batch(tab, jobs.quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::rig::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+  auto pE = to_device(jobs.plusE, "rig::pE"), mE = to_device(jobs.minusE, "rig::mE");
+  auto l0 = to_device(jobs.jl0, "rig::l0"), l1 = to_device(jobs.jl1, "rig::l1");
+  auto l2 = to_device(jobs.jl2, "rig::l2"), l3 = to_device(jobs.jl3, "rig::l3");
+  auto posv = to_device(jobs.jpos, "rig::pos"), tgtv = to_device(jobs.jtgt, "rig::tgt");
+  auto alv = to_device(jobs.jalpha, "rig::al");
+  auto o0v = to_device(jobs.jo0, "rig::o0"), o1v = to_device(jobs.jo1, "rig::o1");
+  auto o2v = to_device(jobs.jo2, "rig::o2");
+  auto offv = batch.out_offset;
+  const int njob = jobs.njob;
+  Kokkos::parallel_for(
+      "intti::rig::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+        const int L[4] = {l0(j), l1(j), l2(j), l3(j)};
+        const int nc[4] = {ncart(L[0]), ncart(L[1]), ncart(L[2]), ncart(L[3])};
+        const int p = posv(j), lp = L[p], tgt = tgtv(j);
+        const Real ap = alv(j);
+        const int pb = offv(pE(j));
+        const bool hasm = mE(j) >= 0;
+        const int mb = hasm ? offv(mE(j)) : 0;
+        int npl[4], nmi[4];
+        for (int i = 0; i < 4; ++i) { npl[i] = nc[i]; nmi[i] = nc[i]; }
+        npl[p] = ncart(lp + 1);
+        if (lp >= 1) nmi[p] = ncart(lp - 1);
+        auto idx = [](const int n[4], int a, int b, int c, int d) {
+          return ((static_cast<std::size_t>(a) * n[1] + b) * n[2] + c) * n[3] + d;
+        };
+        const int oa = o0v(j), ob = o1v(j), oc = o2v(j);
+        int k[4];
+        for (k[0] = 0; k[0] < nc[0]; ++k[0])
+          for (k[1] = 0; k[1] < nc[1]; ++k[1])
+            for (k[2] = 0; k[2] < nc[2]; ++k[2])
+              for (k[3] = 0; k[3] < nc[3]; ++k[3]) {
+                Real cf;
+                if constexpr (Mode == 0)
+                  cf = Dd(static_cast<std::size_t>(oa + k[0]) * nao + ob + k[1]) * gam(oc + k[2]);
+                else
+                  cf = Real(-0.5) * gam(oa + k[0]) * gam(oc + k[2]);
+                if (cf == Real(0)) continue;
+                int b3[3];
+                cart_comp(lp, k[p], b3[0], b3[1], b3[2]);
+                for (int e = 0; e < 3; ++e) {
+                  int m3[3] = {b3[0], b3[1], b3[2]};
+                  m3[e] += 1;
+                  const int ip = comp_index(lp + 1, m3[0], m3[1]);
+                  int ii[4] = {k[0], k[1], k[2], k[3]};
+                  ii[p] = ip;
+                  Real term = 2 * ap * out(pb + idx(npl, ii[0], ii[1], ii[2], ii[3]));
+                  if (b3[e] >= 1 && hasm) {
+                    int mm[3] = {b3[0], b3[1], b3[2]};
+                    mm[e] -= 1;
+                    const int im = comp_index(lp - 1, mm[0], mm[1]);
+                    int jj[4] = {k[0], k[1], k[2], k[3]};
+                    jj[p] = im;
+                    term -= Real(b3[e]) * out(mb + idx(nmi, jj[0], jj[1], jj[2], jj[3]));
+                  }
+                  Kokkos::atomic_add(&force(tgt, e), cf * term);
+                }
+              }
+      });
+}
+
 /// Contribution of differentiating shell position `pos` (0..3) of the quartet
 /// (s0 s1 | s2 s3) to a force vector out[3], contracted with a coefficient
 /// coeff(k0,k1,k2,k3) over the four Cartesian component indices. Uses the MD
@@ -317,6 +433,45 @@ RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
   // Term A: sum_P gamma_P sum_mn D_mn d(mn|P)/dx, quartet (m n | P ghost)
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
+
+  if constexpr (kokkos_scalar_v<Real>) {
+    // Device path: the fit (gemm/syevd) stays on the host -- it is dense linear
+    // algebra, not integrals -- while both derivative terms are batched into one
+    // eri_quartets call each and digested on device. Forces are accumulated into
+    // a single [orbital shells, auxiliary shells] array and split on the way out.
+    detail::RIGradJobs<Real> jobA, jobB;
+    for (int m = 0; m < nso; ++m)
+      for (int n = 0; n < nso; ++n)
+        for (int a = 0; a < nsa; ++a) {
+          const PrimitiveShell<Real> sh[4] = {orb.shells[m], orb.shells[n], aux.shells[a],
+                                              detail::ghost_shell(aux.shells[a])};
+          for (int pos = 0; pos < 3; ++pos) {
+            const int tgt = (pos == 0) ? m : (pos == 1) ? n : nso + a;
+            jobA.add(sh, pos, tgt, orb.ao_off[m], orb.ao_off[n], aux.ao_off[a]);
+          }
+        }
+    for (int a = 0; a < nsa; ++a)
+      for (int b = 0; b < nsa; ++b) {
+        const PrimitiveShell<Real> sh[4] = {aux.shells[a], detail::ghost_shell(aux.shells[a]),
+                                            aux.shells[b], detail::ghost_shell(aux.shells[b])};
+        for (int pos : {0, 2}) {
+          const int tgt = (pos == 0) ? nso + a : nso + b;
+          jobB.add(sh, pos, tgt, aux.ao_off[a], 0, aux.ao_off[b]);
+        }
+      }
+    auto Dd = detail::to_device(D, static_cast<std::size_t>(nao) * nao, "rig::D");
+    auto gam = detail::to_device(gamma, "rig::gamma");
+    Kokkos::View<Real *[3], Kokkos::LayoutLeft> force("rig::force", nso + nsa);
+    detail::ri_grad_digest<Real, 0>(jobA, grid, Dd, nao, gam, force);
+    detail::ri_grad_digest<Real, 1>(jobB, grid, Dd, nao, gam, force);
+    auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, force);
+    for (int s = 0; s < nso; ++s)
+      for (int e = 0; e < 3; ++e) g.forb[s][e] = hf(s, e);
+    for (int s = 0; s < nsa; ++s)
+      for (int e = 0; e < 3; ++e) g.faux[s][e] = hf(nso + s, e);
+    return g;
+  }
+
   for (int m = 0; m < nso; ++m)
     for (int n = 0; n < nso; ++n)
       for (int a = 0; a < nsa; ++a) {
