@@ -26,6 +26,8 @@
 #include <cstddef>
 #include <vector>
 
+#include "batch.hpp"  // PairTable, make_batch, eri_quartets (device driver)
+#include "device.hpp" // detail::to_device / to_host
 #include "fock.hpp"
 #include "gto.hpp"
 #include "quartet.hpp"
@@ -35,7 +37,7 @@ namespace intti {
 
 namespace detail {
 /// index in shell l of the Cartesian component (lx,ly,lz) (cart_comp order).
-inline int comp_index(int l, int lx, int ly) {
+KOKKOS_INLINE_FUNCTION int comp_index(int l, int lx, int ly) {
   return (l - lx) * (l - lx + 1) / 2 + (l - lx - ly);
 }
 
@@ -104,6 +106,159 @@ Real pair_schwarz_margin(const PrimitiveShell<Real> &a, const PrimitiveShell<Rea
   bp.l += 1;
   return std::max({q(a, b), q(ap, b), q(a, bp)});
 }
+
+// ---- device (GPU) two-electron gradient -------------------------------------
+// Drop the 8-fold symmetry replay: loop ALL ordered quartets (a,b,c,d) once and
+// contribute each, which equals the canonical+replay sum. Batch every quartet's
+// promoted/demoted blocks through eri_quartets (one device pass) and run the
+// gradient contraction on device with atomic accumulation into the per-shell
+// forces. Exact (tau = 0) path only; correctness-first, so it materialises the
+// full quartet list (fine for the validation sizes; screened/streamed + symmetry
+// reinstated is the production follow-up). l <= LMAX-1 (each shell is promoted).
+template <class Real>
+std::vector<std::array<Real, 3>>
+two_electron_gradient_dev(const ShellBasis<Real> &basis, const Real *D,
+                          const TGrid<Real> &grid) {
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao;
+  // per-shell device data
+  std::vector<int> hL(ns), hOff(ns);
+  std::vector<Real> hAl(ns);
+  for (int i = 0; i < ns; ++i) {
+    hL[i] = basis.shells[i].l;
+    hOff[i] = basis.ao_off[i];
+    hAl[i] = basis.shells[i].alpha;
+  }
+  auto shL = to_device(hL, "intti::g2::L");
+  auto shOff = to_device(hOff, "intti::g2::off");
+  auto shAl = to_device(hAl, "intti::g2::al");
+  auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "intti::g2::D");
+
+  // build the pair list, the batch (bra,ket) list, and per-quartet block entries
+  std::vector<ShellPair<Real>> plist;
+  auto add_pair = [&](int si, int di, int sj, int dj) {
+    PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
+    a.l += di;
+    b.l += dj;
+    plist.push_back(make_pair(a, b));
+    return static_cast<int>(plist.size()) - 1;
+  };
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> qa, qb, qc, qd; // shells per job (ordered quartet)
+  std::vector<int> plusE, minusE;  // 4 per job: batch-entry index, -1 if absent
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b)
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          const int L[4] = {hL[a], hL[b], hL[c], hL[d]};
+          qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
+          for (int pos = 0; pos < 4; ++pos) {
+            // plus: shell at pos promoted
+            int bp = (pos == 0) ? add_pair(a, 1, b, 0)
+                     : (pos == 1) ? add_pair(a, 0, b, 1)
+                                  : add_pair(a, 0, b, 0);
+            int kp = (pos == 2) ? add_pair(c, 1, d, 0)
+                     : (pos == 3) ? add_pair(c, 0, d, 1)
+                                  : add_pair(c, 0, d, 0);
+            plusE.push_back(static_cast<int>(quartets.size()));
+            quartets.push_back({bp, kp});
+            // minus: shell at pos demoted (only if l>=1)
+            if (L[pos] >= 1) {
+              int bm = (pos == 0) ? add_pair(a, -1, b, 0)
+                       : (pos == 1) ? add_pair(a, 0, b, -1)
+                                    : add_pair(a, 0, b, 0);
+              int km = (pos == 2) ? add_pair(c, -1, d, 0)
+                       : (pos == 3) ? add_pair(c, 0, d, -1)
+                                    : add_pair(c, 0, d, 0);
+              minusE.push_back(static_cast<int>(quartets.size()));
+              quartets.push_back({bm, km});
+            } else {
+              minusE.push_back(-1);
+            }
+          }
+        }
+  const int njob = static_cast<int>(qa.size());
+  auto tab = make_pair_table(plist);
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::g2::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+
+  auto dqa = to_device(qa, "intti::g2::qa"), dqb = to_device(qb, "intti::g2::qb");
+  auto dqc = to_device(qc, "intti::g2::qc"), dqd = to_device(qd, "intti::g2::qd");
+  auto dplus = to_device(plusE, "intti::g2::plusE");
+  auto dminus = to_device(minusE, "intti::g2::minusE");
+  auto offv = batch.out_offset;
+  Kokkos::View<Real *[3], Kokkos::LayoutLeft> gradd("intti::g2::grad", ns);
+  Kokkos::parallel_for(
+      "intti::g2::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+        const int sh[4] = {dqa(j), dqb(j), dqc(j), dqd(j)};
+        const int La = shL(sh[0]), Lb = shL(sh[1]), Lc = shL(sh[2]), Ld = shL(sh[3]);
+        const int na = ncart(La), nb = ncart(Lb), nc = ncart(Lc), nd = ncart(Ld);
+        const int off0 = shOff(sh[0]), off1 = shOff(sh[1]), off2 = shOff(sh[2]), off3 = shOff(sh[3]);
+        auto Dm = [&](int i, int k) { return Dd(static_cast<std::size_t>(i) * nao + k); };
+        for (int pos = 0; pos < 4; ++pos) {
+          const int Lp = shL(sh[pos]);
+          const int pe = dplus(j * 4 + pos), me = dminus(j * 4 + pos);
+          const int pbase = offv(pe);
+          const int mbase = (me >= 0) ? offv(me) : 0;
+          // block dims for plus (pos promoted) and minus (pos demoted)
+          const int dP[4] = {ncart(pos == 0 ? La + 1 : La), ncart(pos == 1 ? Lb + 1 : Lb),
+                             ncart(pos == 2 ? Lc + 1 : Lc), ncart(pos == 3 ? Ld + 1 : Ld)};
+          const int dM[4] = {ncart(pos == 0 ? La - 1 : La), ncart(pos == 1 ? Lb - 1 : Lb),
+                             ncart(pos == 2 ? Lc - 1 : Lc), ncart(pos == 3 ? Ld - 1 : Ld)};
+          const Real ap = shAl(sh[pos]);
+          for (int ka = 0; ka < na; ++ka) {
+            int a3[3];
+            cart_comp(La, ka, a3[0], a3[1], a3[2]);
+            for (int kb = 0; kb < nb; ++kb) {
+              int b3[3];
+              cart_comp(Lb, kb, b3[0], b3[1], b3[2]);
+              for (int kc = 0; kc < nc; ++kc) {
+                int c3[3];
+                cart_comp(Lc, kc, c3[0], c3[1], c3[2]);
+                for (int kd = 0; kd < nd; ++kd) {
+                  int d3[3];
+                  cart_comp(Ld, kd, d3[0], d3[1], d3[2]);
+                  const Real coeff =
+                      Real(0.5) * Dm(off0 + ka, off1 + kb) * Dm(off2 + kc, off3 + kd) -
+                      Real(0.25) * Dm(off0 + ka, off2 + kc) * Dm(off1 + kb, off3 + kd);
+                  if (coeff == Real(0)) continue;
+                  const int *base3 = pos == 0 ? a3 : pos == 1 ? b3 : pos == 2 ? c3 : d3;
+                  const int idxc[4] = {ka, kb, kc, kd};
+                  for (int e = 0; e < 3; ++e) {
+                    int mm[3] = {base3[0], base3[1], base3[2]};
+                    mm[e] = base3[e] + 1;
+                    const int ip = comp_index(Lp + 1, mm[0], mm[1]);
+                    int ic[4] = {idxc[0], idxc[1], idxc[2], idxc[3]};
+                    ic[pos] = ip;
+                    const std::size_t pidx =
+                        (((static_cast<std::size_t>(ic[0]) * dP[1] + ic[1]) * dP[2] + ic[2]) *
+                             dP[3] + ic[3]);
+                    Real term = 2 * ap * out(pbase + pidx);
+                    if (base3[e] >= 1 && me >= 0) {
+                      mm[e] = base3[e] - 1;
+                      const int im = comp_index(Lp - 1, mm[0], mm[1]);
+                      int icm[4] = {idxc[0], idxc[1], idxc[2], idxc[3]};
+                      icm[pos] = im;
+                      const std::size_t midx =
+                          (((static_cast<std::size_t>(icm[0]) * dM[1] + icm[1]) * dM[2] + icm[2]) *
+                               dM[3] + icm[3]);
+                      term -= Real(base3[e]) * out(mbase + midx);
+                    }
+                    Kokkos::atomic_add(&gradd(sh[pos], e), coeff * term);
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+  auto gh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, gradd);
+  std::vector<std::array<Real, 3>> grad(ns);
+  for (int i = 0; i < ns; ++i) grad[i] = {gh(i, 0), gh(i, 1), gh(i, 2)};
+  return grad;
+}
 } // namespace detail
 
 /// Gradient of the closed-shell two-electron energy
@@ -115,6 +270,15 @@ template <class Real>
 std::vector<std::array<Real, 3>>
 two_electron_gradient(const ShellBasis<Real> &basis, const Real *D,
                       const TGrid<Real> &grid, Real tau = Real(0)) {
+  if constexpr (kokkos_scalar_v<Real>) {
+    // exact (unscreened) case -> GPU; screened path keeps the host symmetry replay
+    if (tau == Real(0)) {
+      bool ok = true;
+      for (const auto &s : basis.shells)
+        if (s.l >= LMAX) ok = false; // each shell is promoted to l+1
+      if (ok) return detail::two_electron_gradient_dev(basis, D, grid);
+    }
+  }
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao;
   std::vector<std::array<Real, 3>> grad(ns, {Real(0), Real(0), Real(0)});
