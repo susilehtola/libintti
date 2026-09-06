@@ -638,6 +638,34 @@ serial fallback for complex/quad/class scalars, BSD-3-Clause + SPDX).
   only) — do the refactor now (verifiable on the host backend), validate on a
   real GPU elsewhere. Also: minimax/Beylkin–Monzón t-grid and STO weight
   optimization via the arbitrary-precision core.
+  GPU coverage audit (2026-09-06): three tiers found. Tier 1 (already device,
+  saturating): J/K builds, batched eri_quartets, RI/Cholesky-JK, grid-RI
+  (gridri/fegrid), collocation (product), three-electron factor (tc). Tier 2
+  (device-executed but host-serialised -- loop the SINGLE-quartet debug wrapper
+  eri_quartet/eri_block4, one kernel launch + round-trip per quartet, NOT
+  GPU-throughput): derivative integrals (erigrad/erihess/geoderiv/geohess/
+  rigrad), GIAO (giao/giao2e), spin-orbit (soc), RI 2c/3c (ncenter). Tier 3
+  (pure host serial, no kernel): the 1e matrices (oneel, nuclear, multipole).
+  IMPORTANT: eri_quartet is a single-quartet DEBUG/reference routine (builds a
+  batch of one, full host<->device round-trip) -- NOT a production path; the
+  Tier-2 slowness is misuse of it, to be fixed by batching through eri_quartets.
+  Keep it internal/undocumented so no user mistakes it for the fast path.
+  Tier-3 DONE (2026-09-06): overlap, kinetic, multipole, nuclear (exact case),
+  angular momentum, gradient all ported to a Kokkos parallel_for over shell
+  pairs (detail::make_1e_pairs precomputes E on the host into the device
+  PairTable, extended by (exa,exb) for the higher indices kinetic/multipole/
+  moment/ket-derivative need; assembly + scatter on device; each element written
+  by exactly one pair, no atomics). Dispatch via if constexpr(kokkos_scalar_v):
+  float/double/long double -> device, __float128/class-type -> the serial host
+  loop (Kokkos cannot run float128), so arbitrary precision stays a host
+  capability. nuclear keeps the host path for screening/FMM/l>LMAX. Full suite
+  229/229. Remaining M18: Tier 2 -- rewrite the derivative, GIAO, spin-orbit and
+  ncenter builders as batched-quartet consumers (enumerate all shifted quartets,
+  hand them to eri_quartets as one batch, scatter on device), the LKC-consumer
+  pattern (SHARK #2). Precision note: the analytic path in double already hits
+  ~1e-13/1e-14 (validated 1e-12 vs PySCF), well below the 1 nEh target; the
+  t-grid node count grows only ~log(1/eps) so tightening is cheap; >double needs
+  the host float128 path (no GPU).
 
 - **M-SHARK — BLAS-3 factorization, LKC architecture, digestion**
   (techniques from Neese, *J. Comput. Chem.* 2023, 44, 381, "The SHARK integral
