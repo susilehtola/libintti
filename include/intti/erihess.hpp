@@ -35,12 +35,20 @@ namespace intti {
 
 namespace detail {
 
-// device (GPU) 2e Hessian: same drop-symmetry batched-consumer pattern as the
-// gradient. Each ordered quartet is a member directly (no orbit replay, so no
-// block permutation); the second-derivative digestion requests the quartet at
-// 33 distinct per-position l-offset patterns (single +-2, and pairs of +-1),
-// which are batched (those with all l+o >= 0) and looked up by a key table.
-// tau > 0 applies the host Schwarz(+2 margin)+density screen. l <= LMAX-2.
+// device (GPU) 2e Hessian: batched-quartet consumer WITH the 8-fold symmetry,
+// as in the gradient. Only CANONICAL quartets are enumerated, and each one's 33
+// per-position l-offset patterns (single +-2, and pairs of +-1; those with all
+// l+o >= 0) are batched once and looked up by a 625-entry key table. The
+// contraction is then replayed on each distinct orbit member, reading the
+// canonical blocks through the permutation instead of materialising them.
+//
+// One order up from the gradient, BOTH the offset pattern and the component
+// indices permute: since member slot t is canonical slot pm[t],
+//   oc[pm[t]] = o[t]   and   ic[pm[t]] = comp_index(..., m[t]).
+// The permuted offset is always still in the pattern list, because permuting a
+// "single +-2 at a slot" or "+-1 at two slots" pattern yields another of the
+// same family. tau > 0 applies the host Schwarz(+2 margin)+density screen.
+// l <= LMAX-2.
 template <class Real>
 std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const Real *D,
                                            const TGrid<Real> &grid, Real tau) {
@@ -104,37 +112,56 @@ std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const 
     return static_cast<int>(plist.size()) - 1;
   };
   std::vector<std::pair<int, int>> quartets;
-  std::vector<int> qa, qb, qc, qd, jobEnt;
+  std::vector<int> ca, cbv_, ccv_, cdv_;   // canonical shells per canonical quartet
+  std::vector<int> cqEnt;                  // NP pattern entries per canonical quartet
+  std::vector<int> jq, jp0, jp1, jp2, jp3; // per job: canonical quartet + permutation
   for (int a = 0; a < ns; ++a)
-    for (int b = 0; b < ns; ++b)
+    for (int b = 0; b <= a; ++b) {
+      const int Pab = a * ns + b;
       for (int c = 0; c < ns; ++c)
-        for (int d = 0; d < ns; ++d) {
+        for (int d = 0; d <= c; ++d) {
+          if (c * ns + d > Pab) continue;
+          const int canon[4] = {a, b, c, d};
           if (tau > Real(0)) {
-            const int sh[4] = {a, b, c, d};
             Real dw = 0;
             for (int i = 0; i < 4; ++i)
-              for (int jj = 0; jj < 4; ++jj) dw = std::max(dw, Dmax[sh[i] * ns + sh[jj]]);
+              for (int jj = 0; jj < 4; ++jj)
+                dw = std::max(dw, Dmax[canon[i] * ns + canon[jj]]);
             const Real almax = std::max({hAl[a], hAl[b], hAl[c], hAl[d]});
             if (4 * almax * almax * Q[a * ns + b] * Q[c * ns + d] * dw * dw < tau) continue;
           }
           const int L[4] = {hL[a], hL[b], hL[c], hL[d]};
-          const int sh[4] = {a, b, c, d};
-          qa.push_back(a); qb.push_back(b); qc.push_back(c); qd.push_back(d);
+          const int qidx = static_cast<int>(ca.size());
+          ca.push_back(a); cbv_.push_back(b); ccv_.push_back(c); cdv_.push_back(d);
           for (int pi = 0; pi < NP; ++pi) {
             const auto &o = pats[pi];
             bool ok = true;
             for (int p = 0; p < 4; ++p)
               if (L[p] + o[p] < 0) ok = false;
-            if (!ok) {
-              jobEnt.push_back(-1);
-              continue;
-            }
-            jobEnt.push_back(static_cast<int>(quartets.size()));
-            quartets.push_back({add_pair(sh[0], o[0], sh[1], o[1]),
-                                add_pair(sh[2], o[2], sh[3], o[3])});
+            if (!ok) { cqEnt.push_back(-1); continue; }
+            cqEnt.push_back(static_cast<int>(quartets.size()));
+            quartets.push_back({add_pair(canon[0], o[0], canon[1], o[1]),
+                                add_pair(canon[2], o[2], canon[3], o[3])});
+          }
+          int seen[8][4];
+          int nseen = 0;
+          for (int g = 0; g < 8; ++g) {
+            const int *pm = detail::eri_perms[g];
+            const int mem[4] = {canon[pm[0]], canon[pm[1]], canon[pm[2]], canon[pm[3]]};
+            bool dup = false;
+            for (int t = 0; t < nseen && !dup; ++t)
+              dup = seen[t][0] == mem[0] && seen[t][1] == mem[1] && seen[t][2] == mem[2] &&
+                    seen[t][3] == mem[3];
+            if (dup) continue;
+            for (int t = 0; t < 4; ++t) seen[nseen][t] = mem[t];
+            ++nseen;
+            jq.push_back(qidx);
+            jp0.push_back(pm[0]); jp1.push_back(pm[1]);
+            jp2.push_back(pm[2]); jp3.push_back(pm[3]);
           }
         }
-  const int njob = static_cast<int>(qa.size());
+    }
+  const int njob = static_cast<int>(jq.size());
   auto tab = make_pair_table(plist);
   auto batch = make_batch(tab, quartets);
   QuartetWorkspace<Real> ws;
@@ -144,31 +171,48 @@ std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const 
   auto shL = to_device(hL, "intti::h2::L"), shOff = to_device(hOff, "intti::h2::off");
   auto shAlv = to_device(hAl, "intti::h2::al");
   auto Dd = to_device(D, static_cast<std::size_t>(nao) * nao, "intti::h2::D");
-  auto dqa = to_device(qa, "intti::h2::qa"), dqb = to_device(qb, "intti::h2::qb");
-  auto dqc = to_device(qc, "intti::h2::qc"), dqd = to_device(qd, "intti::h2::qd");
-  auto dEnt = to_device(jobEnt, "intti::h2::ent"), didx = to_device(idxkey, "intti::h2::idx");
+  auto cav = to_device(ca, "h2::ca"), cbv = to_device(cbv_, "h2::cb");
+  auto ccv = to_device(ccv_, "h2::cc"), cdv = to_device(cdv_, "h2::cd");
+  auto jqv = to_device(jq, "h2::jq");
+  auto p0v = to_device(jp0, "h2::p0"), p1v = to_device(jp1, "h2::p1");
+  auto p2v = to_device(jp2, "h2::p2"), p3v = to_device(jp3, "h2::p3");
+  auto dEnt = to_device(cqEnt, "intti::h2::ent"), didx = to_device(idxkey, "intti::h2::idx");
   auto offv = batch.out_offset;
   Kokkos::View<Real *> Hd("intti::h2::H", static_cast<std::size_t>(dim) * dim);
   Kokkos::parallel_for(
       "intti::h2::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
-        const int mem[4] = {dqa(j), dqb(j), dqc(j), dqd(j)};
-        const int L[4] = {shL(mem[0]), shL(mem[1]), shL(mem[2]), shL(mem[3])};
-        const Real al[4] = {shAlv(mem[0]), shAlv(mem[1]), shAlv(mem[2]), shAlv(mem[3])};
-        const int off[4] = {shOff(mem[0]), shOff(mem[1]), shOff(mem[2]), shOff(mem[3])};
+        const int cq = jqv(j);
+        const int canon[4] = {cav(cq), cbv(cq), ccv(cq), cdv(cq)};
+        const int pm[4] = {p0v(j), p1v(j), p2v(j), p3v(j)};
+        int Lc[4];
+        for (int t = 0; t < 4; ++t) Lc[t] = shL(canon[t]);
+        int mem[4], L[4], off[4];
+        Real al[4];
+        for (int t = 0; t < 4; ++t) {
+          mem[t] = canon[pm[t]];
+          L[t] = Lc[pm[t]];
+          off[t] = shOff(mem[t]);
+          al[t] = shAlv(mem[t]);
+        }
         auto Dmk = [&](int i, int k) { return Dd(static_cast<std::size_t>(i) * nao + k); };
+        // rawval takes MEMBER-slot offsets and components; BOTH are mapped onto
+        // the canonical block, since member slot t is canonical slot pm[t]:
+        //   oc[pm[t]] = o[t]   and   ic[pm[t]] = comp_index(..., m[t]).
         auto rawval = [&](const int o[4], const int m[4][3]) -> Real {
-          const int key = (((o[0] + 2) * 5 + (o[1] + 2)) * 5 + (o[2] + 2)) * 5 + (o[3] + 2);
+          int oc[4];
+          for (int t = 0; t < 4; ++t) oc[pm[t]] = o[t];
+          const int key = (((oc[0] + 2) * 5 + (oc[1] + 2)) * 5 + (oc[2] + 2)) * 5 + (oc[3] + 2);
           const int pi = didx(key);
           if (pi < 0) return Real(0);
-          const int ent = dEnt(j * NP + pi);
+          const int ent = dEnt(cq * NP + pi);
           if (ent < 0) return Real(0);
           int nn[4], id[4];
-          for (int p = 0; p < 4; ++p) {
-            const int lp = L[p] + o[p];
-            if (m[p][0] < 0 || m[p][1] < 0 || m[p][2] < 0 || m[p][0] + m[p][1] + m[p][2] != lp)
+          for (int t = 0; t < 4; ++t) {
+            const int lt = L[t] + o[t];
+            if (m[t][0] < 0 || m[t][1] < 0 || m[t][2] < 0 || m[t][0] + m[t][1] + m[t][2] != lt)
               return Real(0);
-            nn[p] = ncart(lp);
-            id[p] = comp_index(lp, m[p][0], m[p][1]);
+            nn[pm[t]] = ncart(lt);
+            id[pm[t]] = comp_index(lt, m[t][0], m[t][1]);
           }
           return out(offv(ent) +
                      (((static_cast<std::size_t>(id[0]) * nn[1] + id[1]) * nn[2] + id[2]) * nn[3] +
