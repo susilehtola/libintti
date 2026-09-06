@@ -318,6 +318,114 @@ multipole_matrices_dev(const ShellBasis<Real> &basis, int max_order,
   return out;
 }
 
+// electron-gradient matrices G_c = <mu| d/dr_c |nu>, antisymmetric; ket +1.
+template <class Real>
+std::array<std::vector<Real>, 3> gradient_matrices_dev(const ShellBasis<Real> &basis) {
+  const int nao = basis.nao;
+  auto op = make_1e_pairs(basis, 0, 1, Real(0));
+  const int npair = op.npair;
+  const std::size_t plane = static_cast<std::size_t>(nao) * nao;
+  Kokkos::View<Real *> Gd("intti::grad::G", 3 * plane);
+  auto pv = op.tab.p, Ev = op.tab.E, betav = op.beta;
+  auto lav = op.tab.la, lbv = op.tab.lb, eoffv = op.tab.e_off, aoa = op.aoa, aob = op.aob;
+  const Real pi = pi_v<Real>();
+  Kokkos::parallel_for(
+      "intti::grad::asm", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        const int la = lav(p), lbx = lbv(p), lb0 = lbx - 1, n1 = la + lbx + 1;
+        const int esz = (la + 1) * (lbx + 1) * n1;
+        const Real pref = sqrt_(pi / pv(p)), bta = betav(p);
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        const bool mirror = (oa != ob);
+        auto S1 = [&](int d, int i, int j) {
+          return pref * Ev(eo + d * esz + (i * (lbx + 1) + j) * n1);
+        };
+        auto K1 = [&](int d, int i, int j) {
+          Real k = -2 * bta * S1(d, i, j + 1);
+          if (j >= 1) k += Real(j) * S1(d, i, j - 1);
+          return k;
+        };
+        for (int ka = 0; ka < ncart(la); ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncart(lb0); ++kb) {
+            int b3[3];
+            cart_comp(lb0, kb, b3[0], b3[1], b3[2]);
+            const Real sx = S1(0, a3[0], b3[0]), sy = S1(1, a3[1], b3[1]), sz = S1(2, a3[2], b3[2]);
+            const Real g[3] = {K1(0, a3[0], b3[0]) * sy * sz, sx * K1(1, a3[1], b3[1]) * sz,
+                               sx * sy * K1(2, a3[2], b3[2])};
+            const int r = oa + ka, c = ob + kb;
+            for (int cc = 0; cc < 3; ++cc) {
+              Gd(cc * plane + static_cast<std::size_t>(r) * nao + c) = g[cc];
+              if (mirror) Gd(cc * plane + static_cast<std::size_t>(c) * nao + r) = -g[cc];
+            }
+          }
+        }
+      });
+  auto flat = to_host(Gd);
+  std::array<std::vector<Real>, 3> G;
+  for (int c = 0; c < 3; ++c)
+    G[c].assign(flat.begin() + c * plane, flat.begin() + (c + 1) * plane);
+  return G;
+}
+
+// angular-momentum matrices L_c = <mu|(r-O) x nabla|nu>_c, antisymmetric;
+// bra +1 (moment) and ket +1 (derivative).
+template <class Real>
+std::array<std::vector<Real>, 3>
+angular_momentum_dev(const ShellBasis<Real> &basis, const Real origin[3]) {
+  const int nao = basis.nao;
+  auto op = make_1e_pairs(basis, 1, 1, Real(0));
+  const int npair = op.npair;
+  const std::size_t plane = static_cast<std::size_t>(nao) * nao;
+  Kokkos::View<Real *> Ld("intti::angmom::L", 3 * plane);
+  auto pv = op.tab.p, Ev = op.tab.E, betav = op.beta;
+  auto lav = op.tab.la, lbv = op.tab.lb, eoffv = op.tab.e_off, aoa = op.aoa, aob = op.aob;
+  auto Acen = op.Acen;
+  const Real pi = pi_v<Real>(), Ox = origin[0], Oy = origin[1], Oz = origin[2];
+  Kokkos::parallel_for(
+      "intti::angmom::asm", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        const int lax = lav(p), lbx = lbv(p), la0 = lax - 1, lb0 = lbx - 1;
+        const int n1 = lax + lbx + 1, esz = (lax + 1) * (lbx + 1) * n1;
+        const Real pref = sqrt_(pi / pv(p)), bta = betav(p);
+        const int eo = eoffv(p), oa = aoa(p), ob = aob(p);
+        const bool mirror = (oa != ob);
+        const Real dAO[3] = {Acen(p, 0) - Ox, Acen(p, 1) - Oy, Acen(p, 2) - Oz};
+        auto S1 = [&](int d, int i, int j) {
+          return pref * Ev(eo + d * esz + (i * (lbx + 1) + j) * n1);
+        };
+        auto K1 = [&](int d, int i, int j) {
+          Real k = -2 * bta * S1(d, i, j + 1);
+          if (j >= 1) k += Real(j) * S1(d, i, j - 1);
+          return k;
+        };
+        auto M1 = [&](int d, int i, int j) { return S1(d, i + 1, j) + dAO[d] * S1(d, i, j); };
+        for (int ka = 0; ka < ncart(la0); ++ka) {
+          int a3[3];
+          cart_comp(la0, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncart(lb0); ++kb) {
+            int b3[3];
+            cart_comp(lb0, kb, b3[0], b3[1], b3[2]);
+            const Real S[3] = {S1(0, a3[0], b3[0]), S1(1, a3[1], b3[1]), S1(2, a3[2], b3[2])};
+            const Real M[3] = {M1(0, a3[0], b3[0]), M1(1, a3[1], b3[1]), M1(2, a3[2], b3[2])};
+            const Real K[3] = {K1(0, a3[0], b3[0]), K1(1, a3[1], b3[1]), K1(2, a3[2], b3[2])};
+            const Real l[3] = {S[0] * (M[1] * K[2] - K[1] * M[2]),
+                               S[1] * (M[2] * K[0] - M[0] * K[2]),
+                               S[2] * (M[0] * K[1] - M[1] * K[0])};
+            const int r = oa + ka, c = ob + kb;
+            for (int cc = 0; cc < 3; ++cc) {
+              Ld(cc * plane + static_cast<std::size_t>(r) * nao + c) = l[cc];
+              if (mirror) Ld(cc * plane + static_cast<std::size_t>(c) * nao + r) = -l[cc];
+            }
+          }
+        }
+      });
+  auto flat = to_host(Ld);
+  std::array<std::vector<Real>, 3> L;
+  for (int c = 0; c < 3; ++c)
+    L[c].assign(flat.begin() + c * plane, flat.begin() + (c + 1) * plane);
+  return L;
+}
+
 } // namespace detail
 
 /// Overlap matrix S (nao x nao, row-major) over the primitive Cartesian AOs.
@@ -456,6 +564,8 @@ inline std::vector<std::array<int, 3>> multipole_labels(int max_order) {
 template <class Real>
 std::array<std::vector<Real>, 3> angular_momentum(const ShellBasis<Real> &basis,
                                                   const Real origin[3]) {
+  if constexpr (kokkos_scalar_v<Real>)
+    return detail::angular_momentum_dev(basis, origin);
   const int nao = basis.nao;
   std::array<std::vector<Real>, 3> L;
   for (auto &m : L) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
@@ -508,6 +618,8 @@ std::array<std::vector<Real>, 3> angular_momentum(const ShellBasis<Real> &basis,
 /// directly from the ket-derivative 1D factor j S[i][j-1] - 2 beta S[i][j+1].
 template <class Real>
 std::array<std::vector<Real>, 3> gradient_matrices(const ShellBasis<Real> &basis) {
+  if constexpr (kokkos_scalar_v<Real>)
+    return detail::gradient_matrices_dev(basis);
   const int nao = basis.nao;
   std::array<std::vector<Real>, 3> G;
   for (auto &m : G) m.assign(static_cast<std::size_t>(nao) * nao, Real(0));
