@@ -1595,4 +1595,370 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
   return res;
 }
 
+/// Derivative RI EXCHANGE matrices. Structurally the same argument as
+/// ri_j_deriv_build, but the fitting response is a tensor rather than a vector,
+/// which is what makes exchange the harder half. With the density-transformed
+/// three-index quantity and its fit,
+///   G^P_{ms}     = sum_l (ml|P) D_ls,     M Ghat = G,
+///   K_mn         = sum_{Q,s} Ghat^Q_{ms} (ns|Q),
+/// so
+///   dK_mn/dx = sum_{Q,s} [ dGhat^Q_{ms}/dx (ns|Q) + Ghat^Q_{ms} d(ns|Q)/dx ],
+///   M dGhat/dx = dG/dx - (dM/dx) Ghat.
+/// Where J needed one metric solve per perturbation for a length-naux vector,
+/// K needs one for a naux x nao x nao object -- there is a response per (m,s)
+/// pair, not per perturbation.
+///
+/// COST NOTE. This is the correctness-first form: it materialises dG/dx for all
+/// perturbations at once, 3 ncen x naux x nao^2 reals. That is fine at the sizes
+/// the tests use and is NOT acceptable for a production-sized system, where the
+/// perturbations must be blocked and the pass re-run per block. The same staging
+/// the rest of the library used (correctness first, fusion after); the integral
+/// pass is also duplicated with ri_j_deriv_build rather than shared, which is
+/// the other obvious fusion.
+template <class Real>
+JKDerivResult<Real> ri_k_deriv_build(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                                     const std::vector<JKRequest<Real>> &reqs,
+                                     const TGrid<Real> &grid,
+                                     Real tau_lin = Real(1e-10)) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  const int ncen = nso + nsa, npert = 3 * ncen;
+  const int nreq = static_cast<int>(reqs.size());
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  const std::size_t NG = static_cast<std::size_t>(naux) * N; // one G tensor
+
+  auto M = coulomb_2c(aux, grid);
+  auto T = coulomb_3c(orb, aux, grid); // T[(m*nao+l)*naux + P]
+  std::vector<Real> V = M, eval(naux);
+  detail::syevd(naux, V.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  // solve M x = rhs for every (m,s) column of a naux x nao^2 tensor in place
+  auto solve_tensor = [&](std::vector<Real> &G) {
+    std::vector<Real> tmp(NG, Real(0));
+    for (int k = 0; k < naux; ++k) {
+      if (eval[k] <= tau_lin * emax) continue;
+      // project G onto eigenvector k, scale, project back
+      std::vector<Real> proj(N, Real(0));
+      for (int P = 0; P < naux; ++P) {
+        const Real vk = V[k * naux + P];
+        if (vk == Real(0)) continue;
+        for (std::size_t i = 0; i < N; ++i) proj[i] += vk * G[P * N + i];
+      }
+      const Real inv = Real(1) / eval[k];
+      for (int P = 0; P < naux; ++P) {
+        const Real vk = V[k * naux + P] * inv;
+        if (vk == Real(0)) continue;
+        for (std::size_t i = 0; i < N; ++i) tmp[P * N + i] += vk * proj[i];
+      }
+    }
+    G.swap(tmp);
+  };
+  // G^P_{ms} = sum_l T[(m,l),P] D_ls ; Ghat = M^{-1} G
+  std::vector<std::vector<Real>> Ghat(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    std::vector<Real> G(NG, Real(0));
+    for (int P = 0; P < naux; ++P)
+      for (int m = 0; m < nao; ++m)
+        for (int l = 0; l < nao; ++l) {
+          const Real t = T[(static_cast<std::size_t>(m) * nao + l) * naux + P];
+          if (t == Real(0)) continue;
+          for (int sIdx = 0; sIdx < nao; ++sIdx)
+            G[P * N + static_cast<std::size_t>(m) * nao + sIdx] +=
+                t * reqs[r].D[static_cast<std::size_t>(l) * nao + sIdx];
+        }
+    solve_tensor(G);
+    Ghat[r] = std::move(G);
+  }
+
+  // ---- derivative three-centre pass ------------------------------------
+  // Gx[r][x]^P_{ms} = sum_l dT[(m,l),P]/dx D_ls
+  // S2[r][x]_{mn}   = sum_{Q,s} Ghat^Q_{ms} dT[(n,s),Q]/dx
+  std::vector<Real> Gx(static_cast<std::size_t>(nreq) * npert * NG, Real(0));
+  std::vector<Real> S2(static_cast<std::size_t>(nreq) * npert * N, Real(0));
+  {
+    std::vector<ShellPair<Real>> plist;
+    std::vector<int> pid(static_cast<std::size_t>(nso) * 3 * nso * 3, -1);
+    auto orb_pair = [&](int si, int di, int sj, int dj) {
+      if (orb.shells[si].l + di < 0 || orb.shells[sj].l + dj < 0) return -1;
+      const std::size_t key =
+          ((static_cast<std::size_t>(si) * 3 + (di + 1)) * nso + sj) * 3 + (dj + 1);
+      if (pid[key] < 0) {
+        PrimitiveShell<Real> a = orb.shells[si], b = orb.shells[sj];
+        a.l += di;
+        b.l += dj;
+        plist.push_back(make_pair(a, b));
+        pid[key] = static_cast<int>(plist.size()) - 1;
+      }
+      return pid[key];
+    };
+    for (int m = 0; m < nso; ++m)
+      for (int l = 0; l < nso; ++l) {
+        orb_pair(m, 0, l, 0);
+        orb_pair(m, 1, l, 0);
+        orb_pair(m, -1, l, 0);
+        orb_pair(m, 0, l, 1);
+        orb_pair(m, 0, l, -1);
+      }
+    const int nbra = static_cast<int>(plist.size());
+    for (int a = 0; a < nsa; ++a) plist.push_back(detail::ghost_pair(aux.shells[a]));
+    std::vector<std::pair<int, int>> quartets;
+    std::vector<int> jm, jl, ja, emp, emm, elp, elm;
+    for (int m = 0; m < nso; ++m)
+      for (int l = 0; l < nso; ++l)
+        for (int a = 0; a < nsa; ++a) {
+          auto emit = [&](int bra) {
+            if (bra < 0) return -1;
+            const int e = static_cast<int>(quartets.size());
+            quartets.push_back({bra, nbra + a});
+            return e;
+          };
+          jm.push_back(m); jl.push_back(l); ja.push_back(a);
+          emp.push_back(emit(orb_pair(m, 1, l, 0)));
+          emm.push_back(emit(orb_pair(m, -1, l, 0)));
+          elp.push_back(emit(orb_pair(m, 0, l, 1)));
+          elm.push_back(emit(orb_pair(m, 0, l, -1)));
+        }
+    const int njob = static_cast<int>(jm.size());
+    auto tab = make_pair_table(plist);
+    auto batch = make_batch(tab, quartets);
+    QuartetWorkspace<Real> ws;
+    Kokkos::View<Real *> out("intti::rikd::out", batch.nout_total);
+    eri_quartets(tab, batch, grid, out, ws);
+    std::vector<int> hlm(nso), hom(nso);
+    std::vector<Real> ham(nso);
+    for (int i = 0; i < nso; ++i) {
+      hlm[i] = orb.shells[i].l;
+      hom[i] = orb.ao_off[i];
+      ham[i] = orb.shells[i].alpha;
+    }
+    std::vector<int> hla(nsa), hoa(nsa);
+    for (int i = 0; i < nsa; ++i) {
+      hla[i] = aux.shells[i].l;
+      hoa[i] = aux.ao_off[i];
+    }
+    std::vector<Real> hD(static_cast<std::size_t>(nreq) * N), hG(static_cast<std::size_t>(nreq) * NG);
+    for (int r = 0; r < nreq; ++r) {
+      for (std::size_t i = 0; i < N; ++i) hD[r * N + i] = reqs[r].D[i];
+      for (std::size_t i = 0; i < NG; ++i) hG[r * NG + i] = Ghat[r][i];
+    }
+    auto dlm = detail::to_device(hlm, "rikd::lm"), dom = detail::to_device(hom, "rikd::om");
+    auto dam = detail::to_device(ham, "rikd::am");
+    auto dla = detail::to_device(hla, "rikd::la"), doa = detail::to_device(hoa, "rikd::oa");
+    auto djm = detail::to_device(jm, "rikd::m"), djl = detail::to_device(jl, "rikd::l");
+    auto dja = detail::to_device(ja, "rikd::a");
+    auto dmp = detail::to_device(emp, "rikd::mp"), dmm = detail::to_device(emm, "rikd::mm");
+    auto dlp = detail::to_device(elp, "rikd::lp"), dlm2 = detail::to_device(elm, "rikd::lm2");
+    auto dD = detail::to_device(hD, "rikd::D"), dG = detail::to_device(hG, "rikd::G");
+    auto offv = batch.out_offset;
+    Kokkos::View<Real *> Gxd("rikd::Gx", Gx.size()), S2d("rikd::S2", S2.size());
+    const int naov = nao, nauxv = naux, nsov = nso, npv = npert;
+    Kokkos::parallel_for(
+        "intti::rikd::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+          const int m = djm(j), l = djl(j), a = dja(j);
+          const int lm = dlm(m), ll = dlm(l), lp = dla(a);
+          const int nm = ncart(lm), nl = ncart(ll), nP = ncart(lp);
+          const int om = dom(m), ol = dom(l), oP = doa(a);
+          const int ent[2][2] = {{dmp(j), dmm(j)}, {dlp(j), dlm2(j)}};
+          for (int km = 0; km < nm; ++km) {
+            int m3[3];
+            cart_comp(lm, km, m3[0], m3[1], m3[2]);
+            for (int kl = 0; kl < nl; ++kl) {
+              int l3[3];
+              cart_comp(ll, kl, l3[0], l3[1], l3[2]);
+              const int mi = om + km, li = ol + kl;
+              for (int kp = 0; kp < nP; ++kp) {
+                const int Pg = oP + kp;
+                for (int e = 0; e < 3; ++e) {
+                  Real dv[3];
+                  for (int slot = 0; slot < 2; ++slot) {
+                    int sg[2], ci[2];
+                    Real co[2];
+                    const int nt = slot == 0
+                                       ? detail::md_grad_terms(lm, m3, dam(m), e, sg, ci, co)
+                                       : detail::md_grad_terms(ll, l3, dam(l), e, sg, ci, co);
+                    Real v = 0;
+                    for (int t = 0; t < nt; ++t) {
+                      const int ee = ent[slot][sg[t]];
+                      if (ee < 0) continue;
+                      const int sh = (sg[t] == 0) ? 1 : -1;
+                      const int mb = (slot == 1) ? ncart(ll + sh) : nl;
+                      const int ia = (slot == 0) ? ci[t] : km;
+                      const int ib = (slot == 1) ? ci[t] : kl;
+                      const std::size_t idx =
+                          ((static_cast<std::size_t>(ia) * mb + ib) * nP + kp);
+                      v += co[t] * out(offv(ee) + idx);
+                    }
+                    dv[slot] = -v;
+                  }
+                  dv[2] = -(dv[0] + dv[1]);
+                  const int tgt[3] = {m, l, nsov + a};
+                  for (int slot = 0; slot < 3; ++slot) {
+                    const std::size_t px = static_cast<std::size_t>(3 * tgt[slot] + e);
+                    for (int r = 0; r < nreq; ++r) {
+                      const std::size_t gb =
+                          (static_cast<std::size_t>(r) * npv + px) * nauxv * naov * naov;
+                      const std::size_t sb =
+                          (static_cast<std::size_t>(r) * npv + px) * naov * naov;
+                      for (int si = 0; si < naov; ++si) {
+                        // Gx^P_{m,si} += dv D_{l,si}
+                        Kokkos::atomic_add(
+                            &Gxd(gb + (static_cast<std::size_t>(Pg) * naov + mi) * naov + si),
+                            dv[slot] * dD(r * static_cast<std::size_t>(naov) * naov +
+                                          static_cast<std::size_t>(li) * naov + si));
+                        // S2_{si,m} += Ghat^P_{si,l} dv   (this quartet is (n s|Q)
+                        // with n = si, s = li, Q = Pg)
+                        Kokkos::atomic_add(
+                            &S2d(sb + static_cast<std::size_t>(si) * naov + mi),
+                            dG(r * (static_cast<std::size_t>(nauxv) * naov * naov) +
+                               (static_cast<std::size_t>(Pg) * naov + si) * naov + li) *
+                                dv[slot]);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        });
+    Kokkos::fence();
+    Gx = detail::to_host(Gxd);
+    S2 = detail::to_host(S2d);
+  }
+
+  // ---- derivative two-centre pass: (M_x Ghat)^P_{ms} --------------------
+  std::vector<Real> MxG(static_cast<std::size_t>(nreq) * npert * NG, Real(0));
+  {
+    std::vector<ShellPair<Real>> plist;
+    std::vector<int> pid(static_cast<std::size_t>(nsa) * 3, -1);
+    auto aux_pair = [&](int si, int di) {
+      if (aux.shells[si].l + di < 0) return -1;
+      const std::size_t key = static_cast<std::size_t>(si) * 3 + (di + 1);
+      if (pid[key] < 0) {
+        PrimitiveShell<Real> a = aux.shells[si];
+        a.l += di;
+        plist.push_back(detail::ghost_pair(a));
+        pid[key] = static_cast<int>(plist.size()) - 1;
+      }
+      return pid[key];
+    };
+    for (int a = 0; a < nsa; ++a) {
+      aux_pair(a, 0);
+      aux_pair(a, 1);
+      aux_pair(a, -1);
+    }
+    std::vector<std::pair<int, int>> quartets;
+    std::vector<int> jp, jq, epp, epm;
+    for (int P = 0; P < nsa; ++P)
+      for (int Qs = 0; Qs < nsa; ++Qs) {
+        auto emit = [&](int bra) {
+          if (bra < 0) return -1;
+          const int e = static_cast<int>(quartets.size());
+          quartets.push_back({bra, aux_pair(Qs, 0)});
+          return e;
+        };
+        jp.push_back(P); jq.push_back(Qs);
+        epp.push_back(emit(aux_pair(P, 1)));
+        epm.push_back(emit(aux_pair(P, -1)));
+      }
+    const int njob = static_cast<int>(jp.size());
+    auto tab = make_pair_table(plist);
+    auto batch = make_batch(tab, quartets);
+    QuartetWorkspace<Real> ws;
+    Kokkos::View<Real *> out("intti::rikd2::out", batch.nout_total);
+    eri_quartets(tab, batch, grid, out, ws);
+    std::vector<int> hla(nsa), hoa(nsa);
+    std::vector<Real> haa(nsa);
+    for (int i = 0; i < nsa; ++i) {
+      hla[i] = aux.shells[i].l;
+      hoa[i] = aux.ao_off[i];
+      haa[i] = aux.shells[i].alpha;
+    }
+    std::vector<Real> hG(static_cast<std::size_t>(nreq) * NG);
+    for (int r = 0; r < nreq; ++r)
+      for (std::size_t i = 0; i < NG; ++i) hG[r * NG + i] = Ghat[r][i];
+    auto dla = detail::to_device(hla, "rikd2::la"), doa = detail::to_device(hoa, "rikd2::oa");
+    auto daa = detail::to_device(haa, "rikd2::aa");
+    auto djp = detail::to_device(jp, "rikd2::p"), djq = detail::to_device(jq, "rikd2::q");
+    auto dpp = detail::to_device(epp, "rikd2::pp"), dpm = detail::to_device(epm, "rikd2::pm");
+    auto dG = detail::to_device(hG, "rikd2::G");
+    auto offv = batch.out_offset;
+    Kokkos::View<Real *> MgD("rikd2::Mg", MxG.size());
+    const int naov = nao, nsov = nso, npv = npert, nauxv = naux;
+    Kokkos::parallel_for(
+        "intti::rikd2::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+          const int P = djp(j), Qs = djq(j);
+          const int lP = dla(P), lQ = dla(Qs);
+          const int nP = ncart(lP), nQ = ncart(lQ);
+          const int oP = doa(P), oQ = doa(Qs);
+          const int ent[2] = {dpp(j), dpm(j)};
+          const std::size_t NN = static_cast<std::size_t>(naov) * naov;
+          for (int kp = 0; kp < nP; ++kp) {
+            int p3[3];
+            cart_comp(lP, kp, p3[0], p3[1], p3[2]);
+            for (int kq = 0; kq < nQ; ++kq)
+              for (int e = 0; e < 3; ++e) {
+                int sg[2], ci[2];
+                Real co[2];
+                const int nt = detail::md_grad_terms(lP, p3, daa(P), e, sg, ci, co);
+                Real v = 0;
+                for (int t = 0; t < nt; ++t) {
+                  const int ee = ent[sg[t]];
+                  if (ee < 0) continue;
+                  v += co[t] * out(offv(ee) + static_cast<std::size_t>(ci[t]) * nQ + kq);
+                }
+                const Real dP = -v, dQ = v;
+                const int tgt[2] = {nsov + P, nsov + Qs};
+                const Real dvv[2] = {dP, dQ};
+                for (int slot = 0; slot < 2; ++slot) {
+                  const std::size_t px = static_cast<std::size_t>(3 * tgt[slot] + e);
+                  for (int r = 0; r < nreq; ++r) {
+                    const std::size_t gb =
+                        (static_cast<std::size_t>(r) * npv + px) * nauxv * NN;
+                    for (std::size_t i = 0; i < NN; ++i)
+                      Kokkos::atomic_add(
+                          &MgD(gb + static_cast<std::size_t>(oP + kp) * NN + i),
+                          dvv[slot] * dG(r * (static_cast<std::size_t>(nauxv) * NN) +
+                                         static_cast<std::size_t>(oQ + kq) * NN + i));
+                  }
+                }
+              }
+          }
+        });
+    Kokkos::fence();
+    MxG = detail::to_host(MgD);
+  }
+
+  // ---- assemble ---------------------------------------------------------
+  JKDerivResult<Real> res;
+  res.nshell = ncen;
+  res.nao = nao;
+  res.J.resize(nreq);
+  res.K.resize(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    res.K[r].assign(static_cast<std::size_t>(npert) * N, Real(0));
+    for (int x = 0; x < npert; ++x) {
+      std::vector<Real> rhs(NG);
+      const std::size_t gb = (static_cast<std::size_t>(r) * npert + x) * NG;
+      for (std::size_t i = 0; i < NG; ++i) rhs[i] = Gx[gb + i] - MxG[gb + i];
+      solve_tensor(rhs); // rhs <- Ghat_x
+      const std::size_t o = static_cast<std::size_t>(x) * N;
+      const std::size_t sb = (static_cast<std::size_t>(r) * npert + x) * N;
+      for (int m = 0; m < nao; ++m)
+        for (int nn = 0; nn < nao; ++nn) {
+          Real acc = 0;
+          for (int Q = 0; Q < naux; ++Q)
+            for (int sIdx = 0; sIdx < nao; ++sIdx)
+              acc += rhs[static_cast<std::size_t>(Q) * N + static_cast<std::size_t>(m) * nao +
+                         sIdx] *
+                     T[(static_cast<std::size_t>(nn) * nao + sIdx) * naux + Q];
+          res.K[r][o + static_cast<std::size_t>(m) * nao + nn] =
+              acc + S2[sb + static_cast<std::size_t>(m) * nao + nn];
+        }
+    }
+  }
+  return res;
+}
+
 } // namespace intti

@@ -485,4 +485,80 @@ TEST(JK, RiCoulombDerivativeMatricesContractToTheKnownGradient) {
     }
 }
 
+
+TEST(JK, RiExchangeDerivativeMatricesMatchFiniteDifference) {
+  // Exchange is the harder half: J's fitting response is one vector gamma_x,
+  // K's is a naux x nao x nao tensor (a response per (m,s) pair). Same test
+  // shape as the Coulomb one -- differencing ri_jk's K at fixed density, and
+  // displacing AUXILIARY shells so the fitting response cannot hide.
+  auto osh = jk_shells();
+  auto ash = jk_aux_shells();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto orb = intti::make_basis(osh);
+  auto aux = intti::make_basis(ash);
+  const int n = orb.nao;
+  const int nso = static_cast<int>(osh.size());
+  const auto D = general_density(n);
+  const std::vector<intti::JKRequest<double>> reqs = {
+      {D.data(), intti::DensitySymmetry::General, intti::FockTerms::Exchange}};
+  const auto dv = intti::ri_k_deriv_build(orb, aux, reqs, grid);
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  const double h = 1e-4;
+  for (int s : {0, nso + 3})
+    for (int e = 0; e < 3; ++e) {
+      auto shifted = [&](double delta) {
+        auto o2 = osh;
+        auto a2 = ash;
+        if (s < nso)
+          o2[s].center[e] += delta;
+        else
+          a2[s - nso].center[e] += delta;
+        const auto fit = intti::ri_fit(intti::make_basis(o2), intti::make_basis(a2), grid);
+        std::vector<double> K(n2);
+        intti::ri_jk(fit, D.data(), static_cast<double *>(nullptr), K.data());
+        return K;
+      };
+      const auto Kp = shifted(h), Km = shifted(-h);
+      const std::size_t o = (static_cast<std::size_t>(3 * s + e)) * n2;
+      double worst = 0, sc = 0;
+      for (std::size_t i = 0; i < n2; ++i) {
+        const double fd = (Kp[i] - Km[i]) / (2 * h);
+        worst = std::max(worst, std::abs(fd - dv.K[0][o + i]));
+        sc = std::max(sc, std::abs(fd));
+      }
+      ASSERT_GT(sc, 1e-4) << "shell " << s << " comp " << e << " derivative is zero";
+      EXPECT_LT(worst, 5e-6 * (sc + 1)) << "shell " << s << " comp " << e;
+    }
+}
+
+TEST(JK, RiExchangeDerivativeMatricesContractToTheKnownGradient) {
+  // E_K = -1/4 sum D K(D), so at fixed D the weighted trace must reproduce
+  // ri_k_gradient -- which, like the Coulomb one, is response-free by 2n+1.
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = orb.nao;
+  const auto D = sym_density(n);
+  const std::vector<intti::JKRequest<double>> reqs = {
+      {D.data(), intti::DensitySymmetry::Symmetric, intti::FockTerms::Exchange}};
+  const auto dv = intti::ri_k_deriv_build(orb, aux, reqs, grid);
+  const auto ref = intti::ri_k_gradient(orb, aux, D.data(), grid);
+  const int nso = static_cast<int>(orb.shells.size());
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  double scale = 0;
+  for (const auto &g : ref.forb)
+    for (int e = 0; e < 3; ++e) scale = std::max(scale, std::abs(g[e]));
+  for (const auto &g : ref.faux)
+    for (int e = 0; e < 3; ++e) scale = std::max(scale, std::abs(g[e]));
+  ASSERT_GT(scale, 1e-4);
+  for (int s = 0; s < dv.nshell; ++s)
+    for (int e = 0; e < 3; ++e) {
+      const std::size_t o = (static_cast<std::size_t>(3 * s + e)) * n2;
+      double g = 0;
+      for (std::size_t i = 0; i < n2; ++i) g += -0.25 * D[i] * dv.K[0][o + i];
+      const double want = (s < nso) ? ref.forb[s][e] : ref.faux[s - nso][e];
+      EXPECT_NEAR(g, want, 1e-9 * (scale + 1)) << "shell " << s << " comp " << e;
+    }
+}
+
 } // namespace
