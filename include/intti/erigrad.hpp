@@ -42,6 +42,37 @@ KOKKOS_INLINE_FUNCTION int comp_index(int l, int lx, int ly) {
   return (l - lx) * (l - lx + 1) / 2 + (l - lx - ly);
 }
 
+/// McMurchie-Davidson centre-shift terms for one Cartesian direction, as the
+/// ELECTRONIC gradient d/dx acting on a Cartesian Gaussian:
+///   d/dx_e chi(l) = l_e chi(l-1, e) - 2 alpha chi(l+1, e).
+/// Returns the number of terms (2, or 1 when the power in that direction is
+/// already zero); sgn 0 selects the PROMOTED (l+1) block with coefficient
+/// -2 alpha, sgn 1 the DEMOTED (l-1) block with coefficient the Cartesian power.
+///
+/// NOTE the sign convention: a Gaussian depends on r - A, so the derivative with
+/// respect to its CENTRE is minus this, d/dA_e = -d/dx_e. Geometric-derivative
+/// callers must negate; the spin-orbit builder wants d/dx and does not.
+template <class Real>
+KOKKOS_INLINE_FUNCTION int md_grad_terms(int l, const int c3[3], Real alpha, int dir,
+                                         int sgn[2], int ci[2], Real co[2]) {
+  int nt = 0;
+  int t[3] = {c3[0], c3[1], c3[2]};
+  t[dir] += 1;
+  sgn[nt] = 0;
+  ci[nt] = comp_index(l + 1, t[0], t[1]);
+  co[nt] = -2 * alpha;
+  ++nt;
+  if (c3[dir] >= 1) {
+    int u[3] = {c3[0], c3[1], c3[2]};
+    u[dir] -= 1;
+    sgn[nt] = 1;
+    ci[nt] = comp_index(l - 1, u[0], u[1]);
+    co[nt] = static_cast<Real>(c3[dir]);
+    ++nt;
+  }
+  return nt;
+}
+
 /// (ab|cd) block for four explicit shells, layout ((ka*ncb+kb)*ncc+kc)*ncd+kd.
 template <class Real>
 std::vector<Real> eri_block4(const PrimitiveShell<Real> &a,

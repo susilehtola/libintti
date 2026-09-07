@@ -248,27 +248,13 @@ std::vector<Real> spin_orbit_2e_block(const PrimitiveShell<Real> &sa,
 // digestion -- eps_kij (d_i mu)(d_j lambda) with the MD centre-shift terms --
 // on device, contracting the density and scattering with atomics.
 
-/// d/dir terms for one Cartesian component of a shell of momentum l (device):
-/// sgn 0 -> (l+1) block coeff -2 alpha; sgn 1 -> (l-1) block coeff the power.
+/// d/dir terms for one Cartesian component of a shell of momentum l (device).
+/// This is exactly the MD electronic-gradient shift, shared with the geometric
+/// derivative builders; see detail::md_grad_terms in erigrad.hpp.
 template <class Real>
 KOKKOS_INLINE_FUNCTION int so_terms(int l, const int c3[3], Real alpha, int dir,
                                     int sgn[2], int ci[2], Real co[2]) {
-  int nt = 0;
-  int t[3] = {c3[0], c3[1], c3[2]};
-  t[dir] += 1;
-  sgn[nt] = 0;
-  ci[nt] = comp_index(l + 1, t[0], t[1]);
-  co[nt] = -2 * alpha;
-  ++nt;
-  if (c3[dir] >= 1) {
-    int u[3] = {c3[0], c3[1], c3[2]};
-    u[dir] -= 1;
-    sgn[nt] = 1;
-    ci[nt] = comp_index(l - 1, u[0], u[1]);
-    co[nt] = static_cast<Real>(c3[dir]);
-    ++nt;
-  }
-  return nt;
+  return md_grad_terms(l, c3, alpha, dir, sgn, ci, co);
 }
 
 /// Shared batch: the 4 shifted-bra x unshifted-ket quartets per ordered quartet.

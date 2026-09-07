@@ -13,7 +13,7 @@
 
 #include <gtest/gtest.h>
 
-#include "intti/erigrad.hpp" // detail::eri_block4
+#include "intti/erigrad.hpp" // detail::eri_block4, two_electron_gradient
 #include "intti/fock.hpp"
 #include "intti/jk.hpp"
 #include "intti/ri.hpp"
@@ -296,6 +296,107 @@ TEST(JK, TwoSidedOrbitalExchangeMatchesDensityDriven) {
   intti::ri_k_occ(fit, CL.data(), nvec, K1.data());
   intti::ri_k_occ2(fit, CL.data(), CL.data(), nvec, K2.data());
   EXPECT_LT(maxdiff(K1, K2), 1e-12 * (maxabs(K1) + 1)) << "C_L = C_R must recover ri_k_occ";
+}
+
+
+TEST(JK, DerivativeMatricesContractToTheKnownGradient) {
+  // E_2e = 1/2 sum D J(D) - 1/4 sum D K(D), so at fixed D
+  //   dE_2e/dR = 1/2 sum D dJ/dR - 1/4 sum D dK/dR
+  // exactly. two_electron_gradient computes the left side and is already
+  // validated, so this pins the new matrices against known-good code.
+  auto sh = jk_shells();
+  auto bas = intti::make_basis(sh);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = bas.nao, ns = static_cast<int>(sh.size());
+  const auto D = sym_density(n);
+  const std::vector<intti::JKRequest<double>> reqs = {
+      {D.data(), intti::DensitySymmetry::Symmetric, intti::FockTerms::CoulombExchange}};
+  const auto dv = intti::jk_deriv_build(bas, reqs, grid);
+  ASSERT_EQ(dv.nshell, ns);
+  const auto ref = intti::two_electron_gradient(bas, D.data(), grid);
+  ASSERT_EQ(static_cast<int>(ref.size()), ns);
+  double scale = 0;
+  for (const auto &g : ref)
+    for (int e = 0; e < 3; ++e) scale = std::max(scale, std::abs(g[e]));
+  ASSERT_GT(scale, 1e-3) << "reference gradient is trivially zero";
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  for (int s = 0; s < ns; ++s)
+    for (int e = 0; e < 3; ++e) {
+      const std::size_t o = (static_cast<std::size_t>(3 * s + e)) * n2;
+      double g = 0;
+      for (std::size_t i = 0; i < n2; ++i)
+        g += 0.5 * D[i] * dv.J[0][o + i] - 0.25 * D[i] * dv.K[0][o + i];
+      EXPECT_NEAR(g, ref[s][e], 1e-10 * (scale + 1)) << "shell " << s << " comp " << e;
+    }
+}
+
+TEST(JK, DerivativeMatricesMatchFiniteDifference) {
+  // The contraction above only pins a trace of each matrix. This differences
+  // jk_build itself with respect to a shell centre, at FIXED density, so every
+  // element is checked -- and with a GENERAL density, which the gradient
+  // identity above cannot exercise.
+  auto sh = jk_shells();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto bas0 = intti::make_basis(sh);
+  const int n = bas0.nao;
+  const auto D = general_density(n);
+  const std::vector<intti::JKRequest<double>> reqs = {
+      {D.data(), intti::DensitySymmetry::General, intti::FockTerms::CoulombExchange}};
+  const auto dv = intti::jk_deriv_build(bas0, reqs, grid);
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  const double h = 1e-4;
+  for (int s : {0, 1, 3})
+    for (int e = 0; e < 3; ++e) {
+      auto shifted = [&](double delta) {
+        auto sh2 = sh;
+        sh2[s].center[e] += delta;
+        auto b2 = intti::make_basis(sh2);
+        return intti::jk_build(b2, reqs, grid);
+      };
+      const auto p = shifted(h), m = shifted(-h);
+      const std::size_t o = (static_cast<std::size_t>(3 * s + e)) * n2;
+      double worst = 0, sc = 0;
+      for (std::size_t i = 0; i < n2; ++i) {
+        const double fdJ = (p.J[0][i] - m.J[0][i]) / (2 * h);
+        const double fdK = (p.K[0][i] - m.K[0][i]) / (2 * h);
+        worst = std::max(worst, std::abs(fdJ - dv.J[0][o + i]));
+        worst = std::max(worst, std::abs(fdK - dv.K[0][o + i]));
+        sc = std::max(sc, std::max(std::abs(fdJ), std::abs(fdK)));
+      }
+      ASSERT_GT(sc, 1e-3) << "shell " << s << " comp " << e << " derivative is zero";
+      // second-order central difference: ~h^2 relative accuracy floor
+      EXPECT_LT(worst, 2e-6 * (sc + 1)) << "shell " << s << " comp " << e;
+    }
+}
+
+TEST(JK, DerivativeMatricesSumToZeroOverShells) {
+  // Translational invariance: moving every centre together cannot change an
+  // integral. The builder gets the fourth slot from exactly this identity, so
+  // what this really checks is that the other three slots are accumulated into
+  // the right targets.
+  auto sh = jk_shells();
+  auto bas = intti::make_basis(sh);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = bas.nao, ns = static_cast<int>(sh.size());
+  const auto D = general_density(n);
+  const std::vector<intti::JKRequest<double>> reqs = {
+      {D.data(), intti::DensitySymmetry::General, intti::FockTerms::CoulombExchange}};
+  const auto dv = intti::jk_deriv_build(bas, reqs, grid);
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  double scale = 0;
+  for (std::size_t i = 0; i < dv.J[0].size(); ++i) scale = std::max(scale, std::abs(dv.J[0][i]));
+  ASSERT_GT(scale, 1e-3);
+  for (int e = 0; e < 3; ++e)
+    for (std::size_t i = 0; i < n2; ++i) {
+      double sj = 0, sk = 0;
+      for (int s = 0; s < ns; ++s) {
+        const std::size_t o = (static_cast<std::size_t>(3 * s + e)) * n2;
+        sj += dv.J[0][o + i];
+        sk += dv.K[0][o + i];
+      }
+      ASSERT_LT(std::abs(sj), 1e-11 * scale) << "sum of dJ over shells, comp " << e;
+      ASSERT_LT(std::abs(sk), 1e-11 * scale) << "sum of dK over shells, comp " << e;
+    }
 }
 
 } // namespace

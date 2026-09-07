@@ -39,6 +39,7 @@
 
 #include "batch.hpp"
 #include "device.hpp"
+#include "erigrad.hpp" // detail::md_grad_terms, comp_index
 #include "fock.hpp"
 #include "gto.hpp"
 #include "tgrid.hpp"
@@ -204,6 +205,228 @@ JKResult<Real> jk_build(const ShellBasis<Real> &basis,
     }
   }
   return res;
+}
+
+/// Derivative Coulomb/exchange matrices: for each shell centre s and Cartesian
+/// direction e,
+///   dJ_mn/dR_se = sum_ls d(mn|ls)/dR_se D_ls,
+///   dK_mn/dR_se = sum_ls d(ml|ns)/dR_se D_ls.
+///
+/// This is what a CPHF right-hand side is built from, for ANY perturbation that
+/// moves the nuclei -- and it is the piece the library was missing: the existing
+/// two_electron_gradient contracts these against a second density straight into
+/// a force and throws the matrices away, which is all an energy gradient needs
+/// and nothing that response needs.
+///
+/// Per shell centre, not per atom; the caller maps shells to atoms and sums, as
+/// it already does for two_electron_gradient. Matrix (s, e) of request r starts
+/// at (3*s + e) * nao * nao.
+template <class Real> struct JKDerivResult {
+  int nshell{0}, nao{0};
+  std::vector<std::vector<Real>> J, K;
+};
+
+namespace detail {
+
+/// The derivative of a quartet with respect to the FOURTH slot is obtained from
+/// translational invariance, d/dA + d/dB + d/dC + d/dD = 0, rather than by
+/// evaluating two more shifted quartets: the integral depends only on centre
+/// differences. That is exact, and saves a quarter of the shifted evaluations.
+template <class Real>
+JKDerivResult<Real> jk_deriv_general(const ShellBasis<Real> &basis,
+                                     const std::vector<JKRequest<Real>> &reqs,
+                                     const TGrid<Real> &grid, Real tau) {
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  const int nreq = static_cast<int>(reqs.size());
+  const int npert = 3 * ns;
+
+  std::vector<int> hL(ns), hOff(ns);
+  std::vector<Real> hAl(ns);
+  for (int i = 0; i < ns; ++i) {
+    hL[i] = basis.shells[i].l;
+    hOff[i] = basis.ao_off[i];
+    hAl[i] = basis.shells[i].alpha;
+  }
+  // memoised (shell, shift) x (shell, shift) pairs: base plus the four singly
+  // shifted forms each ordered pair needs
+  std::vector<ShellPair<Real>> plist;
+  std::vector<int> pid(static_cast<std::size_t>(ns) * 3 * ns * 3, -1);
+  auto pair_id = [&](int si, int di, int sj, int dj) {
+    if (hL[si] + di < 0 || hL[sj] + dj < 0) return -1;
+    const std::size_t key =
+        ((static_cast<std::size_t>(si) * 3 + (di + 1)) * ns + sj) * 3 + (dj + 1);
+    if (pid[key] < 0) {
+      PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
+      a.l += di;
+      b.l += dj;
+      plist.push_back(make_pair(a, b));
+      pid[key] = static_cast<int>(plist.size()) - 1;
+    }
+    return pid[key];
+  };
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      pair_id(a, 0, b, 0);
+      pair_id(a, 1, b, 0);
+      pair_id(a, -1, b, 0);
+      pair_id(a, 0, b, 1);
+      pair_id(a, 0, b, -1);
+    }
+  auto tab = make_pair_table(plist);
+  std::vector<Real> Q;
+  if (tau > Real(0)) Q = schwarz(tab, plist, grid);
+  auto scale = [&](int s) {
+    const Real two_al = 2 * hAl[s];
+    return two_al > Real(hL[s]) ? two_al : Real(hL[s]);
+  };
+  // jobs: one per ordered shell quartet, carrying the six shifted entries it
+  // needs (slots a, b on the bra; c on the ket; slot d from invariance)
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> ja, jb, jc, jd, eap, eam, ebp, ebm, ecp, ecm;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b)
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          if (tau > Real(0)) {
+            const int pb = pair_id(a, 0, b, 0), pk = pair_id(c, 0, d, 0);
+            if (scale(a) * scale(b) * scale(c) * scale(d) * Q[pb] * Q[pk] < tau) continue;
+          }
+          const int kd0 = pair_id(c, 0, d, 0);
+          auto emit = [&](int bra, int ket) {
+            if (bra < 0 || ket < 0) return -1;
+            const int e = static_cast<int>(quartets.size());
+            quartets.push_back({bra, ket});
+            return e;
+          };
+          ja.push_back(a); jb.push_back(b); jc.push_back(c); jd.push_back(d);
+          eap.push_back(emit(pair_id(a, 1, b, 0), kd0));
+          eam.push_back(emit(pair_id(a, -1, b, 0), kd0));
+          ebp.push_back(emit(pair_id(a, 0, b, 1), kd0));
+          ebm.push_back(emit(pair_id(a, 0, b, -1), kd0));
+          ecp.push_back(emit(pair_id(a, 0, b, 0), pair_id(c, 1, d, 0)));
+          ecm.push_back(emit(pair_id(a, 0, b, 0), pair_id(c, -1, d, 0)));
+        }
+  const int njob = static_cast<int>(ja.size());
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::jkd::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+
+  std::vector<Real> hD(static_cast<std::size_t>(nreq) * n2);
+  std::vector<int> hwantJ(nreq), hwantK(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    hwantJ[r] = reqs[r].terms != FockTerms::Exchange;
+    hwantK[r] = reqs[r].terms != FockTerms::Coulomb;
+    for (std::size_t i = 0; i < n2; ++i) hD[r * n2 + i] = reqs[r].D[i];
+  }
+  auto Dd = to_device(hD, "intti::jkd::D");
+  auto wJ = to_device(hwantJ, "intti::jkd::wj"), wK = to_device(hwantK, "intti::jkd::wk");
+  auto shL = to_device(hL, "intti::jkd::L"), shOff = to_device(hOff, "intti::jkd::off");
+  auto shAl = to_device(hAl, "intti::jkd::al");
+  auto dja = to_device(ja, "jkd::a"), djb = to_device(jb, "jkd::b");
+  auto djc = to_device(jc, "jkd::c"), djd = to_device(jd, "jkd::d");
+  auto dap = to_device(eap, "jkd::ap"), dam = to_device(eam, "jkd::am");
+  auto dbp = to_device(ebp, "jkd::bp"), dbm = to_device(ebm, "jkd::bm");
+  auto dcp = to_device(ecp, "jkd::cp"), dcm = to_device(ecm, "jkd::cm");
+  auto offv = batch.out_offset;
+  const std::size_t stride = static_cast<std::size_t>(npert) * n2;
+  Kokkos::View<Real *> Jd("intti::jkd::J", static_cast<std::size_t>(nreq) * stride);
+  Kokkos::View<Real *> Kd("intti::jkd::K", static_cast<std::size_t>(nreq) * stride);
+  Kokkos::parallel_for(
+      "intti::jkd::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+        const int a = dja(j), b = djb(j), c = djc(j), d = djd(j);
+        const int la = shL(a), lb = shL(b), lc = shL(c), ld = shL(d);
+        const int na = ncart(la), nb = ncart(lb), nc = ncart(lc), nd = ncart(ld);
+        const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
+        const int ent[3][2] = {{dap(j), dam(j)}, {dbp(j), dbm(j)}, {dcp(j), dcm(j)}};
+        for (int ka = 0; ka < na; ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < nb; ++kb) {
+            int b3[3];
+            cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+            for (int kc = 0; kc < nc; ++kc) {
+              int c3[3];
+              cart_comp(lc, kc, c3[0], c3[1], c3[2]);
+              for (int kd = 0; kd < nd; ++kd) {
+                const std::size_t iab = static_cast<std::size_t>(oa + ka) * nao + ob + kb;
+                const std::size_t icd = static_cast<std::size_t>(oc + kc) * nao + od + kd;
+                const std::size_t iac = static_cast<std::size_t>(oa + ka) * nao + oc + kc;
+                const std::size_t ibd = static_cast<std::size_t>(ob + kb) * nao + od + kd;
+                for (int e = 0; e < 3; ++e) {
+                  // d/dR of each of the first three slots; the fourth follows
+                  // from translational invariance
+                  Real dv[4];
+                  for (int slot = 0; slot < 3; ++slot) {
+                    int sg[2], ci[2];
+                    Real co[2];
+                    int nt;
+                    if (slot == 0)
+                      nt = md_grad_terms(la, a3, shAl(a), e, sg, ci, co);
+                    else if (slot == 1)
+                      nt = md_grad_terms(lb, b3, shAl(b), e, sg, ci, co);
+                    else
+                      nt = md_grad_terms(lc, c3, shAl(c), e, sg, ci, co);
+                    Real v = 0;
+                    for (int t = 0; t < nt; ++t) {
+                      const int ee = ent[slot][sg[t]];
+                      if (ee < 0) continue;
+                      const int lp = (sg[t] == 0) ? 1 : -1;
+                      const int ma = (slot == 0) ? ncart(la + lp) : na;
+                      const int mb = (slot == 1) ? ncart(lb + lp) : nb;
+                      const int mc = (slot == 2) ? ncart(lc + lp) : nc;
+                      const int ia = (slot == 0) ? ci[t] : ka;
+                      const int ib2 = (slot == 1) ? ci[t] : kb;
+                      const int ic = (slot == 2) ? ci[t] : kc;
+                      (void)ma;
+                      const std::size_t idx =
+                          ((static_cast<std::size_t>(ia) * mb + ib2) * mc + ic) * nd + kd;
+                      v += co[t] * out(offv(ee) + idx);
+                    }
+                    // md_grad_terms is the ELECTRONIC gradient; the centre
+                    // derivative is minus it
+                    dv[slot] = -v;
+                  }
+                  dv[3] = -(dv[0] + dv[1] + dv[2]);
+                  const int tgt[4] = {a, b, c, d};
+                  for (int slot = 0; slot < 4; ++slot) {
+                    const std::size_t po = (static_cast<std::size_t>(3 * tgt[slot] + e)) * n2;
+                    for (int r = 0; r < nreq; ++r) {
+                      const std::size_t o = static_cast<std::size_t>(r) * stride + po;
+                      if (wJ(r)) Kokkos::atomic_add(&Jd(o + iab), dv[slot] * Dd(r * n2 + icd));
+                      if (wK(r)) Kokkos::atomic_add(&Kd(o + iac), dv[slot] * Dd(r * n2 + ibd));
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+  Kokkos::fence();
+  auto hJ = to_host(Jd), hK = to_host(Kd);
+  JKDerivResult<Real> res;
+  res.nshell = ns;
+  res.nao = nao;
+  res.J.resize(nreq);
+  res.K.resize(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    if (hwantJ[r]) res.J[r].assign(hJ.begin() + r * stride, hJ.begin() + (r + 1) * stride);
+    if (hwantK[r]) res.K[r].assign(hK.begin() + r * stride, hK.begin() + (r + 1) * stride);
+  }
+  return res;
+}
+
+} // namespace detail
+
+/// Derivative J/K matrices for a set of densities. See JKDerivResult.
+template <class Real>
+JKDerivResult<Real> jk_deriv_build(const ShellBasis<Real> &basis,
+                                   const std::vector<JKRequest<Real>> &reqs,
+                                   const TGrid<Real> &grid, Real tau = Real(0)) {
+  return detail::jk_deriv_general(basis, reqs, grid, tau);
 }
 
 } // namespace intti
