@@ -34,6 +34,7 @@ add_executable(intti_tests
   test_soc.cpp
   test_crossbasis.cpp
   test_scf.cpp
+  test_jk.cpp
   test_deriv.cpp
   test_geoderiv.cpp
   test_erigrad.cpp
