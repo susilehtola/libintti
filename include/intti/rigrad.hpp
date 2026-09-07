@@ -25,6 +25,7 @@
 #include "erigrad.hpp" // detail::comp_index, detail::eri_block4
 #include "fock.hpp"
 #include "gto.hpp"
+#include "jk.hpp"      // JKRequest, JKDerivResult
 #include "ncenter.hpp" // detail::ghost_pair pattern (ghost shell)
 #include "ri.hpp"      // detail::syevd
 #include "tgrid.hpp"
@@ -1261,6 +1262,337 @@ std::vector<Real> ri_k_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
   detail::gemm('N', 'T', dim, dim, Kab, Real(-0.5), Rp.data(), Kab, S.data(), Kab, Real(1),
                Hess.data(), dim);
   return Hess;
+}
+
+/// Derivative RI Coulomb MATRICES: for each shell centre (orbital shells first,
+/// then auxiliary, as in RIGrad) and Cartesian direction,
+///   dJ_mn/dx = sum_P d(mn|P)/dx gamma_P + sum_P (mn|P) dgamma_P/dx.
+///
+/// The second term is what makes this more than a re-scatter of ri_j_gradient.
+/// The GRADIENT never needs gamma_x: gamma is the stationary point of the
+/// fitting functional, so by the 2n+1 rule the first-order energy is complete
+/// without it. The matrix is not a stationary quantity, so gamma_x is required,
+/// and it comes from differentiating M gamma = d:
+///   M gamma_x = d_x - M_x gamma,
+/// one metric solve per perturbation reusing the eigendecomposition already
+/// formed for gamma. d_x and the first term are two contractions of the SAME
+/// derivative three-centre pass -- over mn with the density, and over P with
+/// gamma -- so it is accumulated once and consumed twice.
+///
+/// The auxiliary-shell perturbations come from translational invariance of the
+/// three-centre integral, d/dP = -(d/dm + d/dn); likewise d/dQ = -d/dP for the
+/// two-centre metric derivative. Those are exact and save evaluating the shifted
+/// auxiliary quartets.
+template <class Real>
+JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                                     const std::vector<JKRequest<Real>> &reqs,
+                                     const TGrid<Real> &grid,
+                                     Real tau_lin = Real(1e-10)) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  const int ncen = nso + nsa, npert = 3 * ncen;
+  const int nreq = static_cast<int>(reqs.size());
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+
+  auto M = coulomb_2c(aux, grid);
+  auto T = coulomb_3c(orb, aux, grid); // N x naux
+  // metric pseudo-inverse, shared by gamma and every gamma_x
+  std::vector<Real> V = M, eval(naux);
+  detail::syevd(naux, V.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  auto solve = [&](const std::vector<Real> &rhs) {
+    std::vector<Real> x(naux, Real(0));
+    for (int k = 0; k < naux; ++k) {
+      if (eval[k] <= tau_lin * emax) continue;
+      Real vd = 0;
+      for (int P = 0; P < naux; ++P) vd += V[k * naux + P] * rhs[P];
+      const Real sc = vd / eval[k];
+      for (int P = 0; P < naux; ++P) x[P] += sc * V[k * naux + P];
+    }
+    return x;
+  };
+  std::vector<std::vector<Real>> gamma(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    std::vector<Real> d(naux, Real(0));
+    detail::gemm('T', 'N', naux, 1, static_cast<int>(N), Real(1), T.data(), naux, reqs[r].D,
+                 1, Real(0), d.data(), 1);
+    gamma[r] = solve(d);
+  }
+
+  // ---- derivative three-centre pass -------------------------------------
+  // accumulates, per perturbation x and request r:
+  //   A[r][x] (nao x nao) = sum_P d(mn|P)/dx gamma_P
+  //   dx[r][x] (naux)     = sum_mn d(mn|P)/dx D_mn
+  std::vector<Real> A(static_cast<std::size_t>(nreq) * npert * N, Real(0));
+  std::vector<Real> dxv(static_cast<std::size_t>(nreq) * npert * naux, Real(0));
+  {
+    std::vector<ShellPair<Real>> plist;
+    std::vector<int> pid(static_cast<std::size_t>(nso) * 3 * nso * 3, -1);
+    auto orb_pair = [&](int si, int di, int sj, int dj) {
+      if (orb.shells[si].l + di < 0 || orb.shells[sj].l + dj < 0) return -1;
+      const std::size_t key =
+          ((static_cast<std::size_t>(si) * 3 + (di + 1)) * nso + sj) * 3 + (dj + 1);
+      if (pid[key] < 0) {
+        PrimitiveShell<Real> a = orb.shells[si], b = orb.shells[sj];
+        a.l += di;
+        b.l += dj;
+        plist.push_back(make_pair(a, b));
+        pid[key] = static_cast<int>(plist.size()) - 1;
+      }
+      return pid[key];
+    };
+    for (int m = 0; m < nso; ++m)
+      for (int n = 0; n < nso; ++n) {
+        orb_pair(m, 0, n, 0);
+        orb_pair(m, 1, n, 0);
+        orb_pair(m, -1, n, 0);
+        orb_pair(m, 0, n, 1);
+        orb_pair(m, 0, n, -1);
+      }
+    const int nbra = static_cast<int>(plist.size());
+    for (int a = 0; a < nsa; ++a) plist.push_back(detail::ghost_pair(aux.shells[a]));
+    std::vector<std::pair<int, int>> quartets;
+    std::vector<int> jm, jn, jaux, emp, emm, enp, enm;
+    for (int m = 0; m < nso; ++m)
+      for (int n = 0; n < nso; ++n)
+        for (int a = 0; a < nsa; ++a) {
+          auto emit = [&](int bra) {
+            if (bra < 0) return -1;
+            const int e = static_cast<int>(quartets.size());
+            quartets.push_back({bra, nbra + a});
+            return e;
+          };
+          jm.push_back(m); jn.push_back(n); jaux.push_back(a);
+          emp.push_back(emit(orb_pair(m, 1, n, 0)));
+          emm.push_back(emit(orb_pair(m, -1, n, 0)));
+          enp.push_back(emit(orb_pair(m, 0, n, 1)));
+          enm.push_back(emit(orb_pair(m, 0, n, -1)));
+        }
+    const int njob = static_cast<int>(jm.size());
+    auto tab = make_pair_table(plist);
+    auto batch = make_batch(tab, quartets);
+    QuartetWorkspace<Real> ws;
+    Kokkos::View<Real *> out("intti::rijd::out", batch.nout_total);
+    eri_quartets(tab, batch, grid, out, ws);
+    // host-side flattened inputs
+    std::vector<int> hlm(nso), hln(nso), hom(nso);
+    std::vector<Real> ham(nso);
+    for (int i = 0; i < nso; ++i) {
+      hlm[i] = orb.shells[i].l;
+      hom[i] = orb.ao_off[i];
+      ham[i] = orb.shells[i].alpha;
+    }
+    std::vector<int> hla(nsa), hoa(nsa);
+    for (int i = 0; i < nsa; ++i) {
+      hla[i] = aux.shells[i].l;
+      hoa[i] = aux.ao_off[i];
+    }
+    std::vector<Real> hg(static_cast<std::size_t>(nreq) * naux), hD(nreq * N);
+    for (int r = 0; r < nreq; ++r) {
+      for (int P = 0; P < naux; ++P) hg[r * naux + P] = gamma[r][P];
+      for (std::size_t i = 0; i < N; ++i) hD[r * N + i] = reqs[r].D[i];
+    }
+    auto dlm = detail::to_device(hlm, "rijd::lm"), dom = detail::to_device(hom, "rijd::om");
+    auto dam = detail::to_device(ham, "rijd::am");
+    auto dla = detail::to_device(hla, "rijd::la"), doa = detail::to_device(hoa, "rijd::oa");
+    auto djm = detail::to_device(jm, "rijd::jm"), djn = detail::to_device(jn, "rijd::jn");
+    auto dja = detail::to_device(jaux, "rijd::ja");
+    auto dmp = detail::to_device(emp, "rijd::mp"), dmm = detail::to_device(emm, "rijd::mm");
+    auto dnp = detail::to_device(enp, "rijd::np"), dnm = detail::to_device(enm, "rijd::nm");
+    auto dg = detail::to_device(hg, "rijd::g"), dD = detail::to_device(hD, "rijd::D");
+    auto offv = batch.out_offset;
+    Kokkos::View<Real *> Ad("rijd::A", A.size()), Dxd("rijd::dx", dxv.size());
+    const std::size_t nn2 = N, nax = naux;
+    Kokkos::parallel_for(
+        "intti::rijd::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+          const int m = djm(j), n = djn(j), a = dja(j);
+          const int lm = dlm(m), ln = dlm(n), lp = dla(a);
+          const int nm = ncart(lm), nn = ncart(ln), nP = ncart(lp);
+          const int om = dom(m), on = dom(n), oP = doa(a);
+          const int ent[2][2] = {{dmp(j), dmm(j)}, {dnp(j), dnm(j)}};
+          for (int km = 0; km < nm; ++km) {
+            int m3[3];
+            cart_comp(lm, km, m3[0], m3[1], m3[2]);
+            for (int kn = 0; kn < nn; ++kn) {
+              int n3[3];
+              cart_comp(ln, kn, n3[0], n3[1], n3[2]);
+              const std::size_t imn = static_cast<std::size_t>(om + km) * nao + on + kn;
+              for (int kp = 0; kp < nP; ++kp) {
+                const int Pg = oP + kp;
+                for (int e = 0; e < 3; ++e) {
+                  Real dv[3];
+                  for (int slot = 0; slot < 2; ++slot) {
+                    int sg[2], ci[2];
+                    Real co[2];
+                    const int nt = slot == 0
+                                       ? detail::md_grad_terms(lm, m3, dam(m), e, sg, ci, co)
+                                       : detail::md_grad_terms(ln, n3, dam(n), e, sg, ci, co);
+                    Real v = 0;
+                    for (int t = 0; t < nt; ++t) {
+                      const int ee = ent[slot][sg[t]];
+                      if (ee < 0) continue;
+                      const int sh = (sg[t] == 0) ? 1 : -1;
+                      const int mm = (slot == 0) ? ncart(lm + sh) : nm;
+                      const int mn2 = (slot == 1) ? ncart(ln + sh) : nn;
+                      const int ia = (slot == 0) ? ci[t] : km;
+                      const int ib = (slot == 1) ? ci[t] : kn;
+                      (void)mm;
+                      const std::size_t idx =
+                          ((static_cast<std::size_t>(ia) * mn2 + ib) * nP + kp);
+                      v += co[t] * out(offv(ee) + idx);
+                    }
+                    dv[slot] = -v; // md_grad_terms is d/dx; the centre derivative is -it
+                  }
+                  dv[2] = -(dv[0] + dv[1]); // d/dP by translational invariance
+                  const int tgt[3] = {m, n, nso + a};
+                  for (int slot = 0; slot < 3; ++slot) {
+                    const std::size_t px = static_cast<std::size_t>(3 * tgt[slot] + e);
+                    for (int r = 0; r < nreq; ++r) {
+                      Kokkos::atomic_add(&Ad((static_cast<std::size_t>(r) * (3 * (nso + nsa)) +
+                                              px) * nn2 + imn),
+                                         dv[slot] * dg(r * nax + Pg));
+                      Kokkos::atomic_add(&Dxd((static_cast<std::size_t>(r) * (3 * (nso + nsa)) +
+                                               px) * nax + Pg),
+                                         dv[slot] * dD(r * nn2 + imn));
+                    }
+                  }
+                }
+              }
+            }
+          }
+        });
+    Kokkos::fence();
+    A = detail::to_host(Ad);
+    dxv = detail::to_host(Dxd);
+  }
+
+  // ---- derivative two-centre pass: (M_x gamma)_P ------------------------
+  std::vector<Real> Mxg(static_cast<std::size_t>(nreq) * npert * naux, Real(0));
+  {
+    std::vector<ShellPair<Real>> plist;
+    std::vector<int> pid(static_cast<std::size_t>(nsa) * 3, -1);
+    auto aux_pair = [&](int si, int di) {
+      if (aux.shells[si].l + di < 0) return -1;
+      const std::size_t key = static_cast<std::size_t>(si) * 3 + (di + 1);
+      if (pid[key] < 0) {
+        PrimitiveShell<Real> a = aux.shells[si];
+        a.l += di;
+        plist.push_back(detail::ghost_pair(a));
+        pid[key] = static_cast<int>(plist.size()) - 1;
+      }
+      return pid[key];
+    };
+    for (int a = 0; a < nsa; ++a) {
+      aux_pair(a, 0);
+      aux_pair(a, 1);
+      aux_pair(a, -1);
+    }
+    std::vector<std::pair<int, int>> quartets;
+    std::vector<int> jp, jq, epp, epm;
+    for (int P = 0; P < nsa; ++P)
+      for (int Qs = 0; Qs < nsa; ++Qs) {
+        auto emit = [&](int bra) {
+          if (bra < 0) return -1;
+          const int e = static_cast<int>(quartets.size());
+          quartets.push_back({bra, aux_pair(Qs, 0)});
+          return e;
+        };
+        jp.push_back(P); jq.push_back(Qs);
+        epp.push_back(emit(aux_pair(P, 1)));
+        epm.push_back(emit(aux_pair(P, -1)));
+      }
+    const int njob = static_cast<int>(jp.size());
+    auto tab = make_pair_table(plist);
+    auto batch = make_batch(tab, quartets);
+    QuartetWorkspace<Real> ws;
+    Kokkos::View<Real *> out("intti::rijd2::out", batch.nout_total);
+    eri_quartets(tab, batch, grid, out, ws);
+    std::vector<int> hla(nsa), hoa(nsa);
+    std::vector<Real> haa(nsa);
+    for (int i = 0; i < nsa; ++i) {
+      hla[i] = aux.shells[i].l;
+      hoa[i] = aux.ao_off[i];
+      haa[i] = aux.shells[i].alpha;
+    }
+    std::vector<Real> hg(static_cast<std::size_t>(nreq) * naux);
+    for (int r = 0; r < nreq; ++r)
+      for (int P = 0; P < naux; ++P) hg[r * naux + P] = gamma[r][P];
+    auto dla = detail::to_device(hla, "rijd2::la"), doa = detail::to_device(hoa, "rijd2::oa");
+    auto daa = detail::to_device(haa, "rijd2::aa");
+    auto djp = detail::to_device(jp, "rijd2::p"), djq = detail::to_device(jq, "rijd2::q");
+    auto dpp = detail::to_device(epp, "rijd2::pp"), dpm = detail::to_device(epm, "rijd2::pm");
+    auto dg = detail::to_device(hg, "rijd2::g");
+    auto offv = batch.out_offset;
+    Kokkos::View<Real *> Mg("rijd2::Mg", Mxg.size());
+    const std::size_t nax = naux;
+    const int nso_ = nso, ncen_ = ncen;
+    Kokkos::parallel_for(
+        "intti::rijd2::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+          const int P = djp(j), Qs = djq(j);
+          const int lP = dla(P), lQ = dla(Qs);
+          const int nP = ncart(lP), nQ = ncart(lQ);
+          const int oP = doa(P), oQ = doa(Qs);
+          const int ent[2] = {dpp(j), dpm(j)};
+          for (int kp = 0; kp < nP; ++kp) {
+            int p3[3];
+            cart_comp(lP, kp, p3[0], p3[1], p3[2]);
+            for (int kq = 0; kq < nQ; ++kq)
+              for (int e = 0; e < 3; ++e) {
+                int sg[2], ci[2];
+                Real co[2];
+                const int nt = detail::md_grad_terms(lP, p3, daa(P), e, sg, ci, co);
+                Real v = 0;
+                for (int t = 0; t < nt; ++t) {
+                  const int ee = ent[sg[t]];
+                  if (ee < 0) continue;
+                  const int sh = (sg[t] == 0) ? 1 : -1;
+                  const std::size_t idx = static_cast<std::size_t>(ci[t]) * nQ + kq;
+                  (void)sh;
+                  v += co[t] * out(offv(ee) + idx);
+                }
+                const Real dP = -v;              // centre derivative
+                const Real dQ = -dP;             // only two centres: d/dQ = -d/dP
+                const int tgt[2] = {nso_ + P, nso_ + Qs};
+                const Real dvv[2] = {dP, dQ};
+                for (int slot = 0; slot < 2; ++slot) {
+                  const std::size_t px = static_cast<std::size_t>(3 * tgt[slot] + e);
+                  for (int r = 0; r < nreq; ++r)
+                    Kokkos::atomic_add(
+                        &Mg((static_cast<std::size_t>(r) * (3 * ncen_) + px) * nax + oP + kp),
+                        dvv[slot] * dg(r * nax + oQ + kq));
+                }
+              }
+          }
+        });
+    Kokkos::fence();
+    Mxg = detail::to_host(Mg);
+  }
+
+  // ---- assemble: dJ^x = A^x + T gamma_x, gamma_x = M^+ (d_x - M_x gamma) --
+  JKDerivResult<Real> res;
+  res.nshell = ncen;
+  res.nao = nao;
+  res.J.resize(nreq);
+  res.K.resize(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    res.J[r].assign(static_cast<std::size_t>(npert) * N, Real(0));
+    for (int x = 0; x < npert; ++x) {
+      std::vector<Real> rhs(naux);
+      for (int P = 0; P < naux; ++P)
+        rhs[P] = dxv[(static_cast<std::size_t>(r) * npert + x) * naux + P] -
+                 Mxg[(static_cast<std::size_t>(r) * npert + x) * naux + P];
+      const auto gx = solve(rhs);
+      std::vector<Real> add(N, Real(0));
+      detail::gemm('N', 'N', static_cast<int>(N), 1, naux, Real(1), T.data(), naux, gx.data(),
+                   1, Real(0), add.data(), 1);
+      const std::size_t o = static_cast<std::size_t>(x) * N;
+      const std::size_t ao = (static_cast<std::size_t>(r) * npert + x) * N;
+      for (std::size_t i = 0; i < N; ++i) res.J[r][o + i] = A[ao + i] + add[i];
+    }
+  }
+  return res;
 }
 
 } // namespace intti

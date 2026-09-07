@@ -17,6 +17,7 @@
 #include "intti/fock.hpp"
 #include "intti/jk.hpp"
 #include "intti/ri.hpp"
+#include "intti/rigrad.hpp"
 #include "intti/tgrid.hpp"
 
 namespace {
@@ -396,6 +397,91 @@ TEST(JK, DerivativeMatricesSumToZeroOverShells) {
       }
       ASSERT_LT(std::abs(sj), 1e-11 * scale) << "sum of dJ over shells, comp " << e;
       ASSERT_LT(std::abs(sk), 1e-11 * scale) << "sum of dK over shells, comp " << e;
+    }
+}
+
+
+TEST(JK, RiCoulombDerivativeMatricesMatchFiniteDifference) {
+  // The RI derivative MATRIX needs gamma_x, which the RI gradient never does:
+  // gamma is the stationary point of the fitting functional, so by the 2n+1 rule
+  // the first-order ENERGY is complete without it, but the matrix is not a
+  // stationary quantity. Differencing ri_jk's J at fixed density therefore tests
+  // exactly the term that is new -- and displacing AUXILIARY shells tests it in
+  // the place the plain gradient can hide it.
+  auto osh = jk_shells();
+  auto ash = jk_aux_shells();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto orb = intti::make_basis(osh);
+  auto aux = intti::make_basis(ash);
+  const int n = orb.nao;
+  const int nso = static_cast<int>(osh.size()), nsa = static_cast<int>(ash.size());
+  const auto D = general_density(n);
+  const std::vector<intti::JKRequest<double>> reqs = {
+      {D.data(), intti::DensitySymmetry::General, intti::FockTerms::Coulomb}};
+  const auto dv = intti::ri_j_deriv_build(orb, aux, reqs, grid);
+  ASSERT_EQ(dv.nshell, nso + nsa);
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  const double h = 1e-4;
+  // one orbital shell and one auxiliary shell, all three directions
+  const std::vector<int> probe = {1, nso + 2};
+  for (int s : probe)
+    for (int e = 0; e < 3; ++e) {
+      auto shifted = [&](double delta) {
+        auto o2 = osh;
+        auto a2 = ash;
+        if (s < nso)
+          o2[s].center[e] += delta;
+        else
+          a2[s - nso].center[e] += delta;
+        auto ob = intti::make_basis(o2);
+        auto ab = intti::make_basis(a2);
+        const auto fit = intti::ri_fit(ob, ab, grid);
+        std::vector<double> J(n2), K(n2);
+        intti::ri_jk(fit, D.data(), J.data(), K.data());
+        return J;
+      };
+      const auto Jp = shifted(h), Jm = shifted(-h);
+      const std::size_t o = (static_cast<std::size_t>(3 * s + e)) * n2;
+      double worst = 0, sc = 0;
+      for (std::size_t i = 0; i < n2; ++i) {
+        const double fd = (Jp[i] - Jm[i]) / (2 * h);
+        worst = std::max(worst, std::abs(fd - dv.J[0][o + i]));
+        sc = std::max(sc, std::abs(fd));
+      }
+      ASSERT_GT(sc, 1e-4) << "shell " << s << " comp " << e << " derivative is zero";
+      EXPECT_LT(worst, 5e-6 * (sc + 1)) << "shell " << s << " comp " << e;
+    }
+}
+
+TEST(JK, RiCoulombDerivativeMatricesContractToTheKnownGradient) {
+  // E_J = 1/2 sum D J(D), so at fixed D the weighted trace of the derivative
+  // matrices must reproduce ri_j_gradient, which is already validated. Note the
+  // gradient itself is gamma_x-free, so agreement here also confirms the gamma_x
+  // contribution cancels out of the trace exactly as the 2n+1 rule says.
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = orb.nao;
+  const auto D = sym_density(n);
+  const std::vector<intti::JKRequest<double>> reqs = {
+      {D.data(), intti::DensitySymmetry::Symmetric, intti::FockTerms::Coulomb}};
+  const auto dv = intti::ri_j_deriv_build(orb, aux, reqs, grid);
+  const auto ref = intti::ri_j_gradient(orb, aux, D.data(), grid);
+  const int nso = static_cast<int>(orb.shells.size());
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  double scale = 0;
+  for (const auto &g : ref.forb)
+    for (int e = 0; e < 3; ++e) scale = std::max(scale, std::abs(g[e]));
+  for (const auto &g : ref.faux)
+    for (int e = 0; e < 3; ++e) scale = std::max(scale, std::abs(g[e]));
+  ASSERT_GT(scale, 1e-4);
+  for (int s = 0; s < dv.nshell; ++s)
+    for (int e = 0; e < 3; ++e) {
+      const std::size_t o = (static_cast<std::size_t>(3 * s + e)) * n2;
+      double g = 0;
+      for (std::size_t i = 0; i < n2; ++i) g += 0.5 * D[i] * dv.J[0][o + i];
+      const double want = (s < nso) ? ref.forb[s][e] : ref.faux[s - nso][e];
+      EXPECT_NEAR(g, want, 1e-9 * (scale + 1)) << "shell " << s << " comp " << e;
     }
 }
 
