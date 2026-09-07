@@ -16,6 +16,7 @@
 #include "intti/erigrad.hpp" // detail::eri_block4
 #include "intti/fock.hpp"
 #include "intti/jk.hpp"
+#include "intti/ri.hpp"
 #include "intti/tgrid.hpp"
 
 namespace {
@@ -185,6 +186,116 @@ TEST(JK, TermSelectionAndScreening) {
   const auto scr = intti::jk_build(bas, reqs, grid, 1e-14);
   EXPECT_LT(maxdiff(scr.J[2], got.J[2]), 1e-11 * maxabs(got.J[2]));
   EXPECT_LT(maxdiff(scr.K[2], got.K[2]), 1e-11 * maxabs(got.K[2]));
+}
+
+
+std::vector<S> jk_aux_shells() {
+  return {{2.4, {0.0, 0.0, 0.0}, 0},      {1.1, {0.0, 0.0, 0.0}, 1},
+          {0.6, {0.5, 0.1, -0.2}, 0},     {1.8, {0.5, 0.1, -0.2}, 1},
+          {0.9, {-0.3, 0.4, 0.2}, 0},     {1.4, {0.2, -0.4, 0.6}, 0},
+          {0.5, {0.2, -0.4, 0.6}, 1}};
+}
+
+TEST(JK, RiPathIsAlreadyGeneralInTheDensity) {
+  // ri_jk contracts K = sum_P B^P D B^P as two GEMMs and never exploits a
+  // triangle, so unlike exchange_build it is correct for a general density
+  // without any change. Pinned here so a future "optimisation" that assumes
+  // symmetry has to fail this test.
+  auto osh = jk_shells();
+  auto orb = intti::make_basis(osh);
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const auto fit = intti::ri_fit(orb, aux, grid);
+  const int n = orb.nao;
+  const auto Da = antisym_density(n), Dg = general_density(n);
+  auto trans = [&](const std::vector<double> &M) {
+    std::vector<double> T(M.size());
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) T[i * n + j] = M[j * n + i];
+    return T;
+  };
+  // K(D)^T = K(D^T): check on a genuinely non-symmetric density
+  std::vector<double> Kg(static_cast<std::size_t>(n) * n), KgT(Kg.size());
+  intti::ri_jk(fit, Dg.data(), static_cast<double *>(nullptr), Kg.data());
+  const auto DgT = trans(Dg);
+  intti::ri_jk(fit, DgT.data(), static_cast<double *>(nullptr), KgT.data());
+  ASSERT_GT(maxabs(Kg), 1e-3);
+  EXPECT_LT(maxdiff(trans(Kg), KgT), 1e-12 * maxabs(Kg)) << "K(D)^T must equal K(D^T)";
+  // antisymmetric density: J vanishes, K is antisymmetric
+  std::vector<double> Ja(Kg.size()), Ka(Kg.size());
+  intti::ri_jk(fit, Da.data(), Ja.data(), Ka.data());
+  ASSERT_GT(maxabs(Ka), 1e-3);
+  EXPECT_LT(maxabs(Ja), 1e-12 * maxabs(Kg)) << "RI J must vanish for antisymmetric D";
+  std::vector<double> sum(Ka.size());
+  const auto KaT = trans(Ka);
+  for (std::size_t i = 0; i < Ka.size(); ++i) sum[i] = Ka[i] + KaT[i];
+  EXPECT_LT(maxabs(sum), 1e-12 * maxabs(Ka)) << "RI K(antisymmetric D) must be antisymmetric";
+}
+
+TEST(JK, RiMultiDensityMatchesPerDensityCalls) {
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const auto fit = intti::ri_fit(orb, aux, grid);
+  const int n = orb.nao;
+  const auto Ds = sym_density(n), Da = antisym_density(n), Dg = general_density(n);
+  std::vector<intti::JKRequest<double>> reqs = {
+      {Ds.data(), intti::DensitySymmetry::Symmetric, intti::FockTerms::CoulombExchange},
+      {Da.data(), intti::DensitySymmetry::Antisymmetric, intti::FockTerms::Exchange},
+      {Dg.data(), intti::DensitySymmetry::General, intti::FockTerms::Coulomb}};
+  const auto got = intti::ri_jk_build(fit, reqs);
+  EXPECT_TRUE(got.J[1].empty()) << "exchange-only request must not build J";
+  EXPECT_TRUE(got.K[2].empty()) << "Coulomb-only request must not build K";
+  const std::vector<const std::vector<double> *> Dv = {&Ds, &Da, &Dg};
+  for (int r = 0; r < 3; ++r) {
+    std::vector<double> J(static_cast<std::size_t>(n) * n), K(J.size());
+    intti::ri_jk(fit, Dv[r]->data(), J.data(), K.data());
+    if (!got.J[r].empty())
+      EXPECT_LT(maxdiff(got.J[r], J), 1e-12 * (maxabs(J) + 1)) << "J, request " << r;
+    if (!got.K[r].empty())
+      EXPECT_LT(maxdiff(got.K[r], K), 1e-12 * (maxabs(K) + 1)) << "K, request " << r;
+  }
+}
+
+TEST(JK, TwoSidedOrbitalExchangeMatchesDensityDriven) {
+  // ri_k_occ2 is the form a CPHF perturbed density actually needs: not
+  // idempotent, but a product of two DIFFERENT orbital sets, D = C_L C_R^T.
+  // Using distinct C_L and C_R makes D non-symmetric, which the one-sided
+  // ri_k_occ cannot represent at all.
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const auto fit = intti::ri_fit(orb, aux, grid);
+  const int n = orb.nao, nvec = 3;
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec),
+      CR(static_cast<std::size_t>(n) * nvec);
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < nvec; ++k) {
+      CL[i * nvec + k] = 0.3 * std::cos(0.7 * i + k) / (1.0 + i);
+      CR[i * nvec + k] = 0.2 * std::sin(0.4 * i - 2.0 * k) + 0.05 * k;
+    }
+  std::vector<double> D(static_cast<std::size_t>(n) * n, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double s = 0;
+      for (int k = 0; k < nvec; ++k) s += CL[i * nvec + k] * CR[j * nvec + k];
+      D[i * n + j] = s;
+    }
+  // D is genuinely non-symmetric
+  double asym = 0;
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) asym = std::max(asym, std::abs(D[i * n + j] - D[j * n + i]));
+  ASSERT_GT(asym, 1e-3) << "test density is symmetric, defeating the point";
+  std::vector<double> Kref(D.size()), Korb(D.size());
+  intti::ri_jk(fit, D.data(), static_cast<double *>(nullptr), Kref.data());
+  intti::ri_k_occ2(fit, CL.data(), CR.data(), nvec, Korb.data());
+  ASSERT_GT(maxabs(Kref), 1e-4);
+  EXPECT_LT(maxdiff(Korb, Kref), 1e-12 * maxabs(Kref)) << "two-sided orbital vs density form";
+  // and C_L = C_R must reproduce the existing one-sided routine exactly
+  std::vector<double> K1(D.size()), K2(D.size());
+  intti::ri_k_occ(fit, CL.data(), nvec, K1.data());
+  intti::ri_k_occ2(fit, CL.data(), CL.data(), nvec, K2.data());
+  EXPECT_LT(maxdiff(K1, K2), 1e-12 * (maxabs(K1) + 1)) << "C_L = C_R must recover ri_k_occ";
 }
 
 } // namespace

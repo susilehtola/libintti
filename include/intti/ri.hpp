@@ -23,6 +23,7 @@
 #include "blas.hpp"     // detail::gemm
 #include "cholesky.hpp" // detail::syevd
 #include "fock.hpp"
+#include "jk.hpp"
 #include "ncenter.hpp"
 #include "tgrid.hpp"
 
@@ -139,8 +140,15 @@ void ri_j_tiled(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
   }
 }
 
-/// RI Coulomb and/or exchange from a symmetric density D (nao x nao,
-/// row-major). Either output pointer may be null.
+/// RI Coulomb and/or exchange from a density D (nao x nao, row-major). Either
+/// output pointer may be null.
+///
+/// D need NOT be symmetric. Unlike the fused exchange_build, which computes the
+/// upper triangle and mirrors it, the contraction here is K = sum_P B^P D B^P
+/// as two GEMMs and assumes nothing about D -- so it is already correct for the
+/// general and antisymmetric densities that response theory produces, and gives
+/// K(D)^T = K(D^T) as it must. J likewise picks up only the symmetric part of D,
+/// because B^P is symmetric in (mu,nu), so J(antisymmetric D) is exactly zero.
 template <class Real>
 void ri_jk(const RIFit<Real> &fit, const Real *D, Real *J, Real *K) {
   const int nao = fit.nao, naux = fit.naux;
@@ -202,6 +210,115 @@ void ri_k_occ(const RIFit<Real> &fit, const Real *C, int nocc, Real *K) {
     // K += X X^T  (K_{mu nu} += sum_i X_{mu i} X_{nu i})
     detail::gemm('N', 'T', nao, nao, nocc, Real(1), X.data(), nocc, X.data(),
                  nocc, Real(1), K, nao);
+  }
+}
+
+/// Multi-density RI J/K: the same interface as jk_build (jk.hpp), one pass over
+/// the fit vectors for all requests. The saving over calling ri_jk per density
+/// is the gather: B is stored strided by naux, so each B^P slice costs an
+/// O(nao^2) gather that ri_jk repeats for every density. Here it is gathered
+/// once per P and applied to all of them, and the Coulomb half collapses to two
+/// GEMMs over the whole request set.
+///
+/// DensitySymmetry is accepted for interface uniformity but not needed: the RI
+/// contraction is general in D already (see ri_jk).
+template <class Real>
+JKResult<Real> ri_jk_build(const RIFit<Real> &fit,
+                           const std::vector<JKRequest<Real>> &reqs) {
+  const int nao = fit.nao, naux = fit.naux;
+  const int nreq = static_cast<int>(reqs.size());
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  JKResult<Real> res;
+  res.J.resize(nreq);
+  res.K.resize(nreq);
+  std::vector<int> wantJ(nreq), wantK(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    wantJ[r] = reqs[r].terms != FockTerms::Exchange;
+    wantK[r] = reqs[r].terms != FockTerms::Coulomb;
+    if (wantJ[r]) res.J[r].assign(N, Real(0));
+    if (wantK[r]) res.K[r].assign(N, Real(0));
+  }
+  // Coulomb: c(P, r) = sum_mn B(mn, P) D_r(mn); J_r(mn) = sum_P B(mn, P) c(P, r)
+  int njr = 0;
+  for (int r = 0; r < nreq; ++r) njr += wantJ[r];
+  if (njr > 0) {
+    std::vector<Real> Dm(N * njr), c(static_cast<std::size_t>(naux) * njr), Jm(N * njr);
+    int col = 0;
+    for (int r = 0; r < nreq; ++r) {
+      if (!wantJ[r]) continue;
+      for (std::size_t i = 0; i < N; ++i) Dm[i * njr + col] = reqs[r].D[i];
+      ++col;
+    }
+    detail::gemm('T', 'N', naux, njr, static_cast<int>(N), Real(1), fit.B.data(), naux,
+                 Dm.data(), njr, Real(0), c.data(), njr);
+    detail::gemm('N', 'N', static_cast<int>(N), njr, naux, Real(1), fit.B.data(), naux,
+                 c.data(), njr, Real(0), Jm.data(), njr);
+    col = 0;
+    for (int r = 0; r < nreq; ++r) {
+      if (!wantJ[r]) continue;
+      for (std::size_t i = 0; i < N; ++i) res.J[r][i] = Jm[i * njr + col];
+      ++col;
+    }
+  }
+  // Exchange: K_r += B^P D_r B^P, gathering B^P once for the whole request set
+  int nkr = 0;
+  for (int r = 0; r < nreq; ++r) nkr += wantK[r];
+  if (nkr > 0) {
+    std::vector<Real> BP(N), Dstack(static_cast<std::size_t>(nao) * nao * nkr);
+    std::vector<Real> BD(static_cast<std::size_t>(nao) * nao * nkr);
+    // densities side by side: Dstack is nao x (nkr*nao)
+    {
+      int col = 0;
+      for (int r = 0; r < nreq; ++r) {
+        if (!wantK[r]) continue;
+        for (int i = 0; i < nao; ++i)
+          for (int j = 0; j < nao; ++j)
+            Dstack[static_cast<std::size_t>(i) * nkr * nao + col * nao + j] =
+                reqs[r].D[static_cast<std::size_t>(i) * nao + j];
+        ++col;
+      }
+    }
+    for (int P = 0; P < naux; ++P) {
+      for (std::size_t mn = 0; mn < N; ++mn) BP[mn] = fit.B[mn * naux + P];
+      detail::gemm('N', 'N', nao, nkr * nao, nao, Real(1), BP.data(), nao, Dstack.data(),
+                   nkr * nao, Real(0), BD.data(), nkr * nao);
+      int col = 0;
+      for (int r = 0; r < nreq; ++r) {
+        if (!wantK[r]) continue;
+        detail::gemm('N', 'N', nao, nao, nao, Real(1), BD.data() + col * nao, nkr * nao,
+                     BP.data(), nao, Real(1), res.K[r].data(), nao);
+        ++col;
+      }
+    }
+  }
+  return res;
+}
+
+/// Two-sided occupation-driven RI exchange, the general form of ri_k_occ: for a
+/// density factorised as D = C_L C_R^T (nao x nvec each, row-major),
+///   K = sum_P (B^P C_L)(B^P C_R)^T,
+/// which is B^P D B^P because B^P is symmetric. C_L = C_R recovers ri_k_occ.
+///
+/// This is the case where the orbital-driven form genuinely matters: a CPHF
+/// perturbed density is NOT idempotent and is not a single orbital product, but
+/// it IS a product of two different orbital sets -- which is exactly why psi4's
+/// JK takes C_left and C_right. Cost scales with nvec rather than nao.
+template <class Real>
+void ri_k_occ2(const RIFit<Real> &fit, const Real *CL, const Real *CR, int nvec, Real *K) {
+  const int nao = fit.nao, naux = fit.naux;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  for (std::size_t i = 0; i < N; ++i) K[i] = Real(0);
+  std::vector<Real> BP(N);
+  std::vector<Real> XL(static_cast<std::size_t>(nao) * nvec);
+  std::vector<Real> XR(static_cast<std::size_t>(nao) * nvec);
+  for (int P = 0; P < naux; ++P) {
+    for (std::size_t mn = 0; mn < N; ++mn) BP[mn] = fit.B[mn * naux + P];
+    detail::gemm('N', 'N', nao, nvec, nao, Real(1), BP.data(), nao, CL, nvec, Real(0),
+                 XL.data(), nvec);
+    detail::gemm('N', 'N', nao, nvec, nao, Real(1), BP.data(), nao, CR, nvec, Real(0),
+                 XR.data(), nvec);
+    detail::gemm('N', 'T', nao, nao, nvec, Real(1), XL.data(), nvec, XR.data(), nvec,
+                 Real(1), K, nao);
   }
 }
 
