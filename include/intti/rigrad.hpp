@@ -1675,39 +1675,12 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
   return res;
 }
 
-// RI EXCHANGE derivative matrices are deliberately ABSENT.
-//
-// A dense-density formulation was implemented and removed: it is not tractable
-// and cannot be made so by blocking. With
-//   G^P_{ms} = sum_l (ml|P) D_ls,  M Ghat = G,  K_mn = sum_{Q,s} Ghat^Q_{ms} (ns|Q),
-// the response M dGhat/dx = dG/dx - (dM/dx) Ghat has a naux x nao x nao
-// intermediate PER PERTURBATION -- 32 GB at nao = 1000, naux = 4000, and 256 GB
-// at twice that. Blocking the perturbation loop does not help, because the
-// object is already too large at a block size of one.
-//
-// The tractable form needs two changes together, and neither alone suffices:
-//
-//  1. Keep the density FACTORISED, D = C_L C_R^T. Then
-//       G^P_{ms} = sum_k X^P_{mk} C_R[s,k],  X^P_{mk} = sum_l (ml|P) C_L[l,k],
-//     and since M^{-1} touches only P, Ghat inherits the factorisation: the
-//     nao x nao slab never has to exist, only naux x nao x nvec. This is the
-//     same reason ri_k_occ2 is orbital-driven -- a perturbed density is a
-//     product of two orbital sets, and keeping it that way is what makes the
-//     response affordable.
-//
-//  2. Move M^{-1} onto the perturbation-INDEPENDENT side, so dGhat/dx is never
-//     formed at all:
-//       sum_{Q,s} dGhat^Q_{ms}/dx (ns|Q)
-//         = sum_{P,s} [dG/dx - (dM/dx) Ghat]^P_{ms} Chat^P_{ns},
-//       Chat^P_{ns} = sum_Q M^{-1}_{PQ} (ns|Q)  -- the fitted three-index,
-//     computed once and reused by every perturbation. The remaining sum over P
-//     is then a plain contraction, so it BLOCKS over the auxiliary index, and
-//     the only per-perturbation storage left is the output matrix itself.
-//
-// With both, per-perturbation memory is nao^2 (the requested output) and the
-// auxiliary block size becomes a cache/BLAS choice rather than a memory limit.
-// Note the Coulomb builder above does not have this problem: its response is a
-// length-naux vector, so it is affordable as written.
+// The RI exchange derivative matrices, absent for a while, are reinstated below
+// as ri_k_deriv_occ. The dense-density version was reverted because its response
+// object was naux x nao^2 PER PERTURBATION -- 32 GB for a single perturbation at
+// nao = 1000, naux = 4000, so no blocking could rescue it. Factorising the
+// density and moving M^{-1} onto the perturbation-independent side fixes it;
+// see ri_k_deriv_occ.
 
 /// RI exchange gradient for a FACTORISED density, D = C_L C_R^T. Same quantity
 /// as ri_k_gradient, computed without ever forming an nao^2 x naux object.
@@ -2067,6 +2040,169 @@ std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis
                  Hess.data(), dim);
   }
   return Hess;
+}
+
+/// Derivative RI EXCHANGE matrices for a factorised density, D = C_L C_R^T.
+/// Reinstates what was reverted for being untractable, in a form that is not.
+///
+/// The dense version's response object Ghat_x was naux x nao^2 PER PERTURBATION,
+/// 32 GB for one perturbation, so blocking could not help. Two changes fix it,
+/// the same pair as for the exchange Hessian:
+///
+///  1. FACTORISE. With X^P_mi = sum_l (ml|P) C_L[l,i], Y^Q_ni = sum_s (ns|Q)
+///     C_R[s,i] and Xhat = M^{-1}X, Yhat = M^{-1}Y, we have
+///     K_mn = sum_{Q,i} Xhat^Q_mi Y^Q_ni: the nao x nao slab per auxiliary
+///     function becomes nao x nvec.
+///  2. Move M^{-1} onto the perturbation-INDEPENDENT side, so the response is
+///     never formed. Differentiating M Xhat = X and folding M^{-1} onto Y:
+///       dK_mn/dx = sum_{P,i}   dX^P_mi/dx  Yhat^P_ni
+///                - sum_{P,R,i} dM_PR/dx Xhat^R_mi Yhat^P_ni
+///                + sum_{Q,i}   Xhat^Q_mi  dY^Q_ni/dx
+///     Every term contracts a derivative integral directly against something
+///     precomputed; nothing of size naux x nao x nvec exists per perturbation.
+///
+/// Terms 1 and 3 use the SAME derivative three-centre integrals in two index
+/// roles, so one pass serves both. The persistent working set is Xhat and Yhat
+/// (2 x naux x nao x nvec, built once); the total is dominated by the requested
+/// OUTPUT, npert x nao^2.
+template <class Real>
+JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                                   const Real *CL, const Real *CR, int nvec,
+                                   const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
+                                   int aux_tile_shells = 0) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  const int ncen = nso + nsa, npert = 3 * ncen;
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
+  auto cshell = [&](bool isaux, int i) { return isaux ? nso + i : i; };
+  const auto ghost = [&](const PrimitiveShell<Real> &sx) { return detail::ghost_shell(sx); };
+
+  auto M = coulomb_2c(aux, grid);
+  std::vector<Real> V = M, eval(naux);
+  detail::syevd(naux, V.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int k = 0; k < naux; ++k) {
+    if (eval[k] <= tau_lin * emax) continue;
+    const Real sc = Real(1) / eval[k];
+    for (int R = 0; R < naux; ++R)
+      for (int Q = 0; Q < naux; ++Q)
+        Minv[R * naux + Q] += sc * V[k * naux + R] * V[k * naux + Q];
+  }
+  std::vector<Real> X(static_cast<std::size_t>(naux) * slab, Real(0));
+  std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0));
+  {
+    std::vector<Real> Tq(N);
+    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+      const int A1 = std::min(A0 + aux_tile_shells, nsa);
+      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+      for (int Q = 0; Q < blk; ++Q) {
+        for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = Tblk[mn * blk + Q];
+        detail::gemm('N', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CL, nvec, Real(0),
+                     X.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
+        detail::gemm('N', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
+                     Y.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
+      }
+    }
+  }
+  std::vector<Real> Xh(X.size(), Real(0)), Yh(Y.size(), Real(0));
+  detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), Minv.data(), naux,
+               X.data(), static_cast<int>(slab), Real(0), Xh.data(), static_cast<int>(slab));
+  detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), Minv.data(), naux,
+               Y.data(), static_cast<int>(slab), Real(0), Yh.data(), static_cast<int>(slab));
+
+  JKDerivResult<Real> res;
+  res.nshell = ncen;
+  res.nao = nao;
+  res.J.resize(1);
+  res.K.resize(1);
+  res.K[0].assign(static_cast<std::size_t>(npert) * N, Real(0));
+  auto Kadd = [&](int x, int m, int n, Real v) {
+    res.K[0][static_cast<std::size_t>(x) * N + static_cast<std::size_t>(m) * nao + n] += v;
+  };
+  for (int l = 0; l < nso; ++l)
+    for (int n = 0; n < nso; ++n)
+      for (int c = 0; c < nsa; ++c) {
+        const auto &sl = orb.shells[l], &sn = orb.shells[n], &sc = aux.shells[c];
+        const auto gh = ghost(sc);
+        const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
+        const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
+        const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
+        for (int pos = 0; pos < 3; ++pos)
+          for (int dir = 0; dir < 3; ++dir) {
+            const auto blk = detail::quartet_pos_deriv_block(sl, sn, sc, gh, pos, dir, grid);
+            const int xi = 3 * cs[pos] + dir;
+            for (int kl = 0; kl < nl; ++kl)
+              for (int kn = 0; kn < nn; ++kn)
+                for (int kQ = 0; kQ < nP; ++kQ) {
+                  const Real dv = blk[(static_cast<std::size_t>(kl) * nn + kn) * nP + kQ];
+                  if (dv == Real(0)) continue;
+                  const int A = ol + kl, B = on + kn, P = oc + kQ;
+                  // term 1: quartet read as (m l|P), m = A, l = B
+                  for (int n2 = 0; n2 < nao; ++n2) {
+                    Real acc = 0;
+                    for (int i = 0; i < nvec; ++i)
+                      acc += CL[static_cast<std::size_t>(B) * nvec + i] *
+                             Yh[static_cast<std::size_t>(P) * slab + n2 * nvec + i];
+                    if (acc != Real(0)) Kadd(xi, A, n2, acc * dv);
+                  }
+                  // term 3: the same quartet read as (n s|Q), n = A, s = B
+                  for (int m2 = 0; m2 < nao; ++m2) {
+                    Real acc = 0;
+                    for (int i = 0; i < nvec; ++i)
+                      acc += Xh[static_cast<std::size_t>(P) * slab + m2 * nvec + i] *
+                             CR[static_cast<std::size_t>(B) * nvec + i];
+                    if (acc != Real(0)) Kadd(xi, m2, A, acc * dv);
+                  }
+                }
+          }
+      }
+  // term 2, one perturbation at a time
+  {
+    std::vector<Real> Amat(static_cast<std::size_t>(naux) * slab);
+    std::vector<Real> dM(static_cast<std::size_t>(naux) * naux);
+    for (int x = 0; x < npert; ++x) {
+      std::fill(dM.begin(), dM.end(), Real(0));
+      bool any = false;
+      for (int c = 0; c < nsa; ++c)
+        for (int ee = 0; ee < nsa; ++ee) {
+          const auto &sC = aux.shells[c], &sE = aux.shells[ee];
+          const auto ghC = ghost(sC), ghE = ghost(sE);
+          const int oC = aux.ao_off[c], oE = aux.ao_off[ee];
+          const int nC = ncart(sC.l), nE = ncart(sE.l);
+          for (int pos : {0, 2}) {
+            const int cs = (pos == 0) ? cshell(true, c) : cshell(true, ee);
+            for (int dir = 0; dir < 3; ++dir) {
+              if (3 * cs + dir != x) continue;
+              const auto blk =
+                  detail::quartet_pos_deriv_block(sC, ghC, sE, ghE, pos, dir, grid);
+              for (int kQ = 0; kQ < nC; ++kQ)
+                for (int kR = 0; kR < nE; ++kR) {
+                  const Real dv = blk[static_cast<std::size_t>(kQ) * nE + kR];
+                  if (dv == Real(0)) continue;
+                  dM[static_cast<std::size_t>(oC + kQ) * naux + oE + kR] += dv;
+                  any = true;
+                }
+            }
+          }
+        }
+      if (!any) continue;
+      detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), dM.data(), naux,
+                   Xh.data(), static_cast<int>(slab), Real(0), Amat.data(),
+                   static_cast<int>(slab));
+      for (int P = 0; P < naux; ++P)
+        detail::gemm('N', 'T', nao, nao, nvec, Real(-1),
+                     Amat.data() + static_cast<std::size_t>(P) * slab, nvec,
+                     Yh.data() + static_cast<std::size_t>(P) * slab, nvec, Real(1),
+                     res.K[0].data() + static_cast<std::size_t>(x) * N, nao);
+    }
+  }
+  return res;
 }
 
 } // namespace intti

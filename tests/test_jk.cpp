@@ -688,4 +688,63 @@ TEST(JK, FactorisedRiExchangeHessianMatchesDense) {
     }
 }
 
+
+TEST(JK, ReinstatedRiExchangeDerivativeMatchesFiniteDifference) {
+  // ri_k_deriv_occ replaces the version reverted for holding naux x nao^2 PER
+  // PERTURBATION. Factorising and moving M^{-1} to the perturbation-independent
+  // side means the response is never formed at all. Validated the same way the
+  // reverted one was: differencing ri_jk's K at fixed density, and displacing
+  // AUXILIARY shells as well, since that is where the fitting response lives.
+  auto osh = jk_shells();
+  auto ash = jk_aux_shells();
+  auto grid = intti::make_tgrid(intti::coulomb());
+  auto orb = intti::make_basis(osh);
+  auto aux = intti::make_basis(ash);
+  const int n = orb.nao, nvec = 3;
+  const int nso = static_cast<int>(osh.size());
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec),
+      CR(static_cast<std::size_t>(n) * nvec);
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < nvec; ++k) {
+      CL[i * nvec + k] = 0.3 * std::cos(0.7 * i + k) / (1.0 + i);
+      CR[i * nvec + k] = 0.2 * std::sin(0.4 * i - 2.0 * k) + 0.05 * k;
+    }
+  std::vector<double> D(static_cast<std::size_t>(n) * n, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double acc = 0;
+      for (int k = 0; k < nvec; ++k) acc += CL[i * nvec + k] * CR[j * nvec + k];
+      D[i * n + j] = acc;
+    }
+  const auto dv = intti::ri_k_deriv_occ(orb, aux, CL.data(), CR.data(), nvec, grid);
+  ASSERT_EQ(dv.nshell, nso + static_cast<int>(ash.size()));
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  const double h = 1e-4;
+  for (int s2 : {0, 1, nso + 2, nso + 5})
+    for (int e = 0; e < 3; ++e) {
+      auto shifted = [&](double delta) {
+        auto o2 = osh;
+        auto a2 = ash;
+        if (s2 < nso)
+          o2[s2].center[e] += delta;
+        else
+          a2[s2 - nso].center[e] += delta;
+        const auto fit = intti::ri_fit(intti::make_basis(o2), intti::make_basis(a2), grid);
+        std::vector<double> K(n2);
+        intti::ri_jk(fit, D.data(), static_cast<double *>(nullptr), K.data());
+        return K;
+      };
+      const auto Kp = shifted(h), Km = shifted(-h);
+      const std::size_t o = (static_cast<std::size_t>(3 * s2 + e)) * n2;
+      double worst = 0, sc = 0;
+      for (std::size_t i = 0; i < n2; ++i) {
+        const double fd = (Kp[i] - Km[i]) / (2 * h);
+        worst = std::max(worst, std::abs(fd - dv.K[0][o + i]));
+        sc = std::max(sc, std::abs(fd));
+      }
+      ASSERT_GT(sc, 1e-4) << "shell " << s2 << " comp " << e << " derivative is zero";
+      EXPECT_LT(worst, 5e-6 * (sc + 1)) << "shell " << s2 << " comp " << e;
+    }
+}
+
 } // namespace
