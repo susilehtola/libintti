@@ -87,6 +87,11 @@ if(INTTI_BUILD_TESTS)
       add_test(NAME PySCFValidationOneEl
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/prototype/pyscf_oneel_validation.py
                 $<TARGET_FILE:intti_dump_oneel> ${CMAKE_CURRENT_BINARY_DIR})
+      # PySCF's OWN SCF driver running on intti's J/K via intti_get_jk -- the
+      # matrix-level facade entry, not the per-quartet one.
+      add_test(NAME PySCFScfBackend
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/prototype/pyscf_scf_backend.py
+                $<TARGET_FILE:intti_cint>)
       add_test(NAME PySCFValidationRI
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/prototype/pyscf_ri_validation.py
                 $<TARGET_FILE:intti_dump_ri> ${CMAKE_CURRENT_BINARY_DIR})

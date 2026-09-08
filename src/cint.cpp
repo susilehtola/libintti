@@ -40,6 +40,8 @@
 #include "intti/batch.hpp"
 #include "intti/c2s.hpp"
 #include "intti/gto.hpp"
+#include "intti/jk.hpp"
+#include "intti/kernel.hpp"
 #include "intti/kernel.hpp"
 #include "intti/math.hpp"
 #include "intti/normalization.hpp"
@@ -299,4 +301,93 @@ extern "C" int intti_int2e_sph(double *out, const int *shls, const int *atm, int
                                 const int *bas, int nbas, const double *env, void * /*opt*/,
                                 double * /*cache*/) {
   return eval_int2e(out, shls, atm, natm, bas, nbas, env, true);
+}
+
+// ---------------------------------------------------------------------------
+// Matrix-level entry point: PySCF's get_jk, served by intti's J/K builders.
+//
+// This is the surface an SCF driver should plug into, NOT intti_int2e_*. The
+// per-quartet entries above exist for libcint drop-in compatibility and for
+// validation; driving an SCF through them would hand the device one quartet at
+// a time, which is exactly what the matrix-level API exists to prevent.
+//
+// The signature mirrors pyscf.scf.hf.SCF.get_jk(mol, dm, hermi, with_j, with_k,
+// omega), and the mapping is close to one-to-one because both interfaces were
+// designed for the same job:
+//     dm list        -> a vector of JKRequest
+//     hermi 0/1      -> DensitySymmetry::General / Symmetric
+//     with_j/with_k  -> FockTerms
+//     omega          -> the range-separated kernel on the t grid
+// hermi = 2 (anti-hermitian, as PySCF uses for some response densities) maps to
+// DensitySymmetry::Antisymmetric.
+//
+// RESTRICTIONS, checked and reported rather than silently mis-answered:
+//   * every shell must be uncontracted (nctr == 1, nprim == 1). intti's matrix
+//     builders take primitive shells; general contraction is a separate piece
+//     of work. Build the molecule with an uncontracted basis.
+//   * Cartesian only (mol.cart = True). The spherical transform is available in
+//     the library but is not applied here.
+// Returns 0 on success, negative on a violated restriction.
+//
+// Convention. If PySCF's AO is chi^p_mu = s_mu chi^ours_mu, then
+// (mn|ls)^p = s_m s_n s_l s_s (mn|ls)^ours, so scaling D on the way in and J/K
+// on the way out by the same diagonal is exact -- the factors are the env
+// contraction coefficient times the gto_norm -> cart_norm_pyscf correction
+// already used by the quartet path.
+extern "C" int intti_get_jk(double *vj, double *vk, const double *dms, int ndm,
+                            const int *hermi, int with_j, int with_k, const int *atm,
+                            int natm, const int *bas, int nbas, const double *env,
+                            double omega, double tau) {
+  ensure_kokkos();
+  std::vector<intti::PrimitiveShell<double>> shells;
+  std::vector<double> scale; // per-AO PySCF/intti conversion
+  for (int ish = 0; ish < nbas; ++ish) {
+    const ShellInfo s = decode_shell(ish, atm, bas, env);
+    if (s.nctr != 1 || s.nprim != 1) return -1; // contracted: not supported here
+    shells.push_back(intti::PrimitiveShell<double>{
+        s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+    const double c = s.coeff[0] * coeff_rescale(s.l);
+    for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+  }
+  auto basis = intti::make_basis(shells);
+  const int nao = basis.nao;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (static_cast<int>(scale.size()) != nao) return -2;
+
+  const intti::TGrid<double> grid =
+      (omega == 0.0) ? default_grid()
+                     : intti::make_tgrid(intti::erf_rs<double>(omega));
+
+  // scale the incoming densities into intti's AO convention
+  std::vector<std::vector<double>> Dscaled(ndm);
+  std::vector<intti::JKRequest<double>> reqs(ndm);
+  for (int d = 0; d < ndm; ++d) {
+    Dscaled[d].resize(N);
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j)
+        Dscaled[d][static_cast<std::size_t>(i) * nao + j] =
+            dms[static_cast<std::size_t>(d) * N + i * nao + j] * scale[i] * scale[j];
+    const int h = hermi ? hermi[d] : 1;
+    reqs[d].D = Dscaled[d].data();
+    reqs[d].sym = (h == 1)   ? intti::DensitySymmetry::Symmetric
+                  : (h == 2) ? intti::DensitySymmetry::Antisymmetric
+                             : intti::DensitySymmetry::General;
+    reqs[d].terms = (with_j && with_k) ? intti::FockTerms::CoulombExchange
+                    : with_j           ? intti::FockTerms::Coulomb
+                                       : intti::FockTerms::Exchange;
+  }
+  const auto res = intti::jk_build(basis, reqs, grid, tau);
+  for (int d = 0; d < ndm; ++d) {
+    if (with_j && vj)
+      for (int i = 0; i < nao; ++i)
+        for (int j = 0; j < nao; ++j)
+          vj[static_cast<std::size_t>(d) * N + i * nao + j] =
+              res.J[d][static_cast<std::size_t>(i) * nao + j] * scale[i] * scale[j];
+    if (with_k && vk)
+      for (int i = 0; i < nao; ++i)
+        for (int j = 0; j < nao; ++j)
+          vk[static_cast<std::size_t>(d) * N + i * nao + j] =
+              res.K[d][static_cast<std::size_t>(i) * nao + j] * scale[i] * scale[j];
+  }
+  return 0;
 }

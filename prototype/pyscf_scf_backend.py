@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Susi Lehtola
+"""Run PySCF's OWN SCF driver on libintti's J/K, via intti_get_jk.
+
+This is the integration test the hand-written C++ SCF driver in tests/test_scf.cpp
+was standing in for. Overriding get_jk is PySCF's documented extension point, and
+its signature maps almost one-to-one onto intti::jk_build:
+
+    dm list        -> vector<JKRequest>
+    hermi 0/1/2    -> DensitySymmetry::General / Symmetric / Antisymmetric
+    with_j/with_k  -> FockTerms
+    omega          -> range-separated kernel on the t grid
+
+Validating this way exercises the builders inside a real driver -- real DIIS,
+real convergence control -- instead of one written for the test, and it is the
+route by which PySCF's gradient and Hessian machinery can be driven on intti
+integrals without reimplementing CPHF.
+
+NOTE the restriction: intti's matrix builders take PRIMITIVE shells, so the
+molecule must use an uncontracted Cartesian basis. intti_get_jk reports a
+violation rather than answering incorrectly.
+
+usage: pyscf_scf_backend.py <path-to-libintti_cint.so>
+"""
+import ctypes
+import sys
+
+import numpy as np
+from pyscf import gto, scf
+
+# same molecule and uncontracted basis as tests/test_scf.cpp
+ATOM = [
+    ["O", (0.0, 0.0, -0.1230376)],
+    ["H", (0.0, 1.4300472, 0.9762012)],
+    ["H", (0.0, -1.4300472, 0.9762012)],
+]
+O_S = [130.70932, 23.808861, 6.4436083, 1.1695961, 0.3803890]
+O_P = [5.0331513, 1.1695961, 0.3803890]
+H_S = [3.4252509, 0.6239137, 0.1688554]
+
+
+def uncontracted(*shells):
+    return [[l, [a, 1.0]] for l, exps in shells for a in exps]
+
+
+def load(lib_path):
+    lib = ctypes.CDLL(lib_path)
+    f = lib.intti_get_jk
+    f.restype = ctypes.c_int
+    d, i = ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int)
+    f.argtypes = [d, d, d, ctypes.c_int, i, ctypes.c_int, ctypes.c_int,
+                  i, ctypes.c_int, i, ctypes.c_int, d,
+                  ctypes.c_double, ctypes.c_double]
+    return f
+
+
+def make_get_jk(fn, mol, tau=0.0):
+    """A drop-in replacement for mf.get_jk backed by intti::jk_build."""
+    nao = mol.nao_nr()
+    atm = np.asarray(mol._atm, dtype=np.int32, order="C")
+    bas = np.asarray(mol._bas, dtype=np.int32, order="C")
+    env = np.asarray(mol._env, dtype=np.float64, order="C")
+
+    def get_jk(mol_, dm, hermi=1, with_j=True, with_k=True, omega=None, **kwargs):
+        dms = np.asarray(dm, dtype=np.float64, order="C")
+        single = dms.ndim == 2
+        dms = dms.reshape(-1, nao, nao)
+        ndm = dms.shape[0]
+        vj = np.zeros((ndm, nao, nao)) if with_j else np.zeros((1, 1, 1))
+        vk = np.zeros((ndm, nao, nao)) if with_k else np.zeros((1, 1, 1))
+        herm = np.full(ndm, int(hermi), dtype=np.int32)
+        dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        rc = fn(dptr(vj), dptr(vk), dptr(np.ascontiguousarray(dms)), ndm, iptr(herm),
+                int(bool(with_j)), int(bool(with_k)), iptr(atm), mol.natm, iptr(bas),
+                mol.nbas, dptr(env), float(omega or 0.0), float(tau))
+        if rc == -1:
+            raise RuntimeError("intti_get_jk: basis must be uncontracted (nctr=nprim=1)")
+        if rc != 0:
+            raise RuntimeError(f"intti_get_jk failed, rc={rc}")
+        if single:
+            return (vj[0] if with_j else None), (vk[0] if with_k else None)
+        return (vj if with_j else None), (vk if with_k else None)
+
+    return get_jk
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 1
+    fn = load(sys.argv[1])
+    basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
+    mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
+
+    ref = scf.RHF(mol)
+    ref.conv_tol = 1e-12
+    e_ref = ref.kernel()
+    assert ref.converged
+
+    # the same driver, with intti supplying every J and K
+    mf = scf.RHF(mol)
+    mf.conv_tol = 1e-12
+    mf.get_jk = make_get_jk(fn, mol)
+    e = mf.kernel()
+    assert mf.converged, "PySCF SCF on intti J/K did not converge"
+
+    print(f"nao          = {mol.nao_nr()}  (uncontracted, cart)")
+    print(f"E(PySCF)     = {e_ref:.15f}")
+    print(f"E(intti J/K) = {e:.15f}")
+    print(f"difference   = {e - e_ref:.3e}")
+
+    # J/K agreement on a NON-symmetric density, which the SCF itself never
+    # exercises but the response machinery depends on
+    rng = np.random.default_rng(0)
+    nao = mol.nao_nr()
+    dm = rng.standard_normal((nao, nao)) * 0.05
+    ours = make_get_jk(fn, mol)(mol, dm, hermi=0)
+    theirs = ref.get_jk(mol, dm, hermi=0)
+    dj = np.abs(ours[0] - theirs[0]).max()
+    dk = np.abs(ours[1] - theirs[1]).max()
+    print(f"general-density J agreement = {dj:.3e}")
+    print(f"general-density K agreement = {dk:.3e}")
+    ok = abs(e - e_ref) < 1e-9 and dj < 1e-9 and dk < 1e-9
+    print("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

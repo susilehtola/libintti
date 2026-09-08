@@ -42,6 +42,21 @@ int intti_int2e_cart(double *out, const int *shls, const int *atm, int natm,
                       const int *bas, int nbas, const double *env, void *opt,
                       double *cache);
 
+/* Matrix-level Coulomb/exchange: the surface an SCF driver should use, mirroring
+ * pyscf.scf.hf.SCF.get_jk(mol, dm, hermi, with_j, with_k, omega). dms/vj/vk are
+ * ndm consecutive nao x nao row-major matrices. hermi is one int per density:
+ * 1 = symmetric, 2 = anti-symmetric, 0 = general. omega = 0 selects plain
+ * Coulomb, otherwise the erf range-separated kernel. tau = 0 disables screening.
+ * Requires an UNCONTRACTED Cartesian basis; returns 0 on success, -1 if any
+ * shell is contracted, -2 on an internal size mismatch.
+ *
+ * Prefer this over intti_int2e_* for anything that builds a Fock matrix: the
+ * per-quartet entries exist for libcint drop-in compatibility, and driving an
+ * SCF through them defeats the batching the library is built around. */
+int intti_get_jk(double *vj, double *vk, const double *dms, int ndm, const int *hermi,
+                 int with_j, int with_k, const int *atm, int natm, const int *bas,
+                 int nbas, const double *env, double omega, double tau);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);
