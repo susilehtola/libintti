@@ -322,4 +322,95 @@ void ri_k_occ2(const RIFit<Real> &fit, const Real *CL, const Real *CR, int nvec,
   }
 }
 
+/// Orbital-driven RI exchange with BOUNDED memory: never forms the nao^2 x naux
+/// fit vectors. For a density factorised as D = C_L C_R^T,
+///   X^P_{mk} = sum_l (ml|P) C_L[l,k],   Y^P_{nk} = sum_s (ns|P) C_R[s,k],
+///   K_mn     = sum_{P,k} [M^{-1} X]^P_{mk} Y^P_{nk},
+/// which is B^P D B^P written with the metric inverse instead of its square
+/// root, so it agrees with ri_k_occ2 to rounding.
+///
+/// TWO independent tilings, and which axis does what is the whole point:
+///   * the AUXILIARY axis tiles the three-centre integrals, exactly as in
+///     ri_j_tiled -- one (mu nu|P-tile) block live at a time;
+///   * the VECTOR axis tiles everything else. The metric solve couples all
+///     auxiliary functions, so P cannot be blocked across it, but K is a plain
+///     sum over k, so vector tiles simply accumulate.
+/// Peak storage is 3 x naux x nao x vec_tile plus one three-centre tile, versus
+/// nao^2 x naux for the fit vectors. Setting both tiles to their full extent
+/// recovers the dense computation exactly -- the dense case is one block.
+///
+/// Cost of the trade, stated: the three-centre integrals are recomputed once per
+/// vector tile, so the integral work scales as ceil(nvec/vec_tile). Choose the
+/// largest vector tile that fits.
+template <class Real>
+void ri_k_occ_tiled(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                    const TGrid<Real> &grid, const Real *CL, const Real *CR, int nvec,
+                    Real *K, int aux_tile_shells = 0, int vec_tile = 0,
+                    Real tau_lin = Real(1e-10)) {
+  static_assert(std::is_same_v<Real, double> || std::is_same_v<Real, float>,
+                "ri_k_occ_tiled requires float or double (LAPACK)");
+  const int nao = orb.nao, naux = aux.nao;
+  const int nsa = static_cast<int>(aux.shells.size());
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  if (vec_tile < 1) vec_tile = nvec;
+  for (std::size_t i = 0; i < N; ++i) K[i] = Real(0);
+  if (nvec == 0) return;
+
+  // metric pseudo-inverse, as in ri_j_tiled
+  auto M = coulomb_2c(aux, grid);
+  std::vector<Real> eval(naux);
+  detail::syevd(naux, M.data(), eval.data()); // M now holds eigenvectors (rows)
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Vs(M.begin(), M.end());
+  for (int k = 0; k < naux; ++k) {
+    const Real sc = (eval[k] <= tau_lin * emax) ? Real(0) : Real(1) / eval[k];
+    for (int P = 0; P < naux; ++P) Vs[k * naux + P] *= sc;
+  }
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  detail::gemm('T', 'N', naux, naux, naux, Real(1), M.data(), naux, Vs.data(), naux, Real(0),
+               Minv.data(), naux);
+
+  std::vector<Real> Tp(N); // one gathered (mu nu|P) slab
+  for (int k0 = 0; k0 < nvec; k0 += vec_tile) {
+    const int k1 = std::min(k0 + vec_tile, nvec);
+    const int kb = k1 - k0;
+    const std::size_t slab = static_cast<std::size_t>(nao) * kb;
+    // X, Y are naux x (nao x kb), P-major so the metric solve is one GEMM
+    std::vector<Real> X(static_cast<std::size_t>(naux) * slab, Real(0));
+    std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0));
+    // slices of the coefficient blocks for this vector tile
+    std::vector<Real> CLb(static_cast<std::size_t>(nao) * kb),
+        CRb(static_cast<std::size_t>(nao) * kb);
+    for (int i = 0; i < nao; ++i)
+      for (int k = 0; k < kb; ++k) {
+        CLb[i * kb + k] = CL[i * nvec + k0 + k];
+        CRb[i * kb + k] = CR[i * nvec + k0 + k];
+      }
+    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+      const int A1 = std::min(A0 + aux_tile_shells, nsa);
+      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1); // N x blk
+      for (int P = 0; P < blk; ++P) {
+        // gather the strided (mu nu|P) slab, then two half transforms
+        for (std::size_t mn = 0; mn < N; ++mn) Tp[mn] = Tblk[mn * blk + P];
+        detail::gemm('N', 'N', nao, kb, nao, Real(1), Tp.data(), nao, CLb.data(), kb, Real(0),
+                     X.data() + static_cast<std::size_t>(p0 + P) * slab, kb);
+        detail::gemm('N', 'N', nao, kb, nao, Real(1), Tp.data(), nao, CRb.data(), kb, Real(0),
+                     Y.data() + static_cast<std::size_t>(p0 + P) * slab, kb);
+      }
+    }
+    // Xhat = M^{-1} X over the auxiliary index: one GEMM for the whole tile
+    std::vector<Real> Xh(X.size(), Real(0));
+    detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), Minv.data(), naux,
+                 X.data(), static_cast<int>(slab), Real(0), Xh.data(),
+                 static_cast<int>(slab));
+    // K += sum_P Xhat_P (nao x kb) . Y_P^T (kb x nao)
+    for (int P = 0; P < naux; ++P)
+      detail::gemm('N', 'T', nao, nao, kb, Real(1), Xh.data() + static_cast<std::size_t>(P) * slab,
+                   kb, Y.data() + static_cast<std::size_t>(P) * slab, kb, Real(1), K, nao);
+  }
+}
+
 } // namespace intti

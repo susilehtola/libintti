@@ -484,4 +484,58 @@ TEST(JK, RiCoulombDerivativeMatricesContractToTheKnownGradient) {
 
 
 
+
+TEST(JK, TiledOrbitalExchangeIsTileIndependentAndBounded) {
+  // ri_k_occ_tiled never forms the nao^2 x naux fit vectors. The two tilings do
+  // different jobs: the AUXILIARY tile bounds the three-centre block, while the
+  // VECTOR tile bounds everything downstream -- the metric solve couples all
+  // auxiliary functions so P cannot be blocked across it, but K is a plain sum
+  // over k, so vector tiles accumulate. Every tiling must give the same K, and
+  // the full-extent tiling must reproduce the dense ri_k_occ2: the dense case is
+  // one block.
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = orb.nao, nvec = 4;
+  const int nsa = static_cast<int>(aux.shells.size());
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec),
+      CR(static_cast<std::size_t>(n) * nvec);
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < nvec; ++k) {
+      CL[i * nvec + k] = 0.3 * std::cos(0.7 * i + k) / (1.0 + i);
+      CR[i * nvec + k] = 0.2 * std::sin(0.4 * i - 2.0 * k) + 0.05 * k;
+    }
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  // dense reference through the existing fit-vector route
+  const auto fit = intti::ri_fit(orb, aux, grid);
+  std::vector<double> Kref(n2);
+  intti::ri_k_occ2(fit, CL.data(), CR.data(), nvec, Kref.data());
+  ASSERT_GT(maxabs(Kref), 1e-4);
+  // every combination of tilings, including the degenerate "one block" case
+  for (int at : {0, 1, 2, nsa})
+    for (int vt : {0, 1, 3, nvec}) {
+      std::vector<double> K(n2);
+      intti::ri_k_occ_tiled(orb, aux, grid, CL.data(), CR.data(), nvec, K.data(), at, vt);
+      EXPECT_LT(maxdiff(K, Kref), 1e-11 * maxabs(Kref))
+          << "aux_tile=" << at << " vec_tile=" << vt;
+    }
+  // and it must handle a non-symmetric density, which is the case it exists for
+  std::vector<double> D(n2, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double sacc = 0;
+      for (int k = 0; k < nvec; ++k) sacc += CL[i * nvec + k] * CR[j * nvec + k];
+      D[i * n + j] = sacc;
+    }
+  double asym = 0;
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) asym = std::max(asym, std::abs(D[i * n + j] - D[j * n + i]));
+  ASSERT_GT(asym, 1e-3) << "test density is symmetric, defeating the point";
+  std::vector<double> Kd(n2);
+  intti::ri_jk(fit, D.data(), static_cast<double *>(nullptr), Kd.data());
+  std::vector<double> Kt(n2);
+  intti::ri_k_occ_tiled(orb, aux, grid, CL.data(), CR.data(), nvec, Kt.data(), 2, 2);
+  EXPECT_LT(maxdiff(Kt, Kd), 1e-11 * maxabs(Kd)) << "tiled orbital vs dense density-driven";
+}
+
 } // namespace
