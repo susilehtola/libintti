@@ -26,16 +26,30 @@ std::vector<Shell> aux_shells() {
           {0.7, {0.1, -0.2, 1.2}, 0}, {1.1, {0.1, -0.2, 1.2}, 1}};
 }
 
-std::vector<double> density(int nao) {
+// The density is built as a sum of outer products, so it is ALREADY factorised:
+// D = C C^T with C nao x 3. The orbital-driven RI-K builders take those factors
+// directly, which is why they can be used here without any decomposition.
+constexpr int kDensityRank = 3;
+
+std::vector<double> density_factors(int nao) {
   std::mt19937 rng(19);
   std::normal_distribution<double> nd;
+  std::vector<double> C(static_cast<std::size_t>(nao) * kDensityRank, 0.0);
+  for (int k = 0; k < kDensityRank; ++k)
+    for (int i = 0; i < nao; ++i) C[i * kDensityRank + k] = nd(rng);
+  return C;
+}
+
+std::vector<double> density(int nao) {
+  const auto C = density_factors(nao);
   std::vector<double> D(static_cast<std::size_t>(nao) * nao, 0.0);
-  for (int k = 0; k < 3; ++k) { // symmetric PSD
-    std::vector<double> v(nao);
-    for (auto &x : v) x = nd(rng);
-    for (int i = 0; i < nao; ++i)
-      for (int j = 0; j < nao; ++j) D[i * nao + j] += v[i] * v[j];
-  }
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      double acc = 0;
+      for (int k = 0; k < kDensityRank; ++k)
+        acc += C[i * kDensityRank + k] * C[j * kDensityRank + k];
+      D[i * nao + j] = acc;
+    }
   return D;
 }
 
@@ -69,7 +83,9 @@ TEST(RIGrad, ExchangeGradientVsFiniteDifference) {
   auto orb = intti::make_basis(os);
   auto D = density(orb.nao);
   auto grid = intti::make_tgrid(intti::coulomb());
-  auto g = intti::ri_k_gradient(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  const auto C = density_factors(orb.nao);
+  auto g = intti::ri_k_gradient_occ(orb, intti::make_basis(as), C.data(), C.data(),
+                                    kDensityRank, grid, 1e-12);
   const double h = 1e-4;
   double worst = 0, scale = 0;
   auto fd = [&](std::vector<Shell> &shells, int s, int e) {
@@ -196,7 +212,9 @@ std::vector<double> ri_k_grad_vec(const std::vector<Shell> &os, const std::vecto
                                   const std::vector<double> &D,
                                   const intti::TGrid<double> &grid) {
   auto orb = intti::make_basis(os);
-  auto g = intti::ri_k_gradient(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  const auto C = density_factors(orb.nao);
+  auto g = intti::ri_k_gradient_occ(orb, intti::make_basis(as), C.data(), C.data(),
+                                    kDensityRank, grid, 1e-12);
   std::vector<double> v;
   for (auto &f : g.forb)
     for (int e = 0; e < 3; ++e) v.push_back(f[e]);
@@ -211,7 +229,9 @@ TEST(RIGrad, ExchangeHessianVsGradientFiniteDifference) {
   auto orb = intti::make_basis(os);
   auto D = density(orb.nao);
   auto grid = intti::make_tgrid(intti::coulomb());
-  auto H = intti::ri_k_hessian(orb, intti::make_basis(as), D.data(), grid, 1e-12);
+  const auto Cf = density_factors(orb.nao);
+  auto H = intti::ri_k_hessian_occ(orb, intti::make_basis(as), Cf.data(), Cf.data(),
+                                   kDensityRank, grid, 1e-12);
   const int nso = static_cast<int>(os.size()), nsa = static_cast<int>(as.size());
   const int ncen = nso + nsa, dim = 3 * ncen;
   const double h = 1e-4;
