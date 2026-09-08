@@ -341,8 +341,18 @@ double ri_energy_and_force(const std::vector<Atom> &at, int nocc,
       osh, sa, at, nocc, scf, grid,
       [&](const intti::ShellBasis<double> &orb, const double *D,
           std::vector<std::array<double, 3>> &acc) {
+        // The SCF density is already factorised, D = 2 C_occ C_occ^T, so the
+        // exchange gradient goes through the memory-bounded orbital-driven
+        // builder rather than the dense one -- which also exercises it inside
+        // the full assembly against PySCF, not just against its dense oracle.
+        std::vector<double> Cf(static_cast<std::size_t>(orb.nao) * nocc);
+        const double rt2 = std::sqrt(2.0);
+        for (int i = 0; i < orb.nao; ++i)
+          for (int k = 0; k < nocc; ++k)
+            Cf[i * nocc + k] = rt2 * scf.C[i * orb.nao + k];
         const auto gj = intti::ri_j_gradient(orb, auxb, D, grid);
-        const auto gk = intti::ri_k_gradient(orb, auxb, D, grid);
+        const auto gk =
+            intti::ri_k_gradient_occ(orb, auxb, Cf.data(), Cf.data(), nocc, grid);
         for (std::size_t i = 0; i < gj.forb.size(); ++i)
           for (int c = 0; c < 3; ++c) acc[sa[i]][c] += gj.forb[i][c] + gk.forb[i][c];
         for (std::size_t i = 0; i < gj.faux.size(); ++i)
@@ -670,8 +680,18 @@ TEST(Scf, RiRhfGradientMatchesPyscfDensityFitting) {
       orbital_shells(), sa, kAtoms, 5, scf, grid,
       [&](const intti::ShellBasis<double> &orb, const double *D,
           std::vector<std::array<double, 3>> &acc) {
+        // The SCF density is already factorised, D = 2 C_occ C_occ^T, so the
+        // exchange gradient goes through the memory-bounded orbital-driven
+        // builder rather than the dense one -- which also exercises it inside
+        // the full assembly against PySCF, not just against its dense oracle.
+        std::vector<double> Cf(static_cast<std::size_t>(orb.nao) * 5);
+        const double rt2 = std::sqrt(2.0);
+        for (int i = 0; i < orb.nao; ++i)
+          for (int k = 0; k < 5; ++k)
+            Cf[i * 5 + k] = rt2 * scf.C[i * orb.nao + k];
         const auto gj = intti::ri_j_gradient(orb, auxb, D, grid);
-        const auto gk = intti::ri_k_gradient(orb, auxb, D, grid);
+        const auto gk =
+            intti::ri_k_gradient_occ(orb, auxb, Cf.data(), Cf.data(), 5, grid);
         for (std::size_t s = 0; s < gj.forb.size(); ++s)
           for (int c = 0; c < 3; ++c) acc[sa[s]][c] += gj.forb[s][c] + gk.forb[s][c];
         for (std::size_t s = 0; s < gj.faux.size(); ++s)
