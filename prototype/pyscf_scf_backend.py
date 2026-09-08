@@ -60,13 +60,62 @@ def load(lib_path):
     ip1.restype = ctypes.c_int
     ip1.argtypes = [d, d, d, d, d, ctypes.c_int, ctypes.c_int, i, ctypes.c_int, i,
                     ctypes.c_int, d, ctypes.c_double]
+    e1 = lib.intti_int1e_ip
+    e1.restype = ctypes.c_int
+    e1.argtypes = [d, ctypes.c_int, ctypes.c_int, i, ctypes.c_int, i, ctypes.c_int, d]
     hs = lib.intti_hess_skeleton
     hs.restype = ctypes.c_int
     hs.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
-    return f, g, hs, ip1
+    return f, g, hs, ip1, e1
 
 
-def make_h1_intti(fn, mol, tau=0.0):
+def make_1e(fn, mol):
+    """int1e_ipovlp / ipkin / ipnuc / iprinv from intti, PySCF's conventions."""
+    nao = mol.nao_nr()
+    atm = np.asarray(mol._atm, dtype=np.int32, order="C")
+    bas = np.asarray(mol._bas, dtype=np.int32, order="C")
+    env = np.asarray(mol._env, dtype=np.float64, order="C")
+
+    def get(which, iatm=-1):
+        o = np.zeros((3, nao, nao))
+        rc = fn(o.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), int(which), int(iatm),
+                atm.ctypes.data_as(ctypes.POINTER(ctypes.c_int)), mol.natm,
+                bas.ctypes.data_as(ctypes.POINTER(ctypes.c_int)), mol.nbas,
+                env.ctypes.data_as(ctypes.POINTER(ctypes.c_double)))
+        if rc != 0:
+            raise RuntimeError(f"intti_int1e_ip failed, rc={rc}")
+        return o
+
+    return get
+
+
+def make_grad_1e_hooks(get, mol):
+    """Gradients.get_ovlp and Gradients.hcore_generator, on intti integrals.
+
+    Mirrors pyscf.grad.rhf exactly: get_ovlp is -int1e_ipovlp, and the hcore
+    derivative for atom ia is the Hellmann-Feynman -Z_ia int1e_iprinv (at that
+    nucleus) plus the atom-sliced rows of -(int1e_ipkin + int1e_ipnuc),
+    symmetrised. intti returns iprinv UNWEIGHTED so the -Z is applied here, as
+    PySCF does.
+    """
+    aoslices = mol.aoslice_by_atom()
+    h1 = -(get(1) + get(2))
+
+    def get_ovlp(mol_=None):
+        return -get(0)
+
+    def hcore_generator(mol_=None):
+        def hcore_deriv(atm_id):
+            shl0, shl1, p0, p1 = aoslices[atm_id]
+            vrinv = get(3, atm_id) * (-mol.atom_charge(atm_id))
+            vrinv[:, p0:p1] += h1[:, p0:p1]
+            return vrinv + vrinv.transpose(0, 2, 1)
+        return hcore_deriv
+
+    return get_ovlp, hcore_generator
+
+
+def make_h1_intti(fn, mol, hcore_gen=None, tau=0.0):
     """Drop-in for pyscf.hessian.rhf.make_h1: the CPHF right-hand side.
 
     Replaces the last use of PySCF's own two-electron integrals in the Hessian
@@ -86,7 +135,8 @@ def make_h1_intti(fn, mol, tau=0.0):
             atmlst = range(mol_.natm)
         mocc = mo_coeff[:, mo_occ > 0]
         dm0 = np.dot(mocc, mocc.T) * 2
-        hcore_deriv = hessobj.base.nuc_grad_method().hcore_generator(mol_)
+        hcore_deriv = (hcore_gen(mol_) if hcore_gen is not None
+                       else hessobj.base.nuc_grad_method().hcore_generator(mol_))
         aoslices = mol_.aoslice_by_atom()
         dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
         iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
@@ -211,7 +261,7 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
-    fn, fn_ip1, fn_hess, fn_h1 = load(sys.argv[1])
+    fn, fn_ip1, fn_hess, fn_h1, fn_1e = load(sys.argv[1])
     basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
     mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
 
@@ -274,6 +324,8 @@ def main():
     g_ref = ref.nuc_grad_method().kernel()
     gobj = ref.nuc_grad_method()
     gobj.get_jk = make_grad_get_jk(fn_ip1, mol)
+    _get1e = make_1e(fn_1e, mol)
+    gobj.get_ovlp, gobj.hcore_generator = make_grad_1e_hooks(_get1e, mol)
     g_ours = gobj.kernel()
     dg = np.abs(np.asarray(g_ours) - np.asarray(g_ref)).max()
     print("gradient (Ha/bohr), PySCF assembly on intti derivative J/K:")
@@ -299,7 +351,9 @@ def main():
     mf2.kernel()
     h2 = mf2.Hessian()
     h2.partial_hess_elec = make_partial_hess(fn_hess, mol).__get__(h2, type(h2))
-    h2.make_h1 = make_h1_intti(fn_h1, mol).__get__(h2, type(h2))
+    _g1e = make_1e(fn_1e, mol)
+    _, _hgen = make_grad_1e_hooks(_g1e, mol)
+    h2.make_h1 = make_h1_intti(fn_h1, mol, hcore_gen=_hgen).__get__(h2, type(h2))
     H_ours = h2.kernel()
     dH = np.abs(np.asarray(H_ours) - np.asarray(H_ref)).max()
     print(f"full Hessian agreement = {dH:.3e}  (|H| = {np.abs(H_ref).max():.3e})")

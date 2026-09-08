@@ -79,6 +79,13 @@ int intti_ip1_h1_jk(double *vj1, double *vj2, double *vk1, double *vk2, const do
                     int shl0, int shl1, const int *atm, int natm, const int *bas,
                     int nbas, const double *env, double tau);
 
+/* One-electron derivative matrices in PySCF's gradient conventions, 3 x nao x
+ * nao. which: 0 = int1e_ipovlp, 1 = int1e_ipkin, 2 = int1e_ipnuc (all nuclei,
+ * weighted -Z), 3 = int1e_iprinv for nucleus `iatm` UNWEIGHTED. Same
+ * restrictions as intti_get_jk. */
+int intti_int1e_ip(double *out, int which, int iatm, const int *atm, int natm,
+                   const int *bas, int nbas, const double *env);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);

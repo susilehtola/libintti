@@ -44,10 +44,12 @@
 #include "intti/erihess.hpp"
 #include "intti/geohess.hpp"
 #include "intti/kernel.hpp"
+#include "intti/deriv.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/erihess.hpp"
 #include "intti/geohess.hpp"
 #include "intti/kernel.hpp"
+#include "intti/deriv.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/math.hpp"
 #include "intti/normalization.hpp"
@@ -550,5 +552,62 @@ extern "C" int intti_ip1_h1_jk(double *vj1, double *vj2, double *vk1, double *vk
           outs[w][o] = (*srcs[w])[o] * scale[i] * scale[j];
         }
   }
+  return 0;
+}
+
+// One-electron derivative matrices in PySCF's gradient conventions, all
+// 3 x nao x nao. `which` selects:
+//   0 = int1e_ipovlp   <nabla mu|nu>
+//   1 = int1e_ipkin    <nabla mu|T|nu>
+//   2 = int1e_ipnuc    <nabla mu| sum_A -Z_A/r_A |nu>   (all nuclei)
+//   3 = int1e_iprinv   <nabla mu| 1/r_C |nu> for the single nucleus `iatm`,
+//                      UNWEIGHTED (the caller applies -Z, as PySCF does)
+// Same restrictions as intti_get_jk.
+extern "C" int intti_int1e_ip(double *out, int which, int iatm, const int *atm, int natm,
+                              const int *bas, int nbas, const double *env) {
+  ensure_kokkos();
+  std::vector<intti::PrimitiveShell<double>> shells;
+  std::vector<double> scale;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const ShellInfo s = decode_shell(ish, atm, bas, env);
+    if (s.nctr != 1 || s.nprim != 1) return -1;
+    shells.push_back(intti::PrimitiveShell<double>{
+        s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+    const double c = s.coeff[0] * coeff_rescale(s.l);
+    for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+  }
+  auto basis = intti::make_basis(shells);
+  const int nao = basis.nao;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (static_cast<int>(scale.size()) != nao) return -2;
+  std::array<std::vector<double>, 3> G;
+  if (which == 0) {
+    G = intti::overlap_deriv(basis);
+  } else if (which == 1) {
+    G = intti::kinetic_deriv(basis);
+  } else {
+    std::vector<intti::PointCharge<double>> ch;
+    if (which == 2) {
+      for (int a = 0; a < natm; ++a) {
+        const int *ai = atm + static_cast<std::size_t>(a) * 6;
+        const double *c = env + ai[PTR_COORD];
+        ch.push_back({-static_cast<double>(ai[CHARGE_OF]), {c[0], c[1], c[2]}});
+      }
+    } else if (which == 3) {
+      if (iatm < 0 || iatm >= natm) return -4;
+      const int *ai = atm + static_cast<std::size_t>(iatm) * 6;
+      const double *c = env + ai[PTR_COORD];
+      ch.push_back({1.0, {c[0], c[1], c[2]}}); // unweighted: caller applies -Z
+    } else {
+      return -5;
+    }
+    G = intti::nuclear_deriv(basis, ch, default_grid());
+  }
+  for (int x = 0; x < 3; ++x)
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j) {
+        const std::size_t o = static_cast<std::size_t>(i) * nao + j;
+        out[static_cast<std::size_t>(x) * N + o] = G[x][o] * scale[i] * scale[j];
+      }
   return 0;
 }
