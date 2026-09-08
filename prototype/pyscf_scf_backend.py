@@ -28,6 +28,7 @@ import sys
 import numpy as np
 from pyscf import gto, scf
 from pyscf.grad import rhf as grad_rhf
+from pyscf.hessian import rhf as hess_rhf
 
 # same molecule and uncontracted basis as tests/test_scf.cpp
 ATOM = [
@@ -55,7 +56,54 @@ def load(lib_path):
     g = lib.intti_get_jk_ip1
     g.restype = ctypes.c_int
     g.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
-    return f, g
+    hs = lib.intti_hess_skeleton
+    hs.restype = ctypes.c_int
+    hs.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
+    return f, g, hs
+
+
+def make_partial_hess(fn, mol, tau=0.0):
+    """Drop-in for pyscf.hessian.rhf.partial_hess_elec.
+
+    intti returns the skeleton contracted per SHELL centre; folding onto atoms
+    is the caller's job (it owns the shell-to-atom map), exactly as for the
+    gradient. The CPHF response terms and hess_nuc are PySCF's and are added by
+    hess_elec on top of what this returns.
+    """
+    nao = mol.nao_nr()
+    nbas = mol.nbas
+    atm = np.asarray(mol._atm, dtype=np.int32, order="C")
+    bas = np.asarray(mol._bas, dtype=np.int32, order="C")
+    env = np.asarray(mol._env, dtype=np.float64, order="C")
+    sh_atom = np.asarray(mol._bas[:, 0], dtype=int)
+
+    def partial_hess_elec(hessobj, mo_energy=None, mo_coeff=None, mo_occ=None,
+                          atmlst=None, max_memory=4000, verbose=None):
+        mf = hessobj.base
+        if mo_coeff is None: mo_coeff = mf.mo_coeff
+        if mo_occ is None: mo_occ = mf.mo_occ
+        if mo_energy is None: mo_energy = mf.mo_energy
+        mocc = mo_coeff[:, mo_occ > 0]
+        dm0 = np.dot(mocc, mocc.T) * 2
+        # energy-weighted density W = 2 sum_i eps_i C_i C_i^T
+        dme0 = np.einsum("pi,qi,i->pq", mocc, mocc, mo_energy[mo_occ > 0]) * 2
+        hs = np.zeros((3 * nbas, 3 * nbas))
+        dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        rc = fn(dptr(hs), dptr(np.ascontiguousarray(dm0)),
+                dptr(np.ascontiguousarray(dme0)), iptr(atm), mol.natm, iptr(bas), nbas,
+                dptr(env), float(tau))
+        if rc != 0:
+            raise RuntimeError(f"intti_hess_skeleton failed, rc={rc}")
+        # fold shell centres onto atoms
+        natm = mol.natm
+        out = np.zeros((natm, natm, 3, 3))
+        for p in range(nbas):
+            for q in range(nbas):
+                out[sh_atom[p], sh_atom[q]] += hs[3 * p:3 * p + 3, 3 * q:3 * q + 3]
+        return out
+
+    return partial_hess_elec
 
 
 def make_grad_get_jk(fn, mol, tau=0.0):
@@ -115,7 +163,7 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
-    fn, fn_ip1 = load(sys.argv[1])
+    fn, fn_ip1, fn_hess = load(sys.argv[1])
     basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
     mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
 
@@ -186,6 +234,36 @@ def main():
     print(f"gradient agreement = {dg:.3e}  (|g| = {np.abs(g_ref).max():.3e})")
     ok = (ok and dgj < 1e-9 and dgk < 1e-9 and np.abs(rj).max() > 1e-3
           and dg < 1e-9 and np.abs(g_ref).max() > 1e-3)
+    # skeleton Hessian: what partial_hess_elec computes, before the CPHF response
+    hobj = ref.Hessian()
+    h_ref = hess_rhf.partial_hess_elec(hobj)
+    h_ours = make_partial_hess(fn_hess, mol)(hobj)
+    dh = np.abs(np.asarray(h_ours) - np.asarray(h_ref)).max()
+    print(f"skeleton Hessian agreement = {dh:.3e}  (|H| = {np.abs(h_ref).max():.3e})")
+    # full Hessian and harmonic frequencies. The skeleton and the CPHF RESPONSE
+    # (hessian.rhf.gen_vind routes through get_jk) are both on intti integrals;
+    # the CPHF right-hand side, make_h1, still uses PySCF's int2e_ip1 -- stated
+    # rather than glossed.
+    H_ref = ref.Hessian().kernel()
+    mf2 = scf.RHF(mol)
+    mf2.conv_tol = 1e-12
+    mf2.get_jk = make_get_jk(fn, mol)
+    mf2.kernel()
+    h2 = mf2.Hessian()
+    h2.partial_hess_elec = make_partial_hess(fn_hess, mol).__get__(h2, type(h2))
+    H_ours = h2.kernel()
+    dH = np.abs(np.asarray(H_ours) - np.asarray(H_ref)).max()
+    print(f"full Hessian agreement = {dH:.3e}  (|H| = {np.abs(H_ref).max():.3e})")
+
+    from pyscf.hessian import thermo
+    f_ref = thermo.harmonic_analysis(mol, H_ref)["freq_wavenumber"]
+    f_our = thermo.harmonic_analysis(mol, np.asarray(H_ours))["freq_wavenumber"]
+    print("harmonic frequencies (cm^-1):")
+    for a, b in zip(np.atleast_1d(f_ref), np.atleast_1d(f_our)):
+        print(f"    PySCF {a:12.4f}    intti {b:12.4f}    diff {b - a:+.2e}")
+    df = np.abs(np.atleast_1d(f_our) - np.atleast_1d(f_ref)).max()
+    ok = (ok and dh < 1e-8 and np.abs(h_ref).max() > 1e-2
+          and dH < 1e-7 and df < 1e-4)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

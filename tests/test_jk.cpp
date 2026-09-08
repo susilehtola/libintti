@@ -538,4 +538,31 @@ TEST(JK, TiledOrbitalExchangeIsTileIndependentAndBounded) {
   EXPECT_LT(maxdiff(Kt, Kd), 1e-11 * maxabs(Kd)) << "tiled orbital vs dense density-driven";
 }
 
+
+TEST(JK, RiCoulombDerivativeIsAuxiliaryTileIndependent) {
+  // ri_j_deriv_build no longer materialises the nao^2 x naux three-centre
+  // tensor; it consumes it in two auxiliary-tiled passes. The second pass had to
+  // be hoisted so the tile loop sits OUTSIDE the perturbation loop -- tiling
+  // inside it would have rebuilt the whole tensor nreq x npert times, trading a
+  // memory problem for a worse time one. Every tiling must give the same answer,
+  // and the full-extent tiling is the dense computation.
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = orb.nao;
+  const int nsa = static_cast<int>(aux.shells.size());
+  const auto D = general_density(n);
+  const std::vector<intti::JKRequest<double>> reqs = {
+      {D.data(), intti::DensitySymmetry::General, intti::FockTerms::Coulomb}};
+  const auto ref = intti::ri_j_deriv_build(orb, aux, reqs, grid, 1e-10, nsa);
+  double scale = 0;
+  for (double v : ref.J[0]) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 1e-3);
+  for (int at : {1, 2, 3, nsa, 0}) {
+    const auto got = intti::ri_j_deriv_build(orb, aux, reqs, grid, 1e-10, at);
+    ASSERT_EQ(got.J[0].size(), ref.J[0].size());
+    EXPECT_LT(maxdiff(got.J[0], ref.J[0]), 1e-11 * scale) << "aux_tile=" << at;
+  }
+}
+
 } // namespace

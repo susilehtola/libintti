@@ -64,6 +64,14 @@ int intti_get_jk(double *vj, double *vk, const double *dms, int ndm, const int *
 int intti_get_jk_ip1(double *vj, double *vk, const double *dm, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, double tau);
 
+/* Skeleton (fixed-density) electronic Hessian -- what
+ * pyscf.hessian.rhf.partial_hess_elec computes: sum D d2h + d2E_2e - sum W d2S,
+ * as (3 nbas) x (3 nbas) row-major indexed by SHELL centre (caller folds onto
+ * atoms). Excludes the CPHF response terms and the nuclear repulsion Hessian,
+ * both of which are the caller's. Same restrictions as intti_get_jk. */
+int intti_hess_skeleton(double *hess, const double *dm, const double *W, const int *atm,
+                        int natm, const int *bas, int nbas, const double *env, double tau);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);

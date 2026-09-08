@@ -41,8 +41,14 @@
 #include "intti/c2s.hpp"
 #include "intti/gto.hpp"
 #include "intti/jk.hpp"
+#include "intti/erihess.hpp"
+#include "intti/geohess.hpp"
 #include "intti/kernel.hpp"
+#include "intti/nuclear.hpp"
+#include "intti/erihess.hpp"
+#include "intti/geohess.hpp"
 #include "intti/kernel.hpp"
+#include "intti/nuclear.hpp"
 #include "intti/math.hpp"
 #include "intti/normalization.hpp"
 #include "intti/tgrid.hpp"
@@ -52,7 +58,7 @@ namespace {
 // libcint bas[] column indices (bas[ish*8 + slot]).
 enum BasSlot { ATOM_OF = 0, ANG_OF = 1, NPRIM_OF = 2, NCTR_OF = 3, PTR_EXP = 5, PTR_COEFF = 6 };
 // libcint atm[] column index of the coordinate offset into env.
-enum AtmSlot { PTR_COORD = 1 };
+enum AtmSlot { CHARGE_OF = 0, PTR_COORD = 1 };
 
 struct ShellInfo {
   int l{0}, nprim{0}, nctr{0};
@@ -431,5 +437,74 @@ extern "C" int intti_get_jk_ip1(double *vj, double *vk, const double *dm, const 
         if (vj) vj[o] = res.J[0][o] * scale[i] * scale[j];
         if (vk) vk[o] = res.K[0][o] * scale[i] * scale[j];
       }
+  return 0;
+}
+
+// Skeleton (fixed-density) electronic Hessian: the quantity
+// pyscf.hessian.rhf.partial_hess_elec computes, namely
+//   sum_mn D_mn d2h_mn + d2E_2e - sum_mn W_mn d2S_mn
+// contracted with the density D and the energy-weighted density W. Returned as
+// (3 nbas) x (3 nbas), row-major, indexed by SHELL centre; the caller folds
+// shells onto atoms with bas[:,ATOM_OF], as it already does for the gradient.
+//
+// This is a contracted INTEGRAL quantity, not SCF machinery: the response terms
+// that need CPHF are PySCF's business and are added by hess_elec on top. The
+// nuclear repulsion Hessian is likewise PySCF's (hess_nuc) and is NOT included.
+//
+// Same restrictions as intti_get_jk: uncontracted Cartesian basis.
+extern "C" int intti_hess_skeleton(double *hess, const double *dm, const double *W,
+                                   const int *atm, int natm, const int *bas, int nbas,
+                                   const double *env, double tau) {
+  ensure_kokkos();
+  std::vector<intti::PrimitiveShell<double>> shells;
+  std::vector<double> scale;
+  std::vector<int> shell_atom;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const ShellInfo s = decode_shell(ish, atm, bas, env);
+    if (s.nctr != 1 || s.nprim != 1) return -1;
+    shells.push_back(intti::PrimitiveShell<double>{
+        s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+    shell_atom.push_back(bas[static_cast<std::size_t>(ish) * 8 + ATOM_OF]);
+    const double c = s.coeff[0] * coeff_rescale(s.l);
+    for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+  }
+  auto basis = intti::make_basis(shells);
+  const int nao = basis.nao, ns = nbas, dim = 3 * ns;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (static_cast<int>(scale.size()) != nao) return -2;
+
+  // scale the incoming matrices into intti's AO convention
+  std::vector<double> Ds(N), Ws(N);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) {
+      const std::size_t o = static_cast<std::size_t>(i) * nao + j;
+      Ds[o] = dm[o] * scale[i] * scale[j];
+      Ws[o] = W[o] * scale[i] * scale[j];
+    }
+  // nuclei, and for each the shell whose centre carries it (differentiating
+  // that shell moves the nucleus, which is what nuclear_attraction_hessian
+  // needs to attribute the Hellmann-Feynman second derivative correctly)
+  std::vector<intti::PointCharge<double>> charges;
+  std::vector<int> charge_shell;
+  for (int a = 0; a < natm; ++a) {
+    const int *ai = atm + static_cast<std::size_t>(a) * 6;
+    const double *c = env + ai[PTR_COORD];
+    const double Z = static_cast<double>(ai[CHARGE_OF]);
+    if (Z == 0.0) continue;
+    int home = -1;
+    for (int ish = 0; ish < nbas && home < 0; ++ish)
+      if (shell_atom[ish] == a) home = ish;
+    if (home < 0) return -3; // a charge with no basis shell on it
+    charges.push_back(intti::PointCharge<double>{-Z, {c[0], c[1], c[2]}});
+    charge_shell.push_back(home);
+  }
+  const auto &grid = default_grid();
+  const auto Hs = intti::overlap_hessian(basis, Ws.data());
+  const auto Hk = intti::kinetic_hessian(basis, Ds.data());
+  const auto Hv = intti::nuclear_attraction_hessian(basis, charges, grid, charge_shell,
+                                                    Ds.data());
+  const auto H2 = intti::two_electron_hessian(basis, Ds.data(), grid, tau);
+  for (std::size_t i = 0; i < static_cast<std::size_t>(dim) * dim; ++i)
+    hess[i] = Hk[i] + Hv[i] - Hs[i] + H2[i];
   return 0;
 }

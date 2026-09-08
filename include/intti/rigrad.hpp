@@ -1287,7 +1287,8 @@ template <class Real>
 JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                                      const std::vector<JKRequest<Real>> &reqs,
                                      const TGrid<Real> &grid,
-                                     Real tau_lin = Real(1e-10)) {
+                                     Real tau_lin = Real(1e-10),
+                                     int aux_tile_shells = 0) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
@@ -1295,8 +1296,14 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
   const int nreq = static_cast<int>(reqs.size());
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
 
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
   auto M = coulomb_2c(aux, grid);
-  auto T = coulomb_3c(orb, aux, grid); // N x naux
+  // The three-centre tensor is NEVER materialised: it is nao^2 x naux, the same
+  // shape the reverted exchange-derivative intermediate was rejected for. It is
+  // consumed in two auxiliary-tiled passes instead (the ri_j_tiled idiom), and
+  // the second pass is hoisted so the tile loop is OUTSIDE the perturbation
+  // loop -- tiling naively inside it would recompute the whole tensor
+  // nreq x npert times.
   // metric pseudo-inverse, shared by gamma and every gamma_x
   std::vector<Real> V = M, eval(naux);
   detail::syevd(naux, V.data(), eval.data());
@@ -1313,12 +1320,19 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
     }
     return x;
   };
+  // pass 1: d_r,P = sum_mn (mn|P) D_r,mn, one auxiliary tile at a time
   std::vector<std::vector<Real>> gamma(nreq);
-  for (int r = 0; r < nreq; ++r) {
-    std::vector<Real> d(naux, Real(0));
-    detail::gemm('T', 'N', naux, 1, static_cast<int>(N), Real(1), T.data(), naux, reqs[r].D,
-                 1, Real(0), d.data(), 1);
-    gamma[r] = solve(d);
+  {
+    std::vector<std::vector<Real>> d(nreq, std::vector<Real>(naux, Real(0)));
+    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+      const int A1 = std::min(A0 + aux_tile_shells, nsa);
+      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+      for (int r = 0; r < nreq; ++r)
+        detail::gemm('T', 'N', blk, 1, static_cast<int>(N), Real(1), Tblk.data(), blk,
+                     reqs[r].D, 1, Real(0), d[r].data() + p0, 1);
+    }
+    for (int r = 0; r < nreq; ++r) gamma[r] = solve(d[r]);
   }
 
   // ---- derivative three-centre pass -------------------------------------
@@ -1576,22 +1590,38 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
   res.nao = nao;
   res.J.resize(nreq);
   res.K.resize(nreq);
+  // gamma_x for every (request, perturbation) first: each is only naux long, so
+  // all of them together are nreq x npert x naux -- negligible beside the output
+  std::vector<Real> gx(static_cast<std::size_t>(nreq) * npert * naux, Real(0));
   for (int r = 0; r < nreq; ++r) {
     res.J[r].assign(static_cast<std::size_t>(npert) * N, Real(0));
     for (int x = 0; x < npert; ++x) {
       std::vector<Real> rhs(naux);
-      for (int P = 0; P < naux; ++P)
-        rhs[P] = dxv[(static_cast<std::size_t>(r) * npert + x) * naux + P] -
-                 Mxg[(static_cast<std::size_t>(r) * npert + x) * naux + P];
-      const auto gx = solve(rhs);
-      std::vector<Real> add(N, Real(0));
-      detail::gemm('N', 'N', static_cast<int>(N), 1, naux, Real(1), T.data(), naux, gx.data(),
-                   1, Real(0), add.data(), 1);
-      const std::size_t o = static_cast<std::size_t>(x) * N;
-      const std::size_t ao = (static_cast<std::size_t>(r) * npert + x) * N;
-      for (std::size_t i = 0; i < N; ++i) res.J[r][o + i] = A[ao + i] + add[i];
+      const std::size_t b = (static_cast<std::size_t>(r) * npert + x) * naux;
+      for (int P = 0; P < naux; ++P) rhs[P] = dxv[b + P] - Mxg[b + P];
+      const auto g = solve(rhs);
+      for (int P = 0; P < naux; ++P) gx[b + P] = g[P];
     }
   }
+  // pass 2: J^x += T gamma_x, tile loop outermost so the three-centre tensor is
+  // built once per tile for ALL requests and perturbations
+  for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa);
+    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+    for (int r = 0; r < nreq; ++r)
+      for (int x = 0; x < npert; ++x)
+        detail::gemm('N', 'N', static_cast<int>(N), 1, blk, Real(1), Tblk.data(), blk,
+                     gx.data() + (static_cast<std::size_t>(r) * npert + x) * naux + p0, 1,
+                     Real(1), res.J[r].data() + static_cast<std::size_t>(x) * N, 1);
+  }
+  // add the perturbation-independent term
+  for (int r = 0; r < nreq; ++r)
+    for (int x = 0; x < npert; ++x) {
+      const std::size_t o = static_cast<std::size_t>(x) * N;
+      const std::size_t ao = (static_cast<std::size_t>(r) * npert + x) * N;
+      for (std::size_t i = 0; i < N; ++i) res.J[r][o + i] += A[ao + i];
+    }
   return res;
 }
 
