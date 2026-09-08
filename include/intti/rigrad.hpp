@@ -1846,4 +1846,227 @@ RIGrad<Real> ri_k_gradient_occ(const ShellBasis<Real> &orb, const ShellBasis<Rea
   return g;
 }
 
+/// RI exchange HESSIAN for a factorised density, D = C_L C_R^T. Same quantity as
+/// ri_k_hessian, without any nao^2 x naux -- let alone dim x nao^2 x naux --
+/// storage.
+///
+/// ri_k_hessian holds R, S and Rp, each dim x nao^2 x naux. At nao = 1000,
+/// naux = 4000 and ~520 shells that is 150 TB against a 20 MB output. TWO
+/// changes are needed and neither suffices alone:
+///
+///  1. FACTORISE. The response inherits the density's factorisation on its first
+///     orbital index, R_x[a,b,Q] = sum_i C_L[a,i] r_x^Q[b,i], and the final
+///     contraction then collapses BOTH orbital indices onto vector indices:
+///       Hess[x][y] = -1/2 sum_{Q,R,i,j} P_x^Q[i,j] M^{-1}_QR P_y^R[j,i],
+///       P_x^Q[i,j] = sum_a r_x^Q[a,i] C_L[a,j].
+///     nao^2 -> nvec^2. Note the second factor is P with its vector indices
+///     TRANSPOSED, so only one object is needed, not two.
+///
+///  2. BLOCK over the VECTOR index. M^{-1} couples only the auxiliary index, so
+///     i is free; the sum over i then accumulates over blocks. Blocking over
+///     PERTURBATIONS instead would also bound the memory but needs O((dim/b)^2)
+///     passes, trading the memory problem for a worse time one -- the same trap
+///     that had to be avoided in ri_j_deriv_build.
+///
+/// P is never built for all i at once and r is never built at all (it would be
+/// dim x naux x nao x nvec, 4.8 TB). Working set is
+/// 2 x dim x naux x vec_block x nvec: ~10 GB at vec_block = 1, ~50 GB at 5.
+template <class Real>
+std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                                   const Real *CL, const Real *CR, int nvec,
+                                   const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
+                                   int aux_tile_shells = 0, int vec_block = 0) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  const int ncen = nso + nsa, dim = 3 * ncen;
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  if (vec_block < 1) vec_block = nvec;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
+  const std::size_t vv = static_cast<std::size_t>(nvec) * nvec;
+  auto cshell = [&](bool isaux, int i) { return isaux ? nso + i : i; };
+  const auto ghost = [&](const PrimitiveShell<Real> &sx) { return detail::ghost_shell(sx); };
+
+  auto M = coulomb_2c(aux, grid);
+  std::vector<Real> V = M, eval(naux);
+  detail::syevd(naux, V.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int k = 0; k < naux; ++k) {
+    if (eval[k] <= tau_lin * emax) continue;
+    const Real sc = Real(1) / eval[k];
+    for (int R = 0; R < naux; ++R)
+      for (int Q = 0; Q < naux; ++Q)
+        Minv[R * naux + Q] += sc * V[k * naux + R] * V[k * naux + Q];
+  }
+  // Y, Yhat, Z, W, c2 exactly as in ri_k_gradient_occ
+  std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0));
+  {
+    std::vector<Real> Tq(N);
+    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+      const int A1 = std::min(A0 + aux_tile_shells, nsa);
+      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+      for (int Q = 0; Q < blk; ++Q) {
+        for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = Tblk[mn * blk + Q];
+        detail::gemm('T', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
+                     Y.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
+      }
+    }
+  }
+  std::vector<Real> Yh(Y.size(), Real(0));
+  detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), Minv.data(), naux,
+               Y.data(), static_cast<int>(slab), Real(0), Yh.data(), static_cast<int>(slab));
+  std::vector<Real> Z(static_cast<std::size_t>(naux) * vv, Real(0));
+  std::vector<Real> W(static_cast<std::size_t>(naux) * vv, Real(0));
+  std::vector<Real> Vm(static_cast<std::size_t>(naux) * vv, Real(0)); // V^R[i,j]
+  for (int R = 0; R < naux; ++R) {
+    detail::gemm('T', 'N', nvec, nvec, nao, Real(-0.5), CR, nvec,
+                 Yh.data() + static_cast<std::size_t>(R) * slab, nvec, Real(0),
+                 Z.data() + static_cast<std::size_t>(R) * vv, nvec);
+    detail::gemm('T', 'N', nvec, nvec, nao, Real(1), CL, nvec,
+                 Yh.data() + static_cast<std::size_t>(R) * slab, nvec, Real(0),
+                 W.data() + static_cast<std::size_t>(R) * vv, nvec);
+    // V^R[i,j] = sum_a Yhat^R[a,i] C_L[a,j]
+    detail::gemm('T', 'N', nvec, nvec, nao, Real(1),
+                 Yh.data() + static_cast<std::size_t>(R) * slab, nvec, CL, nvec, Real(0),
+                 Vm.data() + static_cast<std::size_t>(R) * vv, nvec);
+  }
+  std::vector<Real> Wp(W.size(), Real(0));
+  for (int T = 0; T < naux; ++T)
+    for (int i2 = 0; i2 < nvec; ++i2)
+      for (int j2 = 0; j2 < nvec; ++j2)
+        Wp[static_cast<std::size_t>(T) * vv + i2 * nvec + j2] =
+            W[static_cast<std::size_t>(T) * vv + j2 * nvec + i2];
+  std::vector<Real> c2(static_cast<std::size_t>(naux) * naux, Real(0));
+  detail::gemm('N', 'T', naux, naux, static_cast<int>(vv), Real(0.25), W.data(),
+               static_cast<int>(vv), Wp.data(), static_cast<int>(vv), Real(0), c2.data(),
+               naux);
+
+  std::vector<Real> Hess(static_cast<std::size_t>(dim) * dim, Real(0));
+  // ---- skeleton terms, factorised c3 (Mode 4) and c2 (Mode 3) -------------
+  if constexpr (kokkos_scalar_v<Real>) {
+    detail::RIHessJobs<Real> jA, jB;
+    const std::vector<int> posA{0, 1, 2}, posB{0, 2};
+    jA.build_patterns(posA);
+    for (int l = 0; l < nso; ++l)
+      for (int n = 0; n < nso; ++n)
+        for (int a = 0; a < nsa; ++a) {
+          const PrimitiveShell<Real> sh[4] = {orb.shells[l], orb.shells[n], aux.shells[a],
+                                              ghost(aux.shells[a])};
+          const int tg[3] = {cshell(false, l), cshell(false, n), cshell(true, a)};
+          jA.add(sh, tg, orb.ao_off[l], orb.ao_off[n], aux.ao_off[a]);
+        }
+    jB.build_patterns(posB);
+    for (int a = 0; a < nsa; ++a)
+      for (int b = 0; b < nsa; ++b) {
+        const PrimitiveShell<Real> sh[4] = {aux.shells[a], ghost(aux.shells[a]),
+                                            aux.shells[b], ghost(aux.shells[b])};
+        const int tg[3] = {cshell(true, a), cshell(true, b), 0};
+        jB.add(sh, tg, aux.ao_off[a], 0, aux.ao_off[b]);
+      }
+    auto clv = detail::to_device(CL, static_cast<std::size_t>(nao) * nvec, "rikh::cl");
+    auto zv = detail::to_device(Z, "rikh::z");
+    auto c2d = detail::to_device(c2, "rikh::c2");
+    Kokkos::View<const Real *> none;
+    Kokkos::View<Real *> Hd("rikh::H", static_cast<std::size_t>(dim) * dim);
+    detail::ri_hess_digest<Real, 4>(jA, posA, grid, none, nao, none, none, none, naux, dim,
+                                    Hd, clv, zv, nvec);
+    detail::ri_hess_digest<Real, 3>(jB, posB, grid, none, nao, none, none, c2d, naux, dim,
+                                    Hd);
+    auto hh = detail::to_host(Hd);
+    for (std::size_t i = 0; i < Hess.size(); ++i) Hess[i] += hh[i];
+  }
+
+  // ---- response term, blocked over the vector index -----------------------
+  for (int i0 = 0; i0 < nvec; i0 += vec_block) {
+    const int i1 = std::min(i0 + vec_block, nvec);
+    const int ib = i1 - i0;
+    // Pa[x][Q][ii][j] : first vector index in the block
+    // Pb[y][R][ii][j] = P[y][R][j][i0+ii] : SECOND vector index in the block,
+    // stored with the block index outermost so the metric solve is one GEMM
+    const std::size_t pstride = static_cast<std::size_t>(naux) * ib * nvec;
+    std::vector<Real> Pa(static_cast<std::size_t>(dim) * pstride, Real(0));
+    std::vector<Real> Pb(static_cast<std::size_t>(dim) * pstride, Real(0));
+    auto Pidx = [&](int x, int Q, int ii, int j) {
+      return static_cast<std::size_t>(x) * pstride +
+             (static_cast<std::size_t>(Q) * ib + ii) * nvec + j;
+    };
+    // three-centre: P_x^Q[i,j] += C_R[l,i] C_L[a,j] d(l a|Q)/dx
+    for (int l = 0; l < nso; ++l)
+      for (int n = 0; n < nso; ++n)
+        for (int c = 0; c < nsa; ++c) {
+          const auto &sl = orb.shells[l], &sn = orb.shells[n], &sc = aux.shells[c];
+          const auto gh = ghost(sc);
+          const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
+          const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
+          const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
+          for (int pos = 0; pos < 3; ++pos)
+            for (int dir = 0; dir < 3; ++dir) {
+              auto blk = detail::quartet_pos_deriv_block(sl, sn, sc, gh, pos, dir, grid);
+              const int xi = 3 * cs[pos] + dir;
+              for (int kl = 0; kl < nl; ++kl)
+                for (int kn = 0; kn < nn; ++kn)
+                  for (int kQ = 0; kQ < nP; ++kQ) {
+                    const Real dv = blk[(static_cast<std::size_t>(kl) * nn + kn) * nP + kQ];
+                    if (dv == Real(0)) continue;
+                    const int lam = ol + kl, aa = on + kn, QQ = oc + kQ;
+                    for (int ii = 0; ii < ib; ++ii) {
+                      const Real cri = CR[static_cast<std::size_t>(lam) * nvec + i0 + ii];
+                      const Real clj = CL[static_cast<std::size_t>(aa) * nvec + i0 + ii];
+                      for (int j = 0; j < nvec; ++j) {
+                        // Pa: block index is i (from C_R), free index j (from C_L)
+                        Pa[Pidx(xi, QQ, ii, j)] +=
+                            dv * cri * CL[static_cast<std::size_t>(aa) * nvec + j];
+                        // Pb: block index is j (from C_L), free index i (from C_R)
+                        Pb[Pidx(xi, QQ, ii, j)] +=
+                            dv * clj * CR[static_cast<std::size_t>(lam) * nvec + j];
+                      }
+                    }
+                  }
+            }
+        }
+    // two-centre: P_x^Q[i,j] -= dM_QR/dx V^R[i,j]
+    for (int c = 0; c < nsa; ++c)
+      for (int ee = 0; ee < nsa; ++ee) {
+        const auto &sC = aux.shells[c], &sE = aux.shells[ee];
+        const auto ghC = ghost(sC), ghE = ghost(sE);
+        const int oC = aux.ao_off[c], oE = aux.ao_off[ee];
+        const int nC = ncart(sC.l), nE = ncart(sE.l);
+        for (int pos : {0, 2})
+          for (int dir = 0; dir < 3; ++dir) {
+            auto blk = detail::quartet_pos_deriv_block(sC, ghC, sE, ghE, pos, dir, grid);
+            const int cs = (pos == 0) ? cshell(true, c) : cshell(true, ee);
+            const int xi = 3 * cs + dir;
+            for (int kQ = 0; kQ < nC; ++kQ)
+              for (int kR = 0; kR < nE; ++kR) {
+                const Real dv = blk[static_cast<std::size_t>(kQ) * nE + kR];
+                if (dv == Real(0)) continue;
+                const int QQ = oC + kQ, RR = oE + kR;
+                for (int ii = 0; ii < ib; ++ii)
+                  for (int j = 0; j < nvec; ++j) {
+                    Pa[Pidx(xi, QQ, ii, j)] -=
+                        dv * Vm[static_cast<std::size_t>(RR) * vv + (i0 + ii) * nvec + j];
+                    Pb[Pidx(xi, QQ, ii, j)] -=
+                        dv * Vm[static_cast<std::size_t>(RR) * vv + j * nvec + (i0 + ii)];
+                  }
+              }
+          }
+      }
+    // Hess[x][y] += -1/2 sum_{Q,R,i,j} Pa_x[Q,i,j] Minv[Q,R] Pb_y[R,i,j]
+    std::vector<Real> MPb(Pb.size(), Real(0));
+    const int inner = static_cast<int>(static_cast<std::size_t>(ib) * nvec);
+    for (int y = 0; y < dim; ++y)
+      detail::gemm('N', 'N', naux, inner, naux, Real(1), Minv.data(), naux,
+                   Pb.data() + static_cast<std::size_t>(y) * pstride, inner, Real(0),
+                   MPb.data() + static_cast<std::size_t>(y) * pstride, inner);
+    detail::gemm('N', 'T', dim, dim, static_cast<int>(pstride), Real(-0.5), Pa.data(),
+                 static_cast<int>(pstride), MPb.data(), static_cast<int>(pstride), Real(1),
+                 Hess.data(), dim);
+  }
+  return Hess;
+}
+
 } // namespace intti

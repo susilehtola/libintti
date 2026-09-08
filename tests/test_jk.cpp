@@ -647,4 +647,45 @@ TEST(JK, FactorisedRiExchangeGradientMatchesDense) {
   }
 }
 
+
+TEST(JK, FactorisedRiExchangeHessianMatchesDense) {
+  // ri_k_hessian holds R, S, Rp each dim x nao^2 x naux -- 150 TB at
+  // nao = 1000, naux = 4000 against a 20 MB output. ri_k_hessian_occ needs two
+  // changes together: factorise (nao^2 -> nvec^2) and block over the VECTOR
+  // index, which is free because M^{-1} couples only the auxiliary one. The
+  // dense builder is correct at test size, so it is the oracle.
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = orb.nao, nvec = 3;
+  const int nsa = static_cast<int>(aux.shells.size());
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec),
+      CR(static_cast<std::size_t>(n) * nvec);
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < nvec; ++k) {
+      CL[i * nvec + k] = 0.3 * std::cos(0.7 * i + k) / (1.0 + i);
+      CR[i * nvec + k] = 0.2 * std::sin(0.4 * i - 2.0 * k) + 0.05 * k;
+    }
+  std::vector<double> D(static_cast<std::size_t>(n) * n, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double acc = 0;
+      for (int k = 0; k < nvec; ++k) acc += CL[i * nvec + k] * CR[j * nvec + k];
+      D[i * n + j] = acc;
+    }
+  const auto ref = intti::ri_k_hessian(orb, aux, D.data(), grid);
+  double scale = 0;
+  for (double v : ref) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 1e-4) << "reference Hessian is trivially zero";
+  // every combination of auxiliary tiling and vector blocking must agree
+  for (int at : {1, nsa, 0})
+    for (int vb : {1, 2, nvec, 0}) {
+      const auto got =
+          intti::ri_k_hessian_occ(orb, aux, CL.data(), CR.data(), nvec, grid, 1e-10, at, vb);
+      ASSERT_EQ(got.size(), ref.size());
+      EXPECT_LT(maxdiff(got, ref), 1e-9 * scale)
+          << "aux_tile=" << at << " vec_block=" << vb;
+    }
+}
+
 } // namespace
