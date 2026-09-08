@@ -459,6 +459,104 @@ Opt optimize_ri_rhf(std::vector<Atom> at, int nocc, const intti::TGrid<double> &
   return out;
 }
 
+
+/// RI-RHF driven entirely through the MEMORY-BOUNDED builders: ri_jk_tiled,
+/// which forms no fit vectors at any point.
+///
+/// Damping is applied to the FOCK matrix, not the density. That is not a
+/// stylistic choice: the tiled exchange consumes the density in factorised form
+/// D = C C^T, and a density-damped D = mix D_new + (1-mix) D_old is no longer a
+/// single such product. Damping F keeps D exactly 2 C_occ C_occ^T at every
+/// iteration. (The alternative, if density damping were wanted, is to
+/// concatenate scaled factors -- K is linear in D -- rather than to mix and hope
+/// the factorisation survives.)
+Scf ri_rhf_tiled(const std::vector<Shell> &orb_sh, const std::vector<Shell> &aux_sh,
+                 const std::vector<Atom> &atoms, int nocc, const intti::TGrid<double> &grid,
+                 int aux_tile, int vec_tile) {
+  auto orb = intti::make_basis(orb_sh);
+  auto auxb = intti::make_basis(aux_sh);
+  const int n = orb.nao;
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  std::vector<double> Z;
+  std::vector<std::array<double, 3>> R;
+  for (const auto &a : atoms) {
+    Z.push_back(a.Z);
+    R.push_back(a.R);
+  }
+  const auto S = intti::overlap_matrix(orb);
+  const auto Tk = intti::kinetic_matrix(orb);
+  const auto V = intti::nuclear_matrix(orb, intti::nuclei_as_charges(Z, R), grid);
+  std::vector<double> H(n2);
+  for (std::size_t i = 0; i < n2; ++i) H[i] = Tk[i] + V[i];
+  const auto X = inverse_sqrt(S, n, 1e-10);
+  const double Enuc = nuclear_repulsion(atoms);
+
+  Scf out;
+  out.D.assign(n2, 0.0);
+  std::vector<double> F(H), Fnew(n2), J(n2), K(n2), Fp(n2), Cocc;
+  double Eprev = 0;
+  for (int it = 0; it < 500; ++it) {
+    // F' = X F X, diagonalise, back-transform
+    std::vector<double> tmp(n2, 0.0);
+    for (int i = 0; i < n; ++i)
+      for (int k = 0; k < n; ++k) {
+        double s = 0;
+        for (int j = 0; j < n; ++j) s += F[i * n + j] * X[j * n + k];
+        tmp[i * n + k] = s;
+      }
+    for (int i = 0; i < n; ++i)
+      for (int k = 0; k < n; ++k) {
+        double s = 0;
+        for (int j = 0; j < n; ++j) s += X[i * n + j] * tmp[j * n + k];
+        Fp[i * n + k] = s;
+      }
+    out.eps.assign(n, 0.0);
+    intti::detail::syevd(n, Fp.data(), out.eps.data());
+    out.C.assign(n2, 0.0);
+    for (int i = 0; i < n; ++i)
+      for (int k = 0; k < n; ++k) {
+        double s = 0;
+        for (int j = 0; j < n; ++j) s += X[i * n + j] * Fp[k * n + j];
+        out.C[i * n + k] = s;
+      }
+    // D = 2 C_occ C_occ^T, supplied to the builder as the factor sqrt(2) C_occ
+    Cocc.assign(static_cast<std::size_t>(n) * nocc, 0.0);
+    const double rt2 = std::sqrt(2.0);
+    for (int i = 0; i < n; ++i)
+      for (int k = 0; k < nocc; ++k) Cocc[i * nocc + k] = rt2 * out.C[i * n + k];
+    std::vector<double> Dnew(n2, 0.0);
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) {
+        double s = 0;
+        for (int k = 0; k < nocc; ++k) s += Cocc[i * nocc + k] * Cocc[j * nocc + k];
+        Dnew[i * n + j] = s;
+      }
+    double dmax = 0;
+    for (std::size_t i = 0; i < n2; ++i) dmax = std::max(dmax, std::abs(Dnew[i] - out.D[i]));
+    out.D = Dnew;
+    intti::ri_jk_tiled(orb, auxb, grid, Cocc.data(), nocc, J.data(), K.data(), aux_tile,
+                       vec_tile);
+    for (std::size_t i = 0; i < n2; ++i) Fnew[i] = H[i] + J[i] - 0.5 * K[i];
+    double E = Enuc;
+    for (std::size_t i = 0; i < n2; ++i) E += 0.5 * out.D[i] * (H[i] + Fnew[i]);
+    out.iters = it + 1;
+    // the energy is variational, so its error is SECOND order in the density
+    // error: 1e-8 in the density is ample for the 1e-9 energy this is checked
+    // to, and far cheaper than the 1e-11 the gradient tests need (a gradient
+    // error is only FIRST order -- see the criterion in rhf()).
+    if (it > 0 && std::abs(E - Eprev) < 1e-12 && dmax < 1e-8) {
+      out.E = E;
+      out.converged = true;
+      return out;
+    }
+    Eprev = E;
+    out.E = E;
+    const double mix = 0.85; // damp the FOCK matrix, never the density
+    for (std::size_t i = 0; i < n2; ++i) F[i] = mix * Fnew[i] + (1 - mix) * F[i];
+  }
+  return out;
+}
+
 // PySCF references: prototype/pyscf_scf_validation.py, same molecule, the same
 // uncontracted s/p orbital basis and s/p/d auxiliary basis, cart=True (20 AOs,
 // 38 auxiliary functions, E_nuc = 9.220256432808192). The milestone asks for
@@ -663,6 +761,26 @@ TEST(Scf, NuclearRepulsionMatchesPyscf) {
   // the one piece of the total energy that is not an integral -- pinned so a
   // geometry typo shows up here rather than as an integral discrepancy
   EXPECT_NEAR(nuclear_repulsion(kAtoms), 9.220256432808192, 1e-12);
+}
+
+
+TEST(Scf, TiledRiRhfNeedsNoFitVectorsAndMatchesPyscf) {
+  // The whole point of moving the RI layer off dense nao^2 x naux storage: a
+  // complete RI-RHF that never forms the fit vectors must still land on the
+  // number PySCF's df.RHF gives. Deliberately small tiles, so the blocked paths
+  // are genuinely exercised rather than falling into the one-block case.
+  //
+  // Only one tiling is run here. Tile INDEPENDENCE is already pinned
+  // exhaustively and cheaply at the builder level by
+  // JK.TiledOrbitalExchangeIsTileIndependentAndBounded (all 16 combinations
+  // against the dense reference); what this test adds is that the blocked path
+  // composes into a working SCF, and repeating it per tiling only multiplies
+  // runtime -- each build recomputes the three-centre integrals, which is the
+  // memory-for-time trade the tiling exists to make.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const auto scf = ri_rhf_tiled(orbital_shells(), auxiliary_shells(), kAtoms, 5, grid, 2, 3);
+  ASSERT_TRUE(scf.converged) << "did not converge in " << scf.iters << " iterations";
+  EXPECT_NEAR(scf.E, kPyscfRIRHF, 1e-9);
 }
 
 } // namespace

@@ -413,4 +413,34 @@ void ri_k_occ_tiled(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
   }
 }
 
+/// Memory-bounded RI J and K for a density supplied in FACTORISED form,
+/// D = C C^T with C nao x nvec. Neither half forms the nao^2 x naux fit
+/// vectors: J goes through ri_j_tiled and K through ri_k_occ_tiled.
+///
+/// The interface is factorised rather than dense on purpose. Every density this
+/// is meant for already is: an SCF density is 2 C_occ C_occ^T, a CPHF perturbed
+/// density is C_occ U C_virt^T + transpose. Taking a dense D would mean
+/// factorising it back (an SVD) just to undo the caller's own work.
+///
+/// Linearity is the other reason: K is linear in D, so a damped or mixed
+/// density stays exactly representable by CONCATENATING scaled factors --
+/// D = a D1 + b D2 is C = [sqrt(a) C1, sqrt(b) C2] -- rather than needing a
+/// refactorisation. Callers that damp should mix Fock matrices or concatenate,
+/// not mix densities and hope the factorisation survives.
+template <class Real>
+void ri_jk_tiled(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                 const TGrid<Real> &grid, const Real *C, int nvec, Real *J, Real *K,
+                 int aux_tile_shells = 0, int vec_tile = 0, Real tau_lin = Real(1e-10)) {
+  const int nao = orb.nao;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (J) {
+    // D = C C^T; this is the size of the output, not of the fit vectors
+    std::vector<Real> D(N, Real(0));
+    detail::gemm('N', 'T', nao, nao, nvec, Real(1), C, nvec, C, nvec, Real(0), D.data(), nao);
+    ri_j_tiled(orb, aux, grid, D.data(), J, aux_tile_shells, tau_lin);
+  }
+  if (K)
+    ri_k_occ_tiled(orb, aux, grid, C, C, nvec, K, aux_tile_shells, vec_tile, tau_lin);
+}
+
 } // namespace intti
