@@ -27,6 +27,7 @@ import sys
 
 import numpy as np
 from pyscf import gto, scf
+from pyscf.grad import rhf as grad_rhf
 
 # same molecule and uncontracted basis as tests/test_scf.cpp
 ATOM = [
@@ -45,13 +46,38 @@ def uncontracted(*shells):
 
 def load(lib_path):
     lib = ctypes.CDLL(lib_path)
+    d, i = ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int)
     f = lib.intti_get_jk
     f.restype = ctypes.c_int
-    d, i = ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_int)
     f.argtypes = [d, d, d, ctypes.c_int, i, ctypes.c_int, ctypes.c_int,
                   i, ctypes.c_int, i, ctypes.c_int, d,
                   ctypes.c_double, ctypes.c_double]
-    return f
+    g = lib.intti_get_jk_ip1
+    g.restype = ctypes.c_int
+    g.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
+    return f, g
+
+
+def make_grad_get_jk(fn, mol, tau=0.0):
+    """Drop-in for pyscf.grad.rhf.get_jk, backed by intti::jk_deriv_ao_build."""
+    nao = mol.nao_nr()
+    atm = np.asarray(mol._atm, dtype=np.int32, order="C")
+    bas = np.asarray(mol._bas, dtype=np.int32, order="C")
+    env = np.asarray(mol._env, dtype=np.float64, order="C")
+
+    def get_jk(mol_, dm):
+        d = np.ascontiguousarray(np.asarray(dm, dtype=np.float64))
+        vj = np.zeros((3, nao, nao))
+        vk = np.zeros((3, nao, nao))
+        dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        rc = fn(dptr(vj), dptr(vk), dptr(d), iptr(atm), mol.natm, iptr(bas), mol.nbas,
+                dptr(env), float(tau))
+        if rc != 0:
+            raise RuntimeError(f"intti_get_jk_ip1 failed, rc={rc}")
+        return vj, vk
+
+    return get_jk
 
 
 def make_get_jk(fn, mol, tau=0.0):
@@ -89,7 +115,7 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
-    fn = load(sys.argv[1])
+    fn, fn_ip1 = load(sys.argv[1])
     basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
     mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
 
@@ -139,6 +165,27 @@ def main():
     print(f"   |K + K^T| = {np.abs(theirs_a[1] + theirs_a[1].T).max():.3e}")
     ok = (abs(e - e_ref) < 1e-9 and dj < 1e-9 and dk < 1e-9
           and dja < 1e-9 and dka < 1e-9 and ksc > 1e-4)
+    # derivative J/K in the bra-gradient convention, against pyscf.grad.rhf
+    dm0 = ref.make_rdm1()
+    gj, gk = make_grad_get_jk(fn_ip1, mol)(mol, dm0)
+    rj, rk = grad_rhf.get_jk(mol, dm0)
+    dgj = np.abs(gj - rj).max()
+    dgk = np.abs(gk - rk).max()
+    print(f"grad-convention dJ/dA agreement = {dgj:.3e}  (|dJ| = {np.abs(rj).max():.3e})")
+    print(f"grad-convention dK/dA agreement = {dgk:.3e}  (|dK| = {np.abs(rk).max():.3e})")
+    # ...and the payoff: PySCF's OWN gradient assembly driven on intti's
+    # derivative integrals. Gradients.get_jk is the hook get_veff calls.
+    g_ref = ref.nuc_grad_method().kernel()
+    gobj = ref.nuc_grad_method()
+    gobj.get_jk = make_grad_get_jk(fn_ip1, mol)
+    g_ours = gobj.kernel()
+    dg = np.abs(np.asarray(g_ours) - np.asarray(g_ref)).max()
+    print("gradient (Ha/bohr), PySCF assembly on intti derivative J/K:")
+    for row in np.asarray(g_ours):
+        print("    " + "  ".join(f"{x:14.10f}" for x in row))
+    print(f"gradient agreement = {dg:.3e}  (|g| = {np.abs(g_ref).max():.3e})")
+    ok = (ok and dgj < 1e-9 and dgk < 1e-9 and np.abs(rj).max() > 1e-3
+          and dg < 1e-9 and np.abs(g_ref).max() > 1e-3)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

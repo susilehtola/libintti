@@ -391,3 +391,45 @@ extern "C" int intti_get_jk(double *vj, double *vk, const double *dms, int ndm,
   }
   return 0;
 }
+
+// Derivative J/K in the bra-gradient convention, mirroring
+// pyscf.grad.rhf.get_jk(mol, dm): vj/vk are 3 x nao x nao, the derivative acting
+// on the FIRST AO index only, unfolded onto atoms (the caller does that with its
+// own aoslices). Same restrictions and conventions as intti_get_jk.
+extern "C" int intti_get_jk_ip1(double *vj, double *vk, const double *dm, const int *atm,
+                                int natm, const int *bas, int nbas, const double *env,
+                                double tau) {
+  ensure_kokkos();
+  std::vector<intti::PrimitiveShell<double>> shells;
+  std::vector<double> scale;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const ShellInfo s = decode_shell(ish, atm, bas, env);
+    if (s.nctr != 1 || s.nprim != 1) return -1;
+    shells.push_back(intti::PrimitiveShell<double>{
+        s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+    const double c = s.coeff[0] * coeff_rescale(s.l);
+    for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+  }
+  auto basis = intti::make_basis(shells);
+  const int nao = basis.nao;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (static_cast<int>(scale.size()) != nao) return -2;
+  std::vector<double> Ds(N);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j)
+      Ds[static_cast<std::size_t>(i) * nao + j] =
+          dm[static_cast<std::size_t>(i) * nao + j] * scale[i] * scale[j];
+  std::vector<intti::JKRequest<double>> reqs(1);
+  reqs[0].D = Ds.data();
+  reqs[0].sym = intti::DensitySymmetry::General;
+  reqs[0].terms = intti::FockTerms::CoulombExchange;
+  const auto res = intti::jk_deriv_ao_build(basis, reqs, default_grid(), tau);
+  for (int x = 0; x < 3; ++x)
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j) {
+        const std::size_t o = static_cast<std::size_t>(x) * N + i * nao + j;
+        if (vj) vj[o] = res.J[0][o] * scale[i] * scale[j];
+        if (vk) vk[o] = res.K[0][o] * scale[i] * scale[j];
+      }
+  return 0;
+}

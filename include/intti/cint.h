@@ -57,6 +57,13 @@ int intti_get_jk(double *vj, double *vk, const double *dms, int ndm, const int *
                  int with_j, int with_k, const int *atm, int natm, const int *bas,
                  int nbas, const double *env, double omega, double tau);
 
+/* Derivative J/K in the bra-gradient convention, mirroring
+ * pyscf.grad.rhf.get_jk(mol, dm): vj/vk are 3 x nao x nao with the derivative on
+ * the first AO index, NOT folded onto atoms. Same restrictions as
+ * intti_get_jk. */
+int intti_get_jk_ip1(double *vj, double *vk, const double *dm, const int *atm, int natm,
+                     const int *bas, int nbas, const double *env, double tau);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);
