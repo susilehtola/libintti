@@ -598,4 +598,53 @@ TEST(JK, RiCoulombGradientAndHessianAreAuxiliaryTileIndependent) {
   }
 }
 
+
+TEST(JK, FactorisedRiExchangeGradientMatchesDense) {
+  // ri_k_gradient_occ computes the same quantity as ri_k_gradient without ever
+  // forming an nao^2 x naux object -- the dense builder makes FOUR of them
+  // (T, H, G, c3), ~128 GB at nao = 1000, naux = 4000. The dense version is
+  // correct at test size, so it is the oracle for the factorised one.
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = orb.nao, nvec = 3;
+  const int nsa = static_cast<int>(aux.shells.size());
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec),
+      CR(static_cast<std::size_t>(n) * nvec);
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < nvec; ++k) {
+      CL[i * nvec + k] = 0.3 * std::cos(0.7 * i + k) / (1.0 + i);
+      CR[i * nvec + k] = 0.2 * std::sin(0.4 * i - 2.0 * k) + 0.05 * k;
+    }
+  // the dense builder takes D; build it from the same factors
+  std::vector<double> D(static_cast<std::size_t>(n) * n, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double acc = 0;
+      for (int k = 0; k < nvec; ++k) acc += CL[i * nvec + k] * CR[j * nvec + k];
+      D[i * n + j] = acc;
+    }
+  const auto ref = intti::ri_k_gradient(orb, aux, D.data(), grid);
+  double scale = 0;
+  for (const auto &v : ref.forb)
+    for (int e = 0; e < 3; ++e) scale = std::max(scale, std::abs(v[e]));
+  for (const auto &v : ref.faux)
+    for (int e = 0; e < 3; ++e) scale = std::max(scale, std::abs(v[e]));
+  ASSERT_GT(scale, 1e-4) << "reference gradient is trivially zero";
+  for (int at : {1, 2, nsa, 0}) {
+    const auto got = intti::ri_k_gradient_occ(orb, aux, CL.data(), CR.data(), nvec, grid,
+                                              1e-10, at);
+    ASSERT_EQ(got.forb.size(), ref.forb.size());
+    ASSERT_EQ(got.faux.size(), ref.faux.size());
+    for (std::size_t i = 0; i < ref.forb.size(); ++i)
+      for (int e = 0; e < 3; ++e)
+        EXPECT_NEAR(got.forb[i][e], ref.forb[i][e], 1e-10 * scale)
+            << "orbital shell " << i << " comp " << e << " aux_tile=" << at;
+    for (std::size_t i = 0; i < ref.faux.size(); ++i)
+      for (int e = 0; e < 3; ++e)
+        EXPECT_NEAR(got.faux[i][e], ref.faux[i][e], 1e-10 * scale)
+            << "auxiliary shell " << i << " comp " << e << " aux_tile=" << at;
+  }
+}
+
 } // namespace

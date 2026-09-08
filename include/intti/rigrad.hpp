@@ -95,7 +95,9 @@ void ri_grad_digest(RIGradJobs<Real> &jobs, const TGrid<Real> &grid,
                     Kokkos::View<const Real *> gam,
                     Kokkos::View<const Real *> c3v, Kokkos::View<const Real *> c2v,
                     int naux,
-                    Kokkos::View<Real *[3], Kokkos::LayoutLeft> force) {
+                    Kokkos::View<Real *[3], Kokkos::LayoutLeft> force,
+                    Kokkos::View<const Real *> clv = {},
+                    Kokkos::View<const Real *> zv = {}, int nvec = 0) {
   if (jobs.njob == 0) return;
   auto tab = make_pair_table(jobs.plist);
   auto batch = make_batch(tab, jobs.quartets);
@@ -141,7 +143,23 @@ void ri_grad_digest(RIGradJobs<Real> &jobs, const TGrid<Real> &grid,
                 else if constexpr (Mode == 2)
                   cf = c3v(((static_cast<std::size_t>(oa + k[0]) * nao + ob + k[1]) * naux) +
                            oc + k[2]);
-                else
+                else if constexpr (Mode == 4) {
+                  // c3^R_ln = sum_jk C_L[l,j] C_L[n,k] Z^R_jk -- evaluated here
+                  // rather than read from a dense nao^2 x naux array, which is
+                  // the whole point of the factorised form
+                  const int li = oa + k[0], ni = ob + k[1], R = oc + k[2];
+                  Real acc = 0;
+                  for (int jj = 0; jj < nvec; ++jj) {
+                    const Real cl = clv(static_cast<std::size_t>(li) * nvec + jj);
+                    if (cl == Real(0)) continue;
+                    Real inner = 0;
+                    for (int kk = 0; kk < nvec; ++kk)
+                      inner += clv(static_cast<std::size_t>(ni) * nvec + kk) *
+                               zv((static_cast<std::size_t>(R) * nvec + jj) * nvec + kk);
+                    acc += cl * inner;
+                  }
+                  cf = acc;
+                } else
                   cf = c2v(static_cast<std::size_t>(oa + k[0]) * naux + oc + k[2]);
                 if (cf == Real(0)) continue;
                 int b3[3];
@@ -375,7 +393,8 @@ void ri_hess_digest(RIHessJobs<Real> &jobs, const std::vector<int> &positions,
                     const TGrid<Real> &grid, Kokkos::View<const Real *> Dd, int nao,
                     Kokkos::View<const Real *> gam, Kokkos::View<const Real *> c3v,
                     Kokkos::View<const Real *> c2v, int naux, int dim,
-                    Kokkos::View<Real *> H) {
+                    Kokkos::View<Real *> H, Kokkos::View<const Real *> clv = {},
+                    Kokkos::View<const Real *> zv = {}, int nvec = 0) {
   if (jobs.njob == 0) return;
   auto tab = make_pair_table(jobs.plist);
   auto batch = make_batch(tab, jobs.quartets);
@@ -436,7 +455,23 @@ void ri_hess_digest(RIHessJobs<Real> &jobs, const std::vector<int> &positions,
                 else if constexpr (Mode == 2)
                   cf = c3v(((static_cast<std::size_t>(oa + k[0]) * nao + ob + k[1]) * naux) +
                            oc + k[2]);
-                else
+                else if constexpr (Mode == 4) {
+                  // c3^R_ln = sum_jk C_L[l,j] C_L[n,k] Z^R_jk -- evaluated here
+                  // rather than read from a dense nao^2 x naux array, which is
+                  // the whole point of the factorised form
+                  const int li = oa + k[0], ni = ob + k[1], R = oc + k[2];
+                  Real acc = 0;
+                  for (int jj = 0; jj < nvec; ++jj) {
+                    const Real cl = clv(static_cast<std::size_t>(li) * nvec + jj);
+                    if (cl == Real(0)) continue;
+                    Real inner = 0;
+                    for (int kk = 0; kk < nvec; ++kk)
+                      inner += clv(static_cast<std::size_t>(ni) * nvec + kk) *
+                               zv((static_cast<std::size_t>(R) * nvec + jj) * nvec + kk);
+                    acc += cl * inner;
+                  }
+                  cf = acc;
+                } else
                   cf = c2v(static_cast<std::size_t>(oa + k[0]) * naux + oc + k[2]);
                 if (cf == Real(0)) continue;
                 for (int t = 0; t < 4; ++t) cart_comp(L[t], k[t], bm[t][0], bm[t][1], bm[t][2]);
@@ -1673,5 +1708,142 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
 // auxiliary block size becomes a cache/BLAS choice rather than a memory limit.
 // Note the Coulomb builder above does not have this problem: its response is a
 // length-naux vector, so it is affordable as written.
+
+/// RI exchange gradient for a FACTORISED density, D = C_L C_R^T. Same quantity
+/// as ri_k_gradient, computed without ever forming an nao^2 x naux object.
+///
+/// ri_k_gradient builds four of them -- the three-centre tensor T, the
+/// density-transformed H, its fit G, and the coefficients c3 -- which is ~128 GB
+/// at nao = 1000, naux = 4000. Factorising collapses all but one:
+///
+///   Y^Q_nj  = sum_l C_R[l,j] (ln|Q)                  naux x nao x nvec
+///   Yhat    = M^{-1} Y            (M^{-1} touches only the auxiliary index)
+///   H^Q_sn  = sum_j C_L[s,j] Y^Q_nj,  G^R_sn = sum_j C_L[s,j] Yhat^R_nj
+///   c3^R_ln = sum_ij C_L[l,i] C_L[n,j] Z^R_ij,  Z^R_ij = -1/2 sum_s C_R[s,i] Yhat^R_sj
+///   c2_TU   = 1/4 sum_ij W^T_ij W^U_ji,          W^T_ij =      sum_s C_L[s,i] Yhat^T_sj
+///
+/// so H, G and c3 never exist: Z and W are naux x nvec x nvec, c2 is naux x naux,
+/// and the digest evaluates c3 from its factors per quartet component (Mode 4)
+/// instead of reading a dense array. The three-centre tensor itself is consumed
+/// one auxiliary tile at a time.
+///
+/// Only Yhat remains at naux x nao x nvec -- the same irreducible object as
+/// ri_k_occ_tiled. It is NOT blocked over nvec here: unlike the exchange build,
+/// where K is a plain sum over the vector index so blocks accumulate, Z and c2
+/// need all (i,j) pairs, so nvec blocking would require every pair of blocks.
+/// That is a further step, not a correctness issue.
+template <class Real>
+RIGrad<Real> ri_k_gradient_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                               const Real *CL, const Real *CR, int nvec,
+                               const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
+                               int aux_tile_shells = 0) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nso = static_cast<int>(orb.shells.size());
+  const int nsa = static_cast<int>(aux.shells.size());
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
+  const std::size_t vv = static_cast<std::size_t>(nvec) * nvec;
+
+  auto M = coulomb_2c(aux, grid);
+  std::vector<Real> V = M, eval(naux);
+  detail::syevd(naux, V.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int k = 0; k < naux; ++k) {
+    if (eval[k] <= tau_lin * emax) continue;
+    const Real sc = Real(1) / eval[k];
+    for (int R = 0; R < naux; ++R)
+      for (int Q = 0; Q < naux; ++Q)
+        Minv[R * naux + Q] += sc * V[k * naux + R] * V[k * naux + Q];
+  }
+  // Y^Q_nj = sum_l C_R[l,j] (l n|Q), one auxiliary tile at a time
+  std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0));
+  {
+    std::vector<Real> Tq(N);
+    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+      const int A1 = std::min(A0 + aux_tile_shells, nsa);
+      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+      for (int Q = 0; Q < blk; ++Q) {
+        for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = Tblk[mn * blk + Q];
+        // Y_Q = T_Q^T C_R  (n,j) = sum_l T_Q[l][n] C_R[l][j]
+        detail::gemm('T', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
+                     Y.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
+      }
+    }
+  }
+  // Yhat = M^{-1} Y over the auxiliary index: one GEMM
+  std::vector<Real> Yh(Y.size(), Real(0));
+  detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), Minv.data(), naux,
+               Y.data(), static_cast<int>(slab), Real(0), Yh.data(),
+               static_cast<int>(slab));
+  // Z^R = -1/2 C_R^T Yhat^R ; W^T = C_L^T Yhat^T   (both naux x nvec x nvec)
+  std::vector<Real> Z(static_cast<std::size_t>(naux) * vv, Real(0));
+  std::vector<Real> W(static_cast<std::size_t>(naux) * vv, Real(0));
+  for (int R = 0; R < naux; ++R) {
+    detail::gemm('T', 'N', nvec, nvec, nao, Real(-0.5), CR, nvec,
+                 Yh.data() + static_cast<std::size_t>(R) * slab, nvec, Real(0),
+                 Z.data() + static_cast<std::size_t>(R) * vv, nvec);
+    detail::gemm('T', 'N', nvec, nvec, nao, Real(1), CL, nvec,
+                 Yh.data() + static_cast<std::size_t>(R) * slab, nvec, Real(0),
+                 W.data() + static_cast<std::size_t>(R) * vv, nvec);
+  }
+  // c2_TU = 1/4 sum_ij W^T_ij W^U_ji: transpose the inner block of one factor
+  std::vector<Real> Wp(W.size(), Real(0));
+  for (int T = 0; T < naux; ++T)
+    for (int i2 = 0; i2 < nvec; ++i2)
+      for (int j2 = 0; j2 < nvec; ++j2)
+        Wp[static_cast<std::size_t>(T) * vv + i2 * nvec + j2] =
+            W[static_cast<std::size_t>(T) * vv + j2 * nvec + i2];
+  std::vector<Real> c2(static_cast<std::size_t>(naux) * naux, Real(0));
+  detail::gemm('N', 'T', naux, naux, static_cast<int>(vv), Real(0.25), W.data(),
+               static_cast<int>(vv), Wp.data(), static_cast<int>(vv), Real(0), c2.data(),
+               naux);
+
+  RIGrad<Real> g;
+  g.forb.assign(orb.shells.size(), {Real(0), Real(0), Real(0)});
+  g.faux.assign(aux.shells.size(), {Real(0), Real(0), Real(0)});
+  if constexpr (kokkos_scalar_v<Real>) {
+    detail::RIGradJobs<Real> jobA, jobB;
+    for (int lsh = 0; lsh < nso; ++lsh)
+      for (int nsh = 0; nsh < nso; ++nsh)
+        for (int a = 0; a < nsa; ++a) {
+          const PrimitiveShell<Real> sh[4] = {orb.shells[lsh], orb.shells[nsh],
+                                              aux.shells[a],
+                                              detail::ghost_shell(aux.shells[a])};
+          for (int pos = 0; pos < 3; ++pos) {
+            const int tgt = (pos == 0) ? lsh : (pos == 1) ? nsh : nso + a;
+            jobA.add(sh, pos, tgt, orb.ao_off[lsh], orb.ao_off[nsh], aux.ao_off[a]);
+          }
+        }
+    for (int P = 0; P < nsa; ++P)
+      for (int Qs = 0; Qs < nsa; ++Qs) {
+        const PrimitiveShell<Real> sh[4] = {aux.shells[P], detail::ghost_shell(aux.shells[P]),
+                                            aux.shells[Qs],
+                                            detail::ghost_shell(aux.shells[Qs])};
+        for (int pos : {0, 2}) {
+          const int tgt = nso + ((pos == 0) ? P : Qs);
+          jobB.add(sh, pos, tgt, aux.ao_off[P], 0, aux.ao_off[Qs]);
+        }
+      }
+    const int ncen = nso + nsa;
+    Kokkos::View<Real *[3], Kokkos::LayoutLeft> force("intti::rikg::f", ncen);
+    auto clv = detail::to_device(CL, static_cast<std::size_t>(nao) * nvec, "rikg::cl");
+    auto zv = detail::to_device(Z, "rikg::z");
+    auto c2d = detail::to_device(c2, "rikg::c2");
+    Kokkos::View<const Real *> none;
+    detail::ri_grad_digest<Real, 4>(jobA, grid, none, nao, none, none, none, naux, force,
+                                    clv, zv, nvec);
+    detail::ri_grad_digest<Real, 3>(jobB, grid, none, nao, none, none, c2d, naux, force);
+    auto fh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, force);
+    for (int i = 0; i < nso; ++i)
+      for (int e = 0; e < 3; ++e) g.forb[i][e] = fh(i, e);
+    for (int i = 0; i < nsa; ++i)
+      for (int e = 0; e < 3; ++e) g.faux[i][e] = fh(nso + i, e);
+  }
+  return g;
+}
 
 } // namespace intti
