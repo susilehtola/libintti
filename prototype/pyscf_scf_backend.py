@@ -118,6 +118,15 @@ def install_intti_intor(get, mol):
     def intor(intor_name, comp=None, hermi=0, aosym="s1", out=None, shls_slice=None,
               grids=None):
         base = intor_name.replace("_sph", "").replace("_cart", "")
+        # POLICY: one-electron names only. A two-electron intor returns the
+        # four-index tensor (or is consumed quartet by quartet), which is
+        # exactly the per-quartet route the matrix-level API exists to avoid --
+        # it would hand the device one quartet at a time and lose the batching.
+        # Two-electron work goes through the matrix hooks (get_jk,
+        # intti_get_jk_ip1, intti_hess_skeleton), never through here.
+        assert not base.startswith("int2e"), (
+            f"{base}: two-electron integrals must not be routed through "
+            "mol.intor; use the matrix-level hooks")
         simple = shls_slice is None and out is None and grids is None
         table = {"int1e_ipovlp": 0, "int1e_ipkin": 1, "int1e_ipnuc": 2}
         if simple and base in table:
