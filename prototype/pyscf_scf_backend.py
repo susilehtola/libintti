@@ -121,7 +121,24 @@ def main():
     dk = np.abs(ours[1] - theirs[1]).max()
     print(f"general-density J agreement = {dj:.3e}")
     print(f"general-density K agreement = {dk:.3e}")
-    ok = abs(e - e_ref) < 1e-9 and dj < 1e-9 and dk < 1e-9
+    # hermi = 2: the ANTISYMMETRIC case. This is not a corner case -- NMR
+    # shielding's CPHF response is driven exactly this way
+    # (pyscf/prop/nmr/rhf.py: vresp = mf.gen_response(singlet=True, hermi=2)
+    # with dm1 = d1 - d1.conj().T), and it is the case the fused exchange_build
+    # cannot represent, since it builds an upper triangle and mirrors it.
+    a = rng.standard_normal((nao, nao)) * 0.05
+    a = a - a.T
+    ours_a = make_get_jk(fn, mol)(mol, a, hermi=2)
+    theirs_a = ref.get_jk(mol, a, hermi=2)
+    dja = np.abs(ours_a[0] - theirs_a[0]).max()
+    dka = np.abs(ours_a[1] - theirs_a[1]).max()
+    ksc = np.abs(theirs_a[1]).max()
+    print(f"antisym-density J agreement = {dja:.3e}  (|J| = {np.abs(theirs_a[0]).max():.3e})")
+    print(f"antisym-density K agreement = {dka:.3e}  (|K| = {ksc:.3e})")
+    # K must be genuinely nonzero and antisymmetric, or the check is vacuous
+    print(f"   |K + K^T| = {np.abs(theirs_a[1] + theirs_a[1].T).max():.3e}")
+    ok = (abs(e - e_ref) < 1e-9 and dj < 1e-9 and dk < 1e-9
+          and dja < 1e-9 and dka < 1e-9 and ksc > 1e-4)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
