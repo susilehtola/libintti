@@ -631,15 +631,23 @@ void quartet_pos_hess(const PrimitiveShell<Real> &s0, const PrimitiveShell<Real>
 template <class Real>
 RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                            const Real *D, const TGrid<Real> &grid,
-                           Real tau_lin = Real(1e-10)) {
+                           Real tau_lin = Real(1e-10), int aux_tile_shells = 0) {
   const int nao = orb.nao, naux = aux.nao;
   auto M = coulomb_2c(aux, grid);             // naux x naux
-  auto T = coulomb_3c(orb, aux, grid);        // nao*nao x naux
-  // d_P = sum_mn (mn|P) D_mn = (T^T D)[P], T viewed as N x naux, D as N-vector
+  // The three-centre tensor is consumed exactly once here, as d = T^T D, so it
+  // is taken one auxiliary tile at a time and never materialised: nao^2 x naux
+  // is 32 GB at nao = 1000, naux = 4000.
+  const int nsa_t = static_cast<int>(aux.shells.size());
+  if (aux_tile_shells < 1) aux_tile_shells = nsa_t;
   std::vector<Real> d(naux, Real(0));
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
-  detail::gemm('T', 'N', naux, 1, static_cast<int>(N), Real(1), T.data(), naux, D, 1, Real(0),
-               d.data(), 1);
+  for (int A0 = 0; A0 < nsa_t; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa_t);
+    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+    detail::gemm('T', 'N', blk, 1, static_cast<int>(N), Real(1), Tblk.data(), blk, D, 1,
+                 Real(0), d.data() + p0, 1);
+  }
   // gamma = M^{-1} d via the eigendecomposition (pseudo-inverse with cutoff)
   std::vector<Real> V = M, eval(naux);
   detail::syevd(naux, V.data(), eval.data()); // V: eigenvectors (columns, col-major)
@@ -761,19 +769,26 @@ RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
 template <class Real>
 std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                                const Real *D, const TGrid<Real> &grid,
-                               Real tau_lin = Real(1e-10)) {
+                               Real tau_lin = Real(1e-10), int aux_tile_shells = 0) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
   const int ncen = nso + nsa, dim = 3 * ncen;
   auto M = coulomb_2c(aux, grid);
-  auto T = coulomb_3c(orb, aux, grid);
+  // one auxiliary tile at a time; the tensor is used once, as d = T^T D
+  const int nsa_t = static_cast<int>(aux.shells.size());
+  if (aux_tile_shells < 1) aux_tile_shells = nsa_t;
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
   // d_P and M^{-1}: d_P = sum_mn (mn|P) D_mn = (T^T D)[P]
   std::vector<Real> d(naux, Real(0));
-  detail::gemm('T', 'N', naux, 1, static_cast<int>(N), Real(1), T.data(), naux, D, 1, Real(0),
-               d.data(), 1);
+  for (int A0 = 0; A0 < nsa_t; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa_t);
+    const int p0 = aux.ao_off[A0], blk_ = aux.ao_off[A1] - p0;
+    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+    detail::gemm('T', 'N', blk_, 1, static_cast<int>(N), Real(1), Tblk.data(), blk_, D, 1,
+                 Real(0), d.data() + p0, 1);
+  }
   std::vector<Real> Vv = M, eval(naux);
   detail::syevd(naux, Vv.data(), eval.data());
   Real emax = 0;

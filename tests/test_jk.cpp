@@ -565,4 +565,37 @@ TEST(JK, RiCoulombDerivativeIsAuxiliaryTileIndependent) {
   }
 }
 
+
+TEST(JK, RiCoulombGradientAndHessianAreAuxiliaryTileIndependent) {
+  // ri_j_gradient and ri_j_hessian each consumed the nao^2 x naux three-centre
+  // tensor exactly once, as d = T^T D, so tiling it costs nothing and removes
+  // the last dense allocation from the RI COULOMB path. Every tiling must agree,
+  // full extent being the dense computation.
+  auto orb = intti::make_basis(jk_shells());
+  auto aux = intti::make_basis(jk_aux_shells());
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int n = orb.nao;
+  const int nsa = static_cast<int>(aux.shells.size());
+  const auto D = sym_density(n);
+  const auto g0 = intti::ri_j_gradient(orb, aux, D.data(), grid, 1e-10, nsa);
+  const auto h0 = intti::ri_j_hessian(orb, aux, D.data(), grid, 1e-10, nsa);
+  double gs = 0, hs = 0;
+  for (const auto &v : g0.forb)
+    for (int e = 0; e < 3; ++e) gs = std::max(gs, std::abs(v[e]));
+  for (double v : h0) hs = std::max(hs, std::abs(v));
+  ASSERT_GT(gs, 1e-4);
+  ASSERT_GT(hs, 1e-4);
+  for (int at : {1, 2, 3, 0}) {
+    const auto g = intti::ri_j_gradient(orb, aux, D.data(), grid, 1e-10, at);
+    const auto h = intti::ri_j_hessian(orb, aux, D.data(), grid, 1e-10, at);
+    for (std::size_t i = 0; i < g0.forb.size(); ++i)
+      for (int e = 0; e < 3; ++e)
+        EXPECT_NEAR(g.forb[i][e], g0.forb[i][e], 1e-11 * gs) << "grad orb aux_tile=" << at;
+    for (std::size_t i = 0; i < g0.faux.size(); ++i)
+      for (int e = 0; e < 3; ++e)
+        EXPECT_NEAR(g.faux[i][e], g0.faux[i][e], 1e-11 * gs) << "grad aux aux_tile=" << at;
+    EXPECT_LT(maxdiff(h, h0), 1e-11 * hs) << "hessian aux_tile=" << at;
+  }
+}
+
 } // namespace
