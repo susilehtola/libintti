@@ -16,6 +16,14 @@ real convergence control -- instead of one written for the test, and it is the
 route by which PySCF's gradient and Hessian machinery can be driven on intti
 integrals without reimplementing CPHF.
 
+For the ONE-ELECTRON integrals there is a better level still: replacing
+mol.intor itself (install_intti_intor). get_jk and friends intercept
+CONTRACTIONS; mol.intor is PySCF's actual integral layer, which is what an
+integrals library should be supplying. Patching it means PySCF's own, untouched
+gradient and Hessian code runs on intti integrals with no hook at all, and it
+reaches call sites that are not hookable -- hessian.rhf.hess_elec computes
+s1a = -mol.intor('int1e_ipovlp', comp=3) inline.
+
 NOTE the restriction: intti's matrix builders take PRIMITIVE shells, so the
 molecule must use an uncontracted Cartesian basis. intti_get_jk reports a
 violation rather than answering incorrectly.
@@ -89,30 +97,45 @@ def make_1e(fn, mol):
     return get
 
 
-def make_grad_1e_hooks(get, mol):
-    """Gradients.get_ovlp and Gradients.hcore_generator, on intti integrals.
+def install_intti_intor(get, mol):
+    """Replace mol.intor itself for the names intti implements.
 
-    Mirrors pyscf.grad.rhf exactly: get_ovlp is -int1e_ipovlp, and the hcore
-    derivative for atom ia is the Hellmann-Feynman -Z_ia int1e_iprinv (at that
-    nucleus) plus the atom-sliced rows of -(int1e_ipkin + int1e_ipnuc),
-    symmetrised. intti returns iprinv UNWEIGHTED so the -Z is applied here, as
-    PySCF does.
+    A level below the get_jk / hcore_generator hooks: those intercept
+    CONTRACTIONS, whereas mol.intor is PySCF's actual integral layer -- what an
+    integrals library ought to be supplying. Patching it means PySCF's own,
+    untouched one-electron gradient and Hessian code runs on intti integrals
+    with no hook at all, and it reaches call sites that are not hookable:
+    hessian.rhf.hess_elec computes s1a = -mol.intor('int1e_ipovlp', comp=3)
+    inline, with no override point.
+
+    Names we do not implement fall through to PySCF unchanged. Returns a counter
+    so the caller can ASSERT the interception fired -- a monkeypatch that
+    silently never triggers looks exactly like success.
     """
-    aoslices = mol.aoslice_by_atom()
-    h1 = -(get(1) + get(2))
+    orig = mol.intor
+    served = {}
 
-    def get_ovlp(mol_=None):
-        return -get(0)
+    def intor(intor_name, comp=None, hermi=0, aosym="s1", out=None, shls_slice=None,
+              grids=None):
+        base = intor_name.replace("_sph", "").replace("_cart", "")
+        simple = shls_slice is None and out is None and grids is None
+        table = {"int1e_ipovlp": 0, "int1e_ipkin": 1, "int1e_ipnuc": 2}
+        if simple and base in table:
+            served[base] = served.get(base, 0) + 1
+            return get(table[base])
+        if simple and base == "int1e_iprinv":
+            # the origin is wherever mol.with_rinv_at_nucleus put it; match it to
+            # a nucleus rather than trusting the caller's loop index
+            org = mol._env[gto.PTR_RINV_ORIG:gto.PTR_RINV_ORIG + 3]
+            ia = int(np.argmin(np.linalg.norm(mol.atom_coords() - org, axis=1)))
+            if np.linalg.norm(mol.atom_coords()[ia] - org) < 1e-12:
+                served[base] = served.get(base, 0) + 1
+                return get(3, ia)
+        return orig(intor_name, comp=comp, hermi=hermi, aosym=aosym, out=out,
+                    shls_slice=shls_slice, grids=grids)
 
-    def hcore_generator(mol_=None):
-        def hcore_deriv(atm_id):
-            shl0, shl1, p0, p1 = aoslices[atm_id]
-            vrinv = get(3, atm_id) * (-mol.atom_charge(atm_id))
-            vrinv[:, p0:p1] += h1[:, p0:p1]
-            return vrinv + vrinv.transpose(0, 2, 1)
-        return hcore_deriv
-
-    return get_ovlp, hcore_generator
+    mol.intor = intor
+    return served
 
 
 def make_h1_intti(fn, mol, hcore_gen=None, tau=0.0):
@@ -322,10 +345,14 @@ def main():
     # ...and the payoff: PySCF's OWN gradient assembly driven on intti's
     # derivative integrals. Gradients.get_jk is the hook get_veff calls.
     g_ref = ref.nuc_grad_method().kernel()
+    H_ref_saved = ref.Hessian().kernel()
+    # From here on mol.intor itself is intti's, so PySCF's OWN one-electron
+    # gradient and Hessian code runs on our integrals with no hook at all -- the
+    # 1e hooks written earlier become unnecessary. Installed after every
+    # reference has been computed, so the comparisons stay honest.
+    served = install_intti_intor(make_1e(fn_1e, mol), mol)
     gobj = ref.nuc_grad_method()
     gobj.get_jk = make_grad_get_jk(fn_ip1, mol)
-    _get1e = make_1e(fn_1e, mol)
-    gobj.get_ovlp, gobj.hcore_generator = make_grad_1e_hooks(_get1e, mol)
     g_ours = gobj.kernel()
     dg = np.abs(np.asarray(g_ours) - np.asarray(g_ref)).max()
     print("gradient (Ha/bohr), PySCF assembly on intti derivative J/K:")
@@ -344,16 +371,14 @@ def main():
     # (hessian.rhf.gen_vind routes through get_jk) are both on intti integrals;
     # the CPHF right-hand side, make_h1, still uses PySCF's int2e_ip1 -- stated
     # rather than glossed.
-    H_ref = ref.Hessian().kernel()
+    H_ref = H_ref_saved
     mf2 = scf.RHF(mol)
     mf2.conv_tol = 1e-12
     mf2.get_jk = make_get_jk(fn, mol)
     mf2.kernel()
     h2 = mf2.Hessian()
     h2.partial_hess_elec = make_partial_hess(fn_hess, mol).__get__(h2, type(h2))
-    _g1e = make_1e(fn_1e, mol)
-    _, _hgen = make_grad_1e_hooks(_g1e, mol)
-    h2.make_h1 = make_h1_intti(fn_h1, mol, hcore_gen=_hgen).__get__(h2, type(h2))
+    h2.make_h1 = make_h1_intti(fn_h1, mol).__get__(h2, type(h2))
     H_ours = h2.kernel()
     dH = np.abs(np.asarray(H_ours) - np.asarray(H_ref)).max()
     print(f"full Hessian agreement = {dH:.3e}  (|H| = {np.abs(H_ref).max():.3e})")
@@ -365,6 +390,9 @@ def main():
     for a, b in zip(np.atleast_1d(f_ref), np.atleast_1d(f_our)):
         print(f"    PySCF {a:12.4f}    intti {b:12.4f}    diff {b - a:+.2e}")
     df = np.abs(np.atleast_1d(f_our) - np.atleast_1d(f_ref)).max()
+    print("mol.intor calls served by intti:", dict(sorted(served.items())))
+    # a patch that never fired would look identical to success
+    assert served.get("int1e_ipovlp", 0) > 0, "mol.intor interception never fired"
     ok = (ok and dh < 1e-8 and np.abs(h_ref).max() > 1e-2
           and dH < 1e-7 and df < 1e-4)
     print("PASS" if ok else "FAIL")
