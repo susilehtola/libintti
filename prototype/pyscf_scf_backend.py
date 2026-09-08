@@ -56,10 +56,58 @@ def load(lib_path):
     g = lib.intti_get_jk_ip1
     g.restype = ctypes.c_int
     g.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
+    ip1 = lib.intti_ip1_h1_jk
+    ip1.restype = ctypes.c_int
+    ip1.argtypes = [d, d, d, d, d, ctypes.c_int, ctypes.c_int, i, ctypes.c_int, i,
+                    ctypes.c_int, d, ctypes.c_double]
     hs = lib.intti_hess_skeleton
     hs.restype = ctypes.c_int
     hs.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
-    return f, g, hs
+    return f, g, hs, ip1
+
+
+def make_h1_intti(fn, mol, tau=0.0):
+    """Drop-in for pyscf.hessian.rhf.make_h1: the CPHF right-hand side.
+
+    Replaces the last use of PySCF's own two-electron integrals in the Hessian
+    path. make_h1 needs four int2e_ip1 contractions per atom, with the
+    differentiated index restricted to that atom's shells; intti_ip1_h1_jk
+    returns all four from one pass. vj2/vk2 come back full and are sliced to the
+    atom's AO rows, which is the shape PySCF's 's1ij' scripts already produce.
+    """
+    nao = mol.nao_nr()
+    atm = np.asarray(mol._atm, dtype=np.int32, order="C")
+    bas = np.asarray(mol._bas, dtype=np.int32, order="C")
+    env = np.asarray(mol._env, dtype=np.float64, order="C")
+
+    def make_h1(hessobj, mo_coeff, mo_occ, chkfile=None, atmlst=None, verbose=None):
+        mol_ = hessobj.mol
+        if atmlst is None:
+            atmlst = range(mol_.natm)
+        mocc = mo_coeff[:, mo_occ > 0]
+        dm0 = np.dot(mocc, mocc.T) * 2
+        hcore_deriv = hessobj.base.nuc_grad_method().hcore_generator(mol_)
+        aoslices = mol_.aoslice_by_atom()
+        dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+        iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        h1ao = [None] * mol_.natm
+        for ia in atmlst:
+            shl0, shl1, p0, p1 = aoslices[ia]
+            o = [np.zeros((3, nao, nao)) for _ in range(4)]
+            rc = fn(dptr(o[0]), dptr(o[1]), dptr(o[2]), dptr(o[3]),
+                    dptr(np.ascontiguousarray(dm0)), int(shl0), int(shl1), iptr(atm),
+                    mol_.natm, iptr(bas), mol_.nbas, dptr(env), float(tau))
+            if rc != 0:
+                raise RuntimeError(f"intti_ip1_h1_jk failed, rc={rc}")
+            vj1, vj2, vk1, vk2 = o[0], o[1][:, p0:p1, :], o[2], o[3][:, p0:p1, :]
+            vhf = vj1 - vk1 * .5
+            vhf[:, p0:p1] += vj2 - vk2 * .5
+            h1 = vhf + vhf.transpose(0, 2, 1)
+            h1 += hcore_deriv(ia)
+            h1ao[ia] = h1
+        return h1ao
+
+    return make_h1
 
 
 def make_partial_hess(fn, mol, tau=0.0):
@@ -163,7 +211,7 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
-    fn, fn_ip1, fn_hess = load(sys.argv[1])
+    fn, fn_ip1, fn_hess, fn_h1 = load(sys.argv[1])
     basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
     mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
 
@@ -251,6 +299,7 @@ def main():
     mf2.kernel()
     h2 = mf2.Hessian()
     h2.partial_hess_elec = make_partial_hess(fn_hess, mol).__get__(h2, type(h2))
+    h2.make_h1 = make_h1_intti(fn_h1, mol).__get__(h2, type(h2))
     H_ours = h2.kernel()
     dH = np.abs(np.asarray(H_ours) - np.asarray(H_ref)).max()
     print(f"full Hessian agreement = {dH:.3e}  (|H| = {np.abs(H_ref).max():.3e})")

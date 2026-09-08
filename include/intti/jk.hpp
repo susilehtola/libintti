@@ -597,4 +597,153 @@ JKDerivAO<Real> jk_deriv_ao_build(const ShellBasis<Real> &basis,
   return res;
 }
 
+/// The four int2e_ip1 contractions pyscf.hessian.rhf.make_h1 needs, with the
+/// differentiated index restricted to one atom's shells [shl0, shl1):
+///
+///   vj1[x][k][l] = sum_{j,i in slice} d(ij|kl)/dA_i D_ji   ('ji->s2kl')
+///   vj2[x][i][j] = sum_{l,k}          d(ij|kl)/dA_i D_lk   ('lk->s1ij')
+///   vk1[x][k][j] = sum_{l,i in slice} d(ij|kl)/dA_i D_li   ('li->s1kj')
+///   vk2[x][i][l] = sum_{j,k}          d(ij|kl)/dA_i D_jk   ('jk->s1il')
+///
+/// vj2 and vk2 are jk_deriv_ao_build's J and K; vj1 and vk1 are the other two
+/// index routings of the same derivative integrals, so all four share one pass.
+///
+/// SIGN. PySCF contracts int2e_ip1 = (nabla_i j|kl) against MINUS the density
+/// and returns that. Since nabla = -d/dA, computing with d/dA against the
+/// POSITIVE density reproduces its returned values directly -- no extra
+/// negation, and the two sign conventions cancel exactly once.
+///
+/// vj1 is symmetric in (k,l) because (ij|kl) = (ij|lk); PySCF obtains it by
+/// exploiting that symmetry ('s2kl') and filling, we obtain it by summing all
+/// ordered quartets. Same matrix.
+template <class Real> struct IP1Contractions {
+  int nao{0};
+  std::vector<Real> vj1, vj2, vk1, vk2; ///< each 3 x nao x nao
+};
+
+template <class Real>
+IP1Contractions<Real> ip1_h1_contractions(const ShellBasis<Real> &basis, const Real *D,
+                                          int shl0, int shl1, const TGrid<Real> &grid,
+                                          Real tau = Real(0)) {
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  std::vector<int> hL(ns), hOff(ns);
+  std::vector<Real> hAl(ns);
+  for (int i = 0; i < ns; ++i) {
+    hL[i] = basis.shells[i].l;
+    hOff[i] = basis.ao_off[i];
+    hAl[i] = basis.shells[i].alpha;
+  }
+  std::vector<ShellPair<Real>> plist;
+  std::vector<int> pid(static_cast<std::size_t>(ns) * 3 * ns, -1);
+  auto pair_id = [&](int si, int di, int sj) {
+    if (hL[si] + di < 0) return -1;
+    const std::size_t key = (static_cast<std::size_t>(si) * 3 + (di + 1)) * ns + sj;
+    if (pid[key] < 0) {
+      PrimitiveShell<Real> a = basis.shells[si], b = basis.shells[sj];
+      a.l += di;
+      plist.push_back(make_pair(a, b));
+      pid[key] = static_cast<int>(plist.size()) - 1;
+    }
+    return pid[key];
+  };
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b < ns; ++b) {
+      pair_id(a, 0, b);
+      pair_id(a, 1, b);
+      pair_id(a, -1, b);
+    }
+  auto tab = make_pair_table(plist);
+  std::vector<Real> Q;
+  if (tau > Real(0)) Q = schwarz(tab, plist, grid);
+  auto sc = [&](int s) {
+    const Real t = 2 * hAl[s];
+    return t > Real(hL[s]) ? t : Real(hL[s]);
+  };
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> ja, jb, jc, jd, eap, eam;
+  for (int a = shl0; a < shl1; ++a) // only the differentiated slice
+    for (int b = 0; b < ns; ++b)
+      for (int c = 0; c < ns; ++c)
+        for (int d = 0; d < ns; ++d) {
+          const int ket = pair_id(c, 0, d);
+          if (tau > Real(0) && sc(a) * Q[pair_id(a, 0, b)] * Q[ket] < tau) continue;
+          auto emit = [&](int bra) {
+            if (bra < 0) return -1;
+            const int e = static_cast<int>(quartets.size());
+            quartets.push_back({bra, ket});
+            return e;
+          };
+          ja.push_back(a); jb.push_back(b); jc.push_back(c); jd.push_back(d);
+          eap.push_back(emit(pair_id(a, 1, b)));
+          eam.push_back(emit(pair_id(a, -1, b)));
+        }
+  const int njob = static_cast<int>(ja.size());
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> out("intti::ip1::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, out, ws);
+  auto Dd = detail::to_device(D, n2, "intti::ip1::D");
+  auto shL = detail::to_device(hL, "ip1::L"), shOff = detail::to_device(hOff, "ip1::off");
+  auto shAl = detail::to_device(hAl, "ip1::al");
+  auto dja = detail::to_device(ja, "ip1::a"), djb = detail::to_device(jb, "ip1::b");
+  auto djc = detail::to_device(jc, "ip1::c"), djd = detail::to_device(jd, "ip1::d");
+  auto dap = detail::to_device(eap, "ip1::ap"), dam = detail::to_device(eam, "ip1::am");
+  auto offv = batch.out_offset;
+  const std::size_t stride = static_cast<std::size_t>(3) * n2;
+  Kokkos::View<Real *> J1("ip1::vj1", stride), J2("ip1::vj2", stride);
+  Kokkos::View<Real *> K1("ip1::vk1", stride), K2("ip1::vk2", stride);
+  Kokkos::parallel_for(
+      "intti::ip1::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+        const int a = dja(j), b = djb(j), c = djc(j), d = djd(j);
+        const int la = shL(a), lb = shL(b), lc = shL(c), ld = shL(d);
+        const int na = ncart(la), nb = ncart(lb), nc = ncart(lc), nd = ncart(ld);
+        const int oa = shOff(a), ob = shOff(b), oc = shOff(c), od = shOff(d);
+        const int ent[2] = {dap(j), dam(j)};
+        for (int ka = 0; ka < na; ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < nb; ++kb)
+            for (int kc = 0; kc < nc; ++kc)
+              for (int kd = 0; kd < nd; ++kd) {
+                const int I = oa + ka, Jj = ob + kb, Kk = oc + kc, L = od + kd;
+                for (int e = 0; e < 3; ++e) {
+                  int sg[2], ci[2];
+                  Real co[2];
+                  const int nt = detail::md_grad_terms(la, a3, shAl(a), e, sg, ci, co);
+                  Real v = 0;
+                  for (int t = 0; t < nt; ++t) {
+                    const int ee = ent[sg[t]];
+                    if (ee < 0) continue;
+                    const std::size_t idx =
+                        ((static_cast<std::size_t>(ci[t]) * nb + kb) * nc + kc) * nd + kd;
+                    v += co[t] * out(offv(ee) + idx);
+                  }
+                  const Real dv = -v; // d/dA
+                  const std::size_t xo = static_cast<std::size_t>(e) * n2;
+                  const std::size_t iI = static_cast<std::size_t>(I) * nao;
+                  const std::size_t iK = static_cast<std::size_t>(Kk) * nao;
+                  Kokkos::atomic_add(&J1(xo + iK + L),
+                                     dv * Dd(static_cast<std::size_t>(Jj) * nao + I));
+                  Kokkos::atomic_add(&J2(xo + iI + Jj),
+                                     dv * Dd(static_cast<std::size_t>(L) * nao + Kk));
+                  Kokkos::atomic_add(&K1(xo + iK + Jj),
+                                     dv * Dd(static_cast<std::size_t>(L) * nao + I));
+                  Kokkos::atomic_add(&K2(xo + iI + L),
+                                     dv * Dd(static_cast<std::size_t>(Jj) * nao + Kk));
+                }
+              }
+        }
+      });
+  Kokkos::fence();
+  IP1Contractions<Real> r;
+  r.nao = nao;
+  r.vj1 = detail::to_host(J1);
+  r.vj2 = detail::to_host(J2);
+  r.vk1 = detail::to_host(K1);
+  r.vk2 = detail::to_host(K2);
+  return r;
+}
+
 } // namespace intti

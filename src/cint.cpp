@@ -508,3 +508,47 @@ extern "C" int intti_hess_skeleton(double *hess, const double *dm, const double 
     hess[i] = Hk[i] + Hv[i] - Hs[i] + H2[i];
   return 0;
 }
+
+// The four int2e_ip1 contractions pyscf.hessian.rhf.make_h1 needs, for one
+// atom's shell slice [shl0, shl1). Each output is 3 x nao x nao. See
+// intti::ip1_h1_contractions for the scripts and the sign convention (PySCF
+// contracts against MINUS the density with nabla; we use d/dA with the positive
+// density, and the two conventions cancel).
+extern "C" int intti_ip1_h1_jk(double *vj1, double *vj2, double *vk1, double *vk2,
+                               const double *dm, int shl0, int shl1, const int *atm,
+                               int natm, const int *bas, int nbas, const double *env,
+                               double tau) {
+  ensure_kokkos();
+  std::vector<intti::PrimitiveShell<double>> shells;
+  std::vector<double> scale;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const ShellInfo s = decode_shell(ish, atm, bas, env);
+    if (s.nctr != 1 || s.nprim != 1) return -1;
+    shells.push_back(intti::PrimitiveShell<double>{
+        s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+    const double c = s.coeff[0] * coeff_rescale(s.l);
+    for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+  }
+  auto basis = intti::make_basis(shells);
+  const int nao = basis.nao;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (static_cast<int>(scale.size()) != nao) return -2;
+  std::vector<double> Ds(N);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j)
+      Ds[static_cast<std::size_t>(i) * nao + j] =
+          dm[static_cast<std::size_t>(i) * nao + j] * scale[i] * scale[j];
+  const auto r = intti::ip1_h1_contractions(basis, Ds.data(), shl0, shl1, default_grid(), tau);
+  double *outs[4] = {vj1, vj2, vk1, vk2};
+  const std::vector<double> *srcs[4] = {&r.vj1, &r.vj2, &r.vk1, &r.vk2};
+  for (int w = 0; w < 4; ++w) {
+    if (!outs[w]) continue;
+    for (int x = 0; x < 3; ++x)
+      for (int i = 0; i < nao; ++i)
+        for (int j = 0; j < nao; ++j) {
+          const std::size_t o = static_cast<std::size_t>(x) * N + i * nao + j;
+          outs[w][o] = (*srcs[w])[o] * scale[i] * scale[j];
+        }
+  }
+  return 0;
+}

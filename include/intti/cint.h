@@ -72,6 +72,13 @@ int intti_get_jk_ip1(double *vj, double *vk, const double *dm, const int *atm, i
 int intti_hess_skeleton(double *hess, const double *dm, const double *W, const int *atm,
                         int natm, const int *bas, int nbas, const double *env, double tau);
 
+/* The four int2e_ip1 contractions pyscf.hessian.rhf.make_h1 needs, for one
+ * atom's shell slice [shl0, shl1). Outputs are 3 x nao x nao each; pass NULL to
+ * skip one. Same restrictions as intti_get_jk. */
+int intti_ip1_h1_jk(double *vj1, double *vj2, double *vk1, double *vk2, const double *dm,
+                    int shl0, int shl1, const int *atm, int natm, const int *bas,
+                    int nbas, const double *env, double tau);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);
