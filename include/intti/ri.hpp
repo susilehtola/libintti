@@ -57,9 +57,17 @@ template <class Real> struct RIFit {
 /// when it does not -- or when the density is naturally factorised, where
 /// ri_k_occ_tiled is cheaper than this on both counts (its cost scales with the
 /// RANK of the density, nocc, rather than with nao).
-template <class Real>
-RIFit<Real> ri_fit(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
-                   const TGrid<Real> &grid, Real tau_lin = Real(1e-10)) {
+/// Templated on the BASIS types rather than written twice: ri_fit touches a
+/// basis only through .nao and the two- and three-centre Coulomb builders, and
+/// those already have contraction-aware overloads (ncenter.hpp). So a
+/// generally-contracted RI fit -- and therefore contracted RI J/K -- is the same
+/// code with contracted builders underneath, sharing primitive intermediates
+/// exactly as the contracted energy matrices do. Either basis may be contracted
+/// independently of the other, which matters because a Coulomb-fitting
+/// auxiliary set is usually much less contracted than the orbital set.
+template <class Real, class OrbBasis, class AuxBasis>
+RIFit<Real> ri_fit(const OrbBasis &orb, const AuxBasis &aux, const TGrid<Real> &grid,
+                   Real tau_lin = Real(1e-10)) {
   static_assert(std::is_same_v<Real, double> || std::is_same_v<Real, float>,
                 "ri_fit requires float or double (LAPACK)");
   const int nao = orb.nao, naux = aux.nao;

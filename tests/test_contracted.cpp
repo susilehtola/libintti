@@ -9,6 +9,7 @@
 #include "intti/contracted.hpp"
 #include "intti/deriv.hpp"
 #include "intti/erihess.hpp"
+#include "intti/ri.hpp"
 #include "intti/geohess.hpp"
 #include "intti/fock.hpp"
 #include "intti/jk.hpp"
@@ -627,6 +628,108 @@ TEST(Contracted, TwoElectronHessianVsDecontract) {
   EXPECT_GT(scale, 1e-3) << "2e Hessian trivially zero";
 }
 
+// RI J/K over generally-contracted orbital AND auxiliary bases. ri_fit is
+// templated on the basis types, so this is the same code with the contracted
+// two- and three-centre builders underneath. The two bases are contracted
+// INDEPENDENTLY here (the auxiliary one segmented, the orbital one generally
+// contracted) because that is the real case: a Coulomb-fitting set is usually
+// far less contracted than the orbital set, and a mixed pair would break any
+// code that assumed the two were the same kind.
+//
+// Checked for a symmetric, a general and an antisymmetric density: ri_jk
+// contracts K = sum_P B^P D B^P as two GEMMs and assumes nothing about D, so
+// the response densities CPHF produces must come out right too.
+TEST(Contracted, RiJKVsDecontractRecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+
+  // an auxiliary basis on the same centres, deliberately contracted differently
+  intti::ContractedShell<double> as0;
+  as0.center[0] = as0.center[1] = as0.center[2] = 0;
+  as0.l = 0;
+  as0.alpha = {8.0, 2.0, 0.6};
+  as0.coeff = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}; // segmented, nctr = 3
+  intti::ContractedShell<double> as1;
+  as1.center[0] = 0; as1.center[1] = 0; as1.center[2] = 1.3;
+  as1.l = 1;
+  as1.alpha = {1.6, 0.5};
+  as1.coeff = {0.8, 0.3};
+  intti::ContractedShell<double> as2;
+  as2.center[0] = 0; as2.center[1] = 0.2; as2.center[2] = 0.5;
+  as2.l = 2;
+  as2.alpha = {1.2};
+  as2.coeff = {1.0};
+  auto ca = intti::make_contracted_basis<double>({as0, as1, as2});
+
+  // The reference decontracts the ORBITAL basis only. Decontracting the
+  // AUXILIARY basis would not be a reference at all: fitting is a projection
+  // onto the auxiliary span, and splitting an auxiliary contraction ENLARGES
+  // that span, so the fitted J/K legitimately change. (Doing it anyway gives
+  // differences of order 4, not of order the tolerance -- which is what first
+  // flagged the mistake.) The orbital side is exact, because the three-centre
+  // integrals are linear in the orbital contraction coefficients.
+  intti::ShellBasis<double> pb;
+  std::vector<double> C;
+  const int npao = decontract(cb, pb, C);
+  // the same decontracted orbitals as a trivially-contracted basis, so the
+  // contracted three-centre builder can be handed a contracted pair; the
+  // coefficient cancels cart_norm_pyscf so each effective coefficient is 1,
+  // matching the unnormalized primitives a ShellBasis carries
+  std::vector<intti::ContractedShell<double>> pshells;
+  for (const auto &sh : pb.shells) {
+    intti::ContractedShell<double> t;
+    t.l = sh.l;
+    for (int k = 0; k < 3; ++k) t.center[k] = sh.center[k];
+    t.alpha = {sh.alpha};
+    t.coeff = {1.0 / intti::cart_norm_pyscf(sh.l, sh.alpha)};
+    pshells.push_back(std::move(t));
+  }
+  auto pbc = intti::make_contracted_basis<double>(std::move(pshells));
+  ASSERT_EQ(pbc.nao, npao);
+
+  const auto cfit = intti::ri_fit(cb, ca, grid, 1e-12);
+  const auto pfit = intti::ri_fit(pbc, ca, grid, 1e-12);
+
+  std::vector<double> Dg(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) Dg[i * n + j] = 0.1 + 0.3 * std::sin(0.7 * i + 1.9 * j * j);
+  auto Ds = sym_density(n);
+  std::vector<double> Da(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) Da[i * n + j] = 0.5 * (Dg[i * n + j] - Dg[j * n + i]);
+
+  const char *tags[3] = {"symmetric", "general", "antisymmetric"};
+  const std::vector<double> *D3[3] = {&Ds, &Dg, &Da};
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  for (int w = 0; w < 3; ++w) {
+    std::vector<double> J(n2, 0.0), K(n2, 0.0);
+    intti::ri_jk(cfit, D3[w]->data(), J.data(), K.data());
+
+    auto Deff = pushdown(C, n, npao, *D3[w]);
+    std::vector<double> Jp(static_cast<std::size_t>(npao) * npao, 0.0),
+        Kp(static_cast<std::size_t>(npao) * npao, 0.0);
+    intti::ri_jk(pfit, Deff.data(), Jp.data(), Kp.data());
+    auto Jref = conjugate(C, n, npao, Jp);
+    auto Kref = conjugate(C, n, npao, Kp);
+
+    double dj = 0, dk = 0, sj = 0, sk = 0;
+    for (std::size_t i = 0; i < n2; ++i) {
+      dj = std::max(dj, std::abs(J[i] - Jref[i]));
+      dk = std::max(dk, std::abs(K[i] - Kref[i]));
+      sj = std::max(sj, std::abs(Jref[i]));
+      sk = std::max(sk, std::abs(Kref[i]));
+    }
+    EXPECT_LT(dj, 1e-10 * std::max(sj, 1.0)) << tags[w] << " RI-J != decontract/recontract";
+    EXPECT_LT(dk, 1e-10 * std::max(sk, 1.0)) << tags[w] << " RI-K != decontract/recontract";
+    EXPECT_GT(sk, 1e-3) << tags[w] << " RI-K trivially zero";
+    if (w == 2)
+      EXPECT_LT(sj, 1e-13) << "RI-J(antisymmetric) should vanish (B^P is symmetric)";
+    else
+      EXPECT_GT(sj, 1e-3) << tags[w] << " RI-J trivially zero";
+  }
+}
+
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum
 // of nctr*ncart(l) over shells.
 TEST(Contracted, SymmetricAndSized) {
@@ -642,6 +745,9 @@ TEST(Contracted, SymmetricAndSized) {
 }
 
 // A small contracted auxiliary basis (s + p, general contraction).
+// s + p + d. The d shell is not decoration: a real Coulomb-fitting set carries
+// angular momentum well above the orbital basis, and l >= 2 is where the
+// Cartesian normalization stops being a single per-shell factor.
 ContractedBasis<double> aux_sp() {
   ContractedShell<double> s;
   s.center[0] = 0; s.center[1] = 0; s.center[2] = 0;
@@ -649,7 +755,10 @@ ContractedBasis<double> aux_sp() {
   ContractedShell<double> p;
   p.center[0] = 0.3; p.center[1] = 0; p.center[2] = 0;
   p.l = 1; p.alpha = {1.8, 0.9}; p.coeff = {0.55, 0.5};
-  return intti::make_contracted_basis<double>({s, p});
+  ContractedShell<double> dd;
+  dd.center[0] = 0.1; dd.center[1] = 0.25; dd.center[2] = 0;
+  dd.l = 2; dd.alpha = {1.5, 0.6}; dd.coeff = {0.7, 0.4};
+  return intti::make_contracted_basis<double>({s, p, dd});
 }
 
 // Contracted 2-center Coulomb (P|Q) == C_aux (primitive (P|Q)) C_aux^T.

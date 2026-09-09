@@ -495,6 +495,70 @@ def df_full_hessian_check(fn_rih, fn_rid, fn_ri, atoms, orb_basis, aux_basis, la
             and np.abs(H_ref).max() > 1e-2)
 
 
+
+def df_contracted_check(fn_ri, atoms, cases, label):
+    """DF-RHF on CONTRACTED bases with a real Coulomb-fitting set.
+
+    ri_fit is templated on the basis types, so contracted RI is the same code
+    with the contraction-aware two- and three-centre builders underneath. The
+    auxiliary basis is where this bites: cc-pVDZ-JKFIT carries angular momentum
+    up to f, well above the orbital basis, and l >= 2 in the AUXILIARY position
+    is what a hand-made sp test basis never reaches.
+    """
+    ri_open, ri_get_jk, ri_close = fn_ri
+    dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+    rng = np.random.default_rng(5)
+    ok = True
+    for ob, ab in cases:
+        mol = gto.M(atom=atoms, basis=ob, unit="Bohr", cart=True, verbose=0)
+        auxmol = df.addons.make_auxmol(mol, ab)
+        nao = mol.nao_nr()
+        atmA = np.asarray(mol._atm, dtype=np.int32, order="C")
+        basA = np.asarray(mol._bas, dtype=np.int32, order="C")
+        envA = np.asarray(mol._env, dtype=np.float64, order="C")
+        atmB = np.asarray(auxmol._atm, dtype=np.int32, order="C")
+        basB = np.asarray(auxmol._bas, dtype=np.int32, order="C")
+        envB = np.asarray(auxmol._env, dtype=np.float64, order="C")
+        handle = ri_open(iptr(atmA), mol.natm, iptr(basA), mol.nbas, dptr(envA),
+                         iptr(atmB), auxmol.natm, iptr(basB), auxmol.nbas, dptr(envB), 1e-12)
+        assert handle, "intti_ri_open failed"
+
+        def ri_jk(mol_, dm, hermi=1, with_j=True, with_k=True, omega=None):
+            dm = np.asarray(dm)
+            squeeze = dm.ndim == 2
+            D = np.ascontiguousarray(dm.reshape(-1, nao, nao))
+            vj = np.zeros_like(D)
+            vk = np.zeros_like(D)
+            rc = ri_get_jk(handle, dptr(vj), dptr(vk), dptr(D), D.shape[0],
+                           int(with_j), int(with_k))
+            assert rc == 0, f"intti_ri_get_jk rc={rc}"
+            return (vj[0] if squeeze else vj), (vk[0] if squeeze else vk)
+
+        ref = scf.RHF(mol).density_fit(auxbasis=ab)
+        ref.conv_tol = 1e-12
+        ref.kernel()
+        g = rng.standard_normal((nao, nao)) * 0.05
+        worst = {}
+        for tag, dm in (("scf", ref.make_rdm1()), ("gen", g), ("anti", g - g.T)):
+            oj, ok_ = ri_jk(mol, dm)
+            rj, rk = ref.get_jk(mol, dm, hermi=0)
+            worst[tag] = max(np.abs(oj - rj).max(), np.abs(ok_ - rk).max())
+            ok = ok and worst[tag] < 1e-9
+        mf = scf.RHF(mol).density_fit(auxbasis=ab)
+        mf.conv_tol = 1e-12
+        mf.get_jk = ri_jk
+        e = mf.kernel()
+        ri_close(handle)
+        nctr = max(int(mol._bas[k, 3]) for k in range(mol.nbas))
+        lmax = max(int(auxmol._bas[k, 1]) for k in range(auxmol.nbas))
+        print(f"    {ob:8s}/{ab:14s} nao={nao:3d} naux={auxmol.nao_nr():3d} "
+              f"nctr={nctr} aux_lmax={lmax}  E {e - ref.e_tot:+.1e}  "
+              + "  ".join(f"{k} {v:.1e}" for k, v in worst.items()))
+        ok = ok and mf.converged and abs(e - ref.e_tot) < 1e-9 and lmax >= 2
+    return ok
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -714,6 +778,14 @@ def main():
         {"O": uncontracted((0, [6.0, 1.8, 0.6]), (1, [2.0, 0.7])),
          "H": uncontracted((0, [2.4, 0.7]))},
         "H2O RI freqs") and ok
+    # contracted RI: standard orbital basis AND a standard Coulomb-fitting set,
+    # which is where the auxiliary angular momentum finally exceeds l = 1
+    print("DF-RHF on contracted bases, intti RI J/K:")
+    ok = df_contracted_check(
+        fn_ri, ATOM,
+        [("sto-3g", "cc-pvdz-jkfit"), ("6-31g", "cc-pvdz-jkfit"),
+         ("cc-pvdz", "cc-pvdz-jkfit")],
+        "contracted RI") and ok
     print("mol.intor calls served by intti:", dict(sorted(served.items())))
     # a patch that never fired would look identical to success
     assert served.get("int1e_ipovlp", 0) > 0, "mol.intor interception never fired"

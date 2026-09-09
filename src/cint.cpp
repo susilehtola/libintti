@@ -508,6 +508,10 @@ extern "C" int intti_ri_deriv_jk(double *vj, double *vk, const double *dm,
 // Densities need not be symmetric: ri_jk contracts K = sum_P B^P D B^P as two
 // GEMMs and assumes nothing about D, so the general and antisymmetric densities
 // that response theory produces are served exactly.
+// defined below, with the contracted J/K facade
+intti::ContractedBasis<double> contracted_basis_from(const int *atm, const int *bas,
+                                                     int nbas, const double *env);
+
 namespace {
 struct RIHandle {
   intti::RIFit<double> fit;
@@ -537,11 +541,38 @@ extern "C" void *intti_ri_open(const int *atm, int natm, const int *bas, int nba
     out = intti::make_basis(shells);
     return 0;
   };
+  auto is_contracted = [](const int *b, int nb) {
+    for (int ish = 0; ish < nb; ++ish) {
+      const int *r = b + static_cast<std::size_t>(ish) * 8;
+      if (r[NPRIM_OF] != 1 || r[NCTR_OF] != 1) return true;
+    }
+    return false;
+  };
+  // Either basis may be contracted independently of the other -- and usually is:
+  // a Coulomb-fitting auxiliary set is far less contracted than the orbital set.
+  // The contracted three-centre builder wants a contracted PAIR, so an
+  // uncontracted partner is wrapped as trivially contracted (one primitive per
+  // shell) rather than duplicating the whole path for the mixed case.
+  const bool cc = is_contracted(bas, nbas) || is_contracted(abas, anbas);
+  auto *h = new RIHandle;
+  if (cc) {
+    const auto co = contracted_basis_from(atm, bas, nbas, env);
+    const auto cav = contracted_basis_from(aatm, abas, anbas, aenv);
+    h->nao = co.nao;
+    h->scale.assign(co.nao, 1.0); // normalization is already in the coefficients
+    h->fit = intti::ri_fit(co, cav, default_grid(), tau_lin);
+    return h;
+  }
   std::vector<double> oscale, ascale;
   intti::ShellBasis<double> orb, aux;
-  if (build(atm, bas, nbas, env, oscale, orb) != 0) return nullptr;
-  if (build(aatm, abas, anbas, aenv, ascale, aux) != 0) return nullptr;
-  auto *h = new RIHandle;
+  if (build(atm, bas, nbas, env, oscale, orb) != 0) {
+    delete h;
+    return nullptr;
+  }
+  if (build(aatm, abas, anbas, aenv, ascale, aux) != 0) {
+    delete h;
+    return nullptr;
+  }
   h->nao = orb.nao;
   h->scale = std::move(oscale);
   h->fit = intti::ri_fit(orb, aux, default_grid(), tau_lin);

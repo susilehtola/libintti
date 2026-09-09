@@ -238,13 +238,25 @@ std::vector<Real> coulomb_2c_dev(const ContractedBasis<Real> &aux, const TGrid<R
           for (int cB = 0; cB < ncv(B); ++cB) {
             const Real w = wa * eff(eov(B) + cB * npv(B) + pb);
             if (w == Real(0)) continue;
+            // The mirror is ONLY for the strictly-lower shell blocks. Within a
+            // DIAGONAL shell block (A == B) the cA/kP and cB/kQ loops already
+            // run over the full block, producing both (I,J) and (J,I)
+            // directly, so mirroring there adds every off-diagonal element
+            // twice. The primitive builder above gets away with mirroring
+            // unconditionally because it ASSIGNS, which is idempotent; this one
+            // must accumulate, to sum over the primitives of a contraction.
+            //
+            // s and p hide the bug: a same-centre two-centre integral vanishes
+            // unless both components have even parity in every direction, so
+            // the only nonzero off-diagonals in a diagonal block first appear
+            // at l = 2, as the (xx|yy)-type trace pairs.
             for (int kP = 0; kP < nP; ++kP)
               for (int kQ = 0; kQ < nQ; ++kQ) {
                 const std::size_t I = aov(A) + static_cast<std::size_t>(cA) * nP + kP;
                 const std::size_t J = aov(B) + static_cast<std::size_t>(cB) * nQ + kQ;
                 const Real v = w * out(base + kP * nQ + kQ);
                 Kokkos::atomic_add(&Md(I * naux + J), v);
-                if (I != J) Kokkos::atomic_add(&Md(J * naux + I), v);
+                if (A != B) Kokkos::atomic_add(&Md(J * naux + I), v);
               }
           }
         }
