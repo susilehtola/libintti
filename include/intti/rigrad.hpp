@@ -785,62 +785,39 @@ RIGrad<Real> ri_j_gradient(const ShellBasis<Real> &orb, const ShellBasis<Real> &
   return g;
 }
 
-/// Geometric Hessian of the RI Coulomb energy E_J, as a (3 ncen) x (3 ncen)
-/// matrix with ncen = (#orbital shells) + (#auxiliary shells), ordered orbital
-/// shells first then auxiliary shells (Cartesian-minor).
+namespace detail {
+
+/// ri_j_hessian's derivative kernel, over PRIMITIVE shells, with the fit
+/// supplied already solved.
 ///
-/// E_J = 1/2 d^T M^{-1} d with gamma = M^{-1} d, so differentiating twice gives
-///   d^2E_J/dxdy = gamma^T d_xy - 1/2 gamma^T M_xy gamma + r_x^T M^{-1} r_y,
-///   r_x = d_x - M_x gamma  ( = M gamma_x ).
-/// This is just the exact second derivative of that expression -- nothing
-/// exotic, and the standard density-fitting gradient/Hessian algebra. Its
-/// structural content is the VARIATIONAL / 2n+1 rule: because gamma is the
-/// stationary point of the fitting functional, the GRADIENT needs no gamma_x at
-/// all, and the HESSIAN needs only gamma_x (through r_x), never gamma_xy.
-/// (Earlier revisions of this comment called it "the envelope form"; that is
-/// loose -- the envelope theorem names the first-order statement, and the
-/// second-order one is the 2n+1 rule, which in fact would allow up to the THIRD
-/// derivative from gamma_x alone.) The caller maps shells to atoms and sums.
+/// Everything the kernel contracts against enters LINEARLY in the orbital and
+/// auxiliary indices, so a contracted basis needs no second kernel: since
+///     sum_IJP D_IJ (IJ|P) g_P = sum_ijp (C^T D C)_ij (Ca^T g)_p (ij|p),
+/// the fit is solved in the CONTRACTED auxiliary space and the density and
+/// gamma are pushed down to the primitive space, after which this kernel runs
+/// unchanged. Each primitive triple's derivative is still evaluated exactly
+/// once -- the contraction is folded into the coefficients, not paid for in
+/// integrals -- so this is the shared-intermediate form, not a
+/// decontract/recontract.
+///
+/// `Ca` (nauxc x naux, row-major) lifts a primitive auxiliary index back to the
+/// contracted one, where M^{-1} lives; empty means the two spaces coincide.
+/// `parent` folds shell centres onto perturbation groups; `gam` is the
+/// pushed-down gamma, in the PRIMITIVE auxiliary space.
 template <class Real>
-std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
-                               const Real *D, const TGrid<Real> &grid,
-                               Real tau_lin = Real(1e-10), int aux_tile_shells = 0) {
+std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
+                                      const ShellBasis<Real> &aux, const Real *D,
+                                      const std::vector<Real> &Ca, int nauxc,
+                                      const std::vector<Real> &Minv,
+                                      const std::vector<Real> &gamma,
+                                      const std::vector<int> &parent, int ngrp,
+                                      const TGrid<Real> &grid) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
-  const int ncen = nso + nsa, dim = 3 * ncen;
-  auto M = coulomb_2c(aux, grid);
-  // one auxiliary tile at a time; the tensor is used once, as d = T^T D
-  const int nsa_t = static_cast<int>(aux.shells.size());
-  if (aux_tile_shells < 1) aux_tile_shells = nsa_t;
+  const int dim = 3 * ngrp;
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
-  const std::size_t N = static_cast<std::size_t>(nao) * nao;
-  // d_P and M^{-1}: d_P = sum_mn (mn|P) D_mn = (T^T D)[P]
-  std::vector<Real> d(naux, Real(0));
-  for (int A0 = 0; A0 < nsa_t; A0 += aux_tile_shells) {
-    const int A1 = std::min(A0 + aux_tile_shells, nsa_t);
-    const int p0 = aux.ao_off[A0], blk_ = aux.ao_off[A1] - p0;
-    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
-    detail::gemm('T', 'N', blk_, 1, static_cast<int>(N), Real(1), Tblk.data(), blk_, D, 1,
-                 Real(0), d.data() + p0, 1);
-  }
-  std::vector<Real> Vv = M, eval(naux);
-  detail::syevd(naux, Vv.data(), eval.data());
-  Real emax = 0;
-  for (Real e : eval) emax = std::max(emax, e);
-  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0)), gamma(naux, Real(0));
-  for (int kk = 0; kk < naux; ++kk) {
-    if (eval[kk] <= tau_lin * emax) continue;
-    const Real inv = Real(1) / eval[kk];
-    Real vd = 0;
-    for (int P = 0; P < naux; ++P) vd += Vv[kk * naux + P] * d[P];
-    for (int P = 0; P < naux; ++P) {
-      gamma[P] += inv * vd * Vv[kk * naux + P];
-      for (int Q = 0; Q < naux; ++Q)
-        Minv[P * naux + Q] += inv * Vv[kk * naux + P] * Vv[kk * naux + Q];
-    }
-  }
-  auto cshell = [&](bool isaux, int s) { return isaux ? nso + s : s; };
+  auto cshell = [&](bool isaux, int s) { return parent[isaux ? nso + s : s]; };
 
   // first-derivative residual tensor r[x][P] = d_x[P] - (M_x gamma)[P]
   std::vector<Real> r(static_cast<std::size_t>(dim) * naux, Real(0));
@@ -889,16 +866,27 @@ std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
           }
         }
     }
-  // s[x] = M^{-1} r[x]: s[x][P] = sum_Q r[x][Q] Minv[P][Q] = (r Minv^T)[x][P]
-  std::vector<Real> s(static_cast<std::size_t>(dim) * naux, Real(0));
-  detail::gemm('N', 'T', dim, naux, naux, Real(1), r.data(), naux, Minv.data(), naux,
-               Real(0), s.data(), naux);
+  // r was accumulated at PRIMITIVE auxiliary indices; M^{-1} lives in the
+  // contracted space, so lift it there first: r_c = r Ca^T. Ca empty means the
+  // two spaces coincide and the lift is the identity.
+  std::vector<Real> rc;
+  if (Ca.empty()) {
+    rc = r;
+  } else {
+    rc.assign(static_cast<std::size_t>(dim) * nauxc, Real(0));
+    detail::gemm('N', 'T', dim, nauxc, naux, Real(1), r.data(), naux, Ca.data(), naux,
+                 Real(0), rc.data(), nauxc);
+  }
+  // s[x] = M^{-1} r_c[x]: s[x][P] = sum_Q r_c[x][Q] Minv[P][Q] = (r_c Minv^T)[x][P]
+  std::vector<Real> s(static_cast<std::size_t>(dim) * nauxc, Real(0));
+  detail::gemm('N', 'T', dim, nauxc, nauxc, Real(1), rc.data(), nauxc, Minv.data(), nauxc,
+               Real(0), s.data(), nauxc);
 
   std::vector<Real> H(static_cast<std::size_t>(dim) * dim, Real(0));
   auto Hadd = [&](int x, int y, Real v) { H[static_cast<std::size_t>(x) * dim + y] += v; };
-  // response term H[x][y] = sum_P r[x][P] s[y][P] = (r s^T)[x][y]
-  detail::gemm('N', 'T', dim, dim, naux, Real(1), r.data(), naux, s.data(), naux, Real(1),
-               H.data(), dim);
+  // response term H[x][y] = sum_P r_c[x][P] s[y][P] = (r_c s^T)[x][y]
+  detail::gemm('N', 'T', dim, dim, nauxc, Real(1), rc.data(), nauxc, s.data(), nauxc,
+               Real(1), H.data(), dim);
   if constexpr (kokkos_scalar_v<Real>) {
     // Device direct terms. The response term r^T M^{-1} r above is dense linear
     // algebra over first derivatives and stays on the host; H already holds it,
@@ -972,6 +960,141 @@ std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
         }
     }
   return H;
+}
+
+/// Solve the RI fit: M^{-1} (with a relative eigenvalue cutoff) and
+/// gamma = M^{-1} d, d_P = sum_mn (mn|P) D_mn. Templated on the basis types so
+/// the contracted builders serve it unchanged.
+/// d_P = sum_mn (mn|P) D_mn. Overloaded rather than templated so the primitive
+/// path keeps its AUXILIARY TILING -- the three-centre tensor is used once here,
+/// so materialising all of it would be a needless nao^2 x naux. The contracted
+/// path has no tiled three-centre builder yet and takes the whole tensor.
+template <class Real>
+void ri_fit_rhs(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux, const Real *D,
+                const TGrid<Real> &grid, int aux_tile_shells, std::vector<Real> &d) {
+  const int naux = aux.nao, nsa = static_cast<int>(aux.shells.size());
+  const std::size_t N = static_cast<std::size_t>(orb.nao) * orb.nao;
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  d.assign(naux, Real(0));
+  for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa);
+    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+    gemm('T', 'N', blk, 1, static_cast<int>(N), Real(1), Tblk.data(), blk, D, 1, Real(0),
+         d.data() + p0, 1);
+  }
+}
+
+template <class Real>
+void ri_fit_rhs(const ContractedBasis<Real> &orb, const ContractedBasis<Real> &aux,
+                const Real *D, const TGrid<Real> &grid, int, std::vector<Real> &d) {
+  const int naux = aux.nao;
+  const std::size_t N = static_cast<std::size_t>(orb.nao) * orb.nao;
+  const auto T = coulomb_3c(orb, aux, grid); // (mn, P) row-major
+  d.assign(naux, Real(0));
+  gemm('T', 'N', naux, 1, static_cast<int>(N), Real(1), T.data(), naux, D, 1, Real(0),
+       d.data(), 1);
+}
+
+template <class Real, class OrbBasis, class AuxBasis>
+void ri_solve_fit(const OrbBasis &orb, const AuxBasis &aux, const Real *D,
+                  const TGrid<Real> &grid, Real tau_lin, int aux_tile_shells,
+                  std::vector<Real> &Minv, std::vector<Real> &gamma) {
+  const int naux = aux.nao;
+  auto M = coulomb_2c(aux, grid);
+  std::vector<Real> d;
+  ri_fit_rhs(orb, aux, D, grid, aux_tile_shells, d);
+  std::vector<Real> Vv = M, eval(naux);
+  detail::syevd(naux, Vv.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  Minv.assign(static_cast<std::size_t>(naux) * naux, Real(0));
+  gamma.assign(naux, Real(0));
+  for (int kk = 0; kk < naux; ++kk) {
+    if (eval[kk] <= tau_lin * emax) continue;
+    const Real inv = Real(1) / eval[kk];
+    Real vd = 0;
+    for (int P = 0; P < naux; ++P) vd += Vv[kk * naux + P] * d[P];
+    for (int P = 0; P < naux; ++P) {
+      gamma[P] += inv * vd * Vv[kk * naux + P];
+      for (int Q = 0; Q < naux; ++Q)
+        Minv[P * naux + Q] += inv * Vv[kk * naux + P] * Vv[kk * naux + Q];
+    }
+  }
+}
+
+} // namespace detail
+
+/// Geometric Hessian of the RI Coulomb energy E_J, as a (3 ncen) x (3 ncen)
+/// matrix with ncen = (#orbital shells) + (#auxiliary shells), ordered orbital
+/// shells first then auxiliary shells (Cartesian-minor).
+///
+/// E_J = 1/2 d^T M^{-1} d with gamma = M^{-1} d, so differentiating twice gives
+///   d^2E_J/dxdy = gamma^T d_xy - 1/2 gamma^T M_xy gamma + r_x^T M^{-1} r_y,
+///   r_x = d_x - M_x gamma  ( = M gamma_x ).
+/// This is just the exact second derivative of that expression -- nothing
+/// exotic, and the standard density-fitting gradient/Hessian algebra. Its
+/// structural content is the VARIATIONAL / 2n+1 rule: because gamma is the
+/// stationary point of the fitting functional, the GRADIENT needs no gamma_x at
+/// all, and the HESSIAN needs only gamma_x (through r_x), never gamma_xy.
+/// (Earlier revisions of this comment called it "the envelope form"; that is
+/// loose -- the envelope theorem names the first-order statement, and the
+/// second-order one is the 2n+1 rule, which in fact would allow up to the THIRD
+/// derivative from gamma_x alone.) The caller maps shells to atoms and sums.
+template <class Real>
+std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                               const Real *D, const TGrid<Real> &grid,
+                               Real tau_lin = Real(1e-10), int aux_tile_shells = 0) {
+  std::vector<Real> Minv, gamma;
+  detail::ri_solve_fit(orb, aux, D, grid, tau_lin, aux_tile_shells, Minv, gamma);
+  const int ncen =
+      static_cast<int>(orb.shells.size()) + static_cast<int>(aux.shells.size());
+  std::vector<int> parent(ncen);
+  for (int i = 0; i < ncen; ++i) parent[i] = i;
+  return detail::ri_j_hessian_kernel(orb, aux, D, {}, aux.nao, Minv, gamma, parent, ncen,
+                                     grid);
+}
+
+/// Same, over generally-contracted orbital and auxiliary bases. The fit is
+/// solved in the CONTRACTED auxiliary space -- which is the physically right
+/// space, since splitting an auxiliary contraction would enlarge the fitting
+/// span -- and the density and gamma are then pushed down to the primitive
+/// space the derivative kernel runs in. Result is indexed by CONTRACTED shell
+/// centre, orbital shells then auxiliary.
+template <class Real>
+std::vector<Real> ri_j_hessian(const ContractedBasis<Real> &orb,
+                               const ContractedBasis<Real> &aux, const Real *D,
+                               const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
+                               int aux_tile_shells = 0) {
+  std::vector<Real> Minv, gamma;
+  detail::ri_solve_fit(orb, aux, D, grid, tau_lin, aux_tile_shells, Minv, gamma);
+  ShellBasis<Real> po, pa;
+  const auto fo = detail::expand_contracted(orb, po);
+  const auto fa = detail::expand_contracted(aux, pa);
+  const auto Co = detail::fanout_matrix(fo, po); // nao_c x nao_p
+  const auto Ca = detail::fanout_matrix(fa, pa); // naux_c x naux_p
+  // D_p = C^T D C and gamma_p = Ca^T gamma
+  const int naoc = orb.nao, naop = po.nao, nauxc = aux.nao, nauxp = pa.nao;
+  std::vector<Real> tmp(static_cast<std::size_t>(naoc) * naop, Real(0));
+  detail::gemm('N', 'N', naoc, naop, naoc, Real(1), D, naoc, Co.data(), naop, Real(0),
+               tmp.data(), naop);
+  std::vector<Real> Dp(static_cast<std::size_t>(naop) * naop, Real(0));
+  detail::gemm('T', 'N', naop, naop, naoc, Real(1), Co.data(), naop, tmp.data(), naop,
+               Real(0), Dp.data(), naop);
+  std::vector<Real> gp(nauxp, Real(0));
+  for (int P = 0; P < nauxc; ++P)
+    for (int p = 0; p < nauxp; ++p)
+      gp[p] += Ca[static_cast<std::size_t>(P) * nauxp + p] * gamma[P];
+  // shell centres: orbital primitives then auxiliary primitives, each folded
+  // onto its parent CONTRACTED shell
+  const int ncen = static_cast<int>(po.shells.size()) + static_cast<int>(pa.shells.size());
+  const int ngrp = fo.nsh + fa.nsh;
+  std::vector<int> parent(ncen);
+  for (int i = 0; i < static_cast<int>(po.shells.size()); ++i) parent[i] = fo.parent[i];
+  for (int i = 0; i < static_cast<int>(pa.shells.size()); ++i)
+    parent[static_cast<int>(po.shells.size()) + i] = fo.nsh + fa.parent[i];
+  return detail::ri_j_hessian_kernel(po, pa, Dp.data(), Ca, nauxc, Minv, gp, parent, ngrp,
+                                     grid);
 }
 
 

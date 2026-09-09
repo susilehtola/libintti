@@ -10,6 +10,7 @@
 #include "intti/deriv.hpp"
 #include "intti/erihess.hpp"
 #include "intti/ri.hpp"
+#include "intti/rigrad.hpp"
 #include "intti/geohess.hpp"
 #include "intti/fock.hpp"
 #include "intti/jk.hpp"
@@ -728,6 +729,82 @@ TEST(Contracted, RiJKVsDecontractRecontract) {
     else
       EXPECT_GT(sj, 1e-3) << tags[w] << " RI-J trivially zero";
   }
+}
+
+// The RI Coulomb HESSIAN over contracted bases. The fit is solved in the
+// contracted auxiliary space and the density and gamma are pushed down to the
+// primitive space the derivative kernel runs in; every primitive triple's
+// derivative is still evaluated once, so this is not a decontract/recontract.
+//
+// Reference: the same kernel with the ORBITAL basis decontracted (wrapped as
+// trivially-contracted shells) and the SAME auxiliary basis, then folded from
+// primitive shells onto their parent contracted shells. As in the RI J/K test,
+// the auxiliary basis must not be decontracted -- that would enlarge the
+// fitting span and legitimately change the answer.
+TEST(Contracted, RiJHessianVsDecontractRecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+
+  intti::ContractedShell<double> as0;
+  as0.center[0] = as0.center[1] = as0.center[2] = 0;
+  as0.l = 0; as0.alpha = {8.0, 2.0}; as0.coeff = {0.7, 0.4};
+  intti::ContractedShell<double> as1;
+  as1.center[0] = 0; as1.center[1] = 0; as1.center[2] = 1.3;
+  as1.l = 1; as1.alpha = {1.6, 0.5}; as1.coeff = {0.8, 0.3};
+  intti::ContractedShell<double> as2;
+  as2.center[0] = 0; as2.center[1] = 0.2; as2.center[2] = 0.5;
+  as2.l = 2; as2.alpha = {1.2}; as2.coeff = {1.0};
+  auto ca = intti::make_contracted_basis<double>({as0, as1, as2});
+  const int ncs = static_cast<int>(cb.shells.size()), nas = static_cast<int>(ca.shells.size());
+
+  auto D = sym_density(n);
+  auto got = intti::ri_j_hessian(cb, ca, D.data(), grid, 1e-12);
+
+  intti::ShellBasis<double> pb;
+  std::vector<double> C;
+  const int npao = decontract(cb, pb, C);
+  std::vector<intti::ContractedShell<double>> pshells;
+  for (const auto &sh : pb.shells) {
+    intti::ContractedShell<double> t;
+    t.l = sh.l;
+    for (int k = 0; k < 3; ++k) t.center[k] = sh.center[k];
+    t.alpha = {sh.alpha};
+    t.coeff = {1.0 / intti::cart_norm_pyscf(sh.l, sh.alpha)};
+    pshells.push_back(std::move(t));
+  }
+  auto pbc = intti::make_contracted_basis<double>(std::move(pshells));
+  auto Deff = pushdown(C, n, npao, D);
+  auto Hp = intti::ri_j_hessian(pbc, ca, Deff.data(), grid, 1e-12);
+
+  // primitive orbital shell -> parent contracted orbital shell; auxiliary
+  // shells are the same in both runs and follow the orbital block
+  std::vector<int> parent;
+  for (int a = 0; a < ncs; ++a)
+    for (int p = 0; p < cb.shells[a].nprim(); ++p) parent.push_back(a);
+  const int nps = static_cast<int>(parent.size());
+  for (int a = 0; a < nas; ++a) parent.push_back(ncs + a);
+  const int dimc = 3 * (ncs + nas), dimp = 3 * (nps + nas);
+  std::vector<double> ref(static_cast<std::size_t>(dimc) * dimc, 0.0);
+  for (int i2 = 0; i2 < nps + nas; ++i2)
+    for (int e = 0; e < 3; ++e)
+      for (int j = 0; j < nps + nas; ++j)
+        for (int f = 0; f < 3; ++f)
+          ref[(3 * parent[i2] + e) * static_cast<std::size_t>(dimc) + 3 * parent[j] + f] +=
+              Hp[(3 * i2 + e) * static_cast<std::size_t>(dimp) + 3 * j + f];
+
+  ASSERT_EQ(got.size(), ref.size());
+  double worst = 0, scale = 0, asym = 0;
+  for (std::size_t i2 = 0; i2 < got.size(); ++i2) {
+    worst = std::max(worst, std::abs(got[i2] - ref[i2]));
+    scale = std::max(scale, std::abs(ref[i2]));
+  }
+  for (int i2 = 0; i2 < dimc; ++i2)
+    for (int j = 0; j < dimc; ++j)
+      asym = std::max(asym, std::abs(got[i2 * dimc + j] - got[j * dimc + i2]));
+  EXPECT_LT(worst, 1e-9 * std::max(scale, 1.0)) << "contracted RI-J Hessian != decontracted";
+  EXPECT_GT(scale, 1e-2) << "RI-J Hessian trivially zero";
+  EXPECT_LT(asym, 1e-9 * (scale + 1)) << "RI-J Hessian must be symmetric";
 }
 
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum

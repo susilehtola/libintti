@@ -587,6 +587,26 @@ ShellFanout<Real> expand_contracted(const ContractedBasis<Real> &cb,
   return f;
 }
 
+/// The fan-out as an explicit (nao_contracted x nao_primitive) matrix, so a
+/// density or a fit vector can be pushed down to the primitive space with a
+/// GEMM: D_p = C^T D C, gamma_p = C^T gamma. Row I is contracted AO I's
+/// expansion over the primitive AOs.
+template <class Real>
+std::vector<Real> fanout_matrix(const ShellFanout<Real> &f, const ShellBasis<Real> &prims) {
+  const int nc = f.nao, np = prims.nao;
+  std::vector<Real> C(static_cast<std::size_t>(nc) * np, Real(0));
+  const int ns = static_cast<int>(prims.shells.size());
+  for (int s = 0; s < ns; ++s) {
+    const int n = ncart(prims.shells[s].l);
+    for (int c = 0; c < f.nctr[s]; ++c) {
+      const Real w = f.w[f.coff[s] + c];
+      for (int k = 0; k < n; ++k)
+        C[static_cast<std::size_t>(f.base[s] + c * n + k) * np + prims.ao_off[s] + k] = w;
+    }
+  }
+  return C;
+}
+
 } // namespace detail
 
 // ---- derivative integrals over a generally-contracted basis -----------------

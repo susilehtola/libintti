@@ -304,6 +304,11 @@ int eval_int2e(double *out, const int *shls, const int *atm, int /*natm*/, const
 
 } // namespace
 
+// defined below, with the contracted J/K facade
+intti::ContractedBasis<double> contracted_basis_from(const int *atm, const int *bas,
+                                                     int nbas, const double *env);
+
+
 extern "C" int intti_int2e_cart(double *out, const int *shls, const int *atm, int natm,
                                  const int *bas, int nbas, const double *env, void * /*opt*/,
                                  double * /*cache*/) {
@@ -357,6 +362,28 @@ extern "C" int intti_ri_hess_jk(double *hj, double *hk, const double *dm,
     out = intti::make_basis(shells);
     return 0;
   };
+  auto has_contraction = [](const int *b, int nb) {
+    for (int ish = 0; ish < nb; ++ish) {
+      const int *r = b + static_cast<std::size_t>(ish) * 8;
+      if (r[NPRIM_OF] != 1 || r[NCTR_OF] != 1) return true;
+    }
+    return false;
+  };
+  const std::size_t dimc = static_cast<std::size_t>(3) * (nbas + anbas);
+  if (has_contraction(bas, nbas) || has_contraction(abas, anbas)) {
+    // The contracted RI-J Hessian: fit in the contracted auxiliary space, then
+    // the primitive derivative kernel on the pushed-down density and gamma.
+    // Result stays indexed by CONTRACTED shell, so the caller's shell -> atom
+    // fold is unchanged. RI-K has no contracted path yet and is refused rather
+    // than answered with the wrong basis.
+    if (hk) return -9;
+    if (!hj || !dm) return -7;
+    const auto co = contracted_basis_from(atm, bas, nbas, env);
+    const auto ca = contracted_basis_from(aatm, abas, anbas, aenv);
+    const auto H = intti::ri_j_hessian(co, ca, dm, default_grid(), tau_lin);
+    for (std::size_t i = 0; i < dimc * dimc; ++i) hj[i] = H[i];
+    return 0;
+  }
   std::vector<double> oscale, ascale;
   intti::ShellBasis<double> orb, aux;
   if (build(atm, bas, nbas, env, oscale, orb) != 0) return -1;
@@ -364,7 +391,7 @@ extern "C" int intti_ri_hess_jk(double *hj, double *hk, const double *dm,
   const int nao = orb.nao;
   if (static_cast<int>(oscale.size()) != nao) return -2;
   if (static_cast<int>(ascale.size()) != aux.nao) return -2;
-  const std::size_t dim = static_cast<std::size_t>(3) * (nbas + anbas);
+  const std::size_t dim = dimc;
   const auto &grid = default_grid();
 
   // The AUXILIARY normalization does not need rescaling on the way out: the
@@ -508,10 +535,6 @@ extern "C" int intti_ri_deriv_jk(double *vj, double *vk, const double *dm,
 // Densities need not be symmetric: ri_jk contracts K = sum_P B^P D B^P as two
 // GEMMs and assumes nothing about D, so the general and antisymmetric densities
 // that response theory produces are served exactly.
-// defined below, with the contracted J/K facade
-intti::ContractedBasis<double> contracted_basis_from(const int *atm, const int *bas,
-                                                     int nbas, const double *env);
-
 namespace {
 struct RIHandle {
   intti::RIFit<double> fit;

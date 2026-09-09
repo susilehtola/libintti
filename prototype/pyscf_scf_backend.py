@@ -617,6 +617,64 @@ def ncentre_check(fn_nc, atoms, cases):
     return ok
 
 
+# a compact auxiliary basis carrying d functions: enough angular momentum to
+# exercise the auxiliary side, without the ill-conditioning of a production
+# fitting set (see ri_fit's note on tau_lin -- cc-pVDZ-JKFIT has condition
+# number 2e10, and a Hessian amplifies that further than J/K does, to ~3e-06)
+MILD_D_AUX = {"O": [[0, [6.0, 1.0]], [0, [1.8, 1.0]], [0, [0.6, 1.0]],
+                    [1, [2.0, 1.0]], [1, [0.7, 1.0]], [2, [1.4, 1.0]]],
+              "H": [[0, [2.4, 1.0]], [0, [0.7, 1.0]], [1, [0.9, 1.0]]]}
+
+
+def df_j_hessian_contracted(fn_rih, atoms, cases):
+    """The RI Coulomb Hessian over contracted bases, vs pyscf.df.hessian.rhf ej.
+
+    The fit is solved in the CONTRACTED auxiliary space -- the physically right
+    space, since splitting an auxiliary contraction would enlarge the fitting
+    span -- and the density and gamma are pushed down to the primitive space the
+    derivative kernel runs in. Every primitive triple's derivative is still
+    evaluated once, so this is not a decontract/recontract.
+    """
+    from pyscf.df.hessian import rhf as dfhess
+    dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+    ok = True
+    for ob, ab in cases:
+        mol = gto.M(atom=atoms, basis=ob, unit="Bohr", cart=True, verbose=0)
+        auxmol = df.addons.make_auxmol(mol, ab)
+        mf = scf.RHF(mol).density_fit(auxbasis=ab)
+        mf.conv_tol = 1e-12
+        mf.kernel()
+        hobj = dfhess.Hessian(mf)
+        hobj.auxbasis_response = 2
+        _, ej, _ = dfhess._partial_hess_ejk(hobj)
+        ncen = mol.nbas + auxmol.nbas
+        hj = np.zeros((3 * ncen, 3 * ncen))
+        atmA = np.asarray(mol._atm, dtype=np.int32, order="C")
+        basA = np.asarray(mol._bas, dtype=np.int32, order="C")
+        envA = np.asarray(mol._env, dtype=np.float64, order="C")
+        atmB = np.asarray(auxmol._atm, dtype=np.int32, order="C")
+        basB = np.asarray(auxmol._bas, dtype=np.int32, order="C")
+        envB = np.asarray(auxmol._env, dtype=np.float64, order="C")
+        dm0 = np.ascontiguousarray(mf.make_rdm1())
+        rc = fn_rih(dptr(hj), None, dptr(dm0), None, 0,
+                    iptr(atmA), mol.natm, iptr(basA), mol.nbas, dptr(envA),
+                    iptr(atmB), auxmol.natm, iptr(basB), auxmol.nbas, dptr(envB), 1e-12)
+        assert rc == 0, f"intti_ri_hess_jk rc={rc}"
+        sh = np.concatenate([basA[:, 0], basB[:, 0]])
+        out = np.zeros((mol.natm, mol.natm, 3, 3))
+        for p in range(ncen):
+            for q in range(ncen):
+                out[sh[p], sh[q]] += hj[3 * p:3 * p + 3, 3 * q:3 * q + 3]
+        dj = np.abs(out - ej).max()
+        nctr = max(int(mol._bas[k, 3]) for k in range(mol.nbas))
+        la = max(int(auxmol._bas[k, 1]) for k in range(auxmol.nbas))
+        print(f"    {ob:8s}(nctr{nctr}) nao={mol.nao_nr():3d} naux={auxmol.nao_nr():3d} "
+              f"aux_l{la}  ej {dj:.2e} (|{np.abs(ej).max():.2e}|)")
+        ok = ok and dj < 1e-9 and np.abs(ej).max() > 1e-2 and la >= 2
+    return ok
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -828,6 +886,13 @@ def main():
         {"N": uncontracted((0, [7.0, 2.0]), (1, [1.6]), (2, [1.1])),
          "H": uncontracted((0, [2.2, 0.6]), (1, [0.8]))},
         "NH3 d-aux") and ok
+    # the RI-J Hessian over CONTRACTED bases. Only ej: the RI exchange
+    # derivative kernels have no contracted path yet and the facade refuses
+    # rather than answering on the wrong basis.
+    print("contracted RI-J Hessian vs pyscf.df.hessian.rhf:")
+    ok = df_j_hessian_contracted(
+        fn_rih, ATOM,
+        [("sto-3g", MILD_D_AUX), ("6-31g", MILD_D_AUX), ("cc-pvdz", MILD_D_AUX)]) and ok
     # ...and the whole DF Hessian driven on those derivative integrals
     print("DF Hessian on intti RI derivative integrals:")
     ok = df_full_hessian_check(
