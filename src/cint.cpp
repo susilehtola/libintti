@@ -557,11 +557,47 @@ extern "C" int intti_get_jk_ip1(double *vj, double *vk, const double *dm, const 
 // that need CPHF are PySCF's business and are added by hess_elec on top. The
 // nuclear repulsion Hessian is likewise PySCF's (hess_nuc) and is NOT included.
 //
-// Same restrictions as intti_get_jk: uncontracted Cartesian basis.
+// Cartesian basis only; generally-contracted shells are served natively.
 extern "C" int intti_hess_skeleton(double *hess, const double *dm, const double *W,
                                    const int *atm, int natm, const int *bas, int nbas,
                                    const double *env, double tau) {
   ensure_kokkos();
+  // The output is indexed by SHELL centre, and for a contracted basis that must
+  // stay the CONTRACTED shell -- moving a contracted shell's centre moves all
+  // its primitives together, and the caller folds shells onto atoms with
+  // bas[:,ATOM_OF]. The library's contracted builders keep that indexing.
+  bool contracted = false;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const int *b = bas + static_cast<std::size_t>(ish) * 8;
+    if (b[NPRIM_OF] != 1 || b[NCTR_OF] != 1) contracted = true;
+  }
+  if (contracted) {
+    const auto cbasis = contracted_basis_from(atm, bas, nbas, env);
+    std::vector<intti::PointCharge<double>> cch;
+    std::vector<int> cch_shell;
+    for (int a = 0; a < natm; ++a) {
+      const int *ai = atm + static_cast<std::size_t>(a) * 6;
+      const double *c = env + ai[PTR_COORD];
+      const double Z = static_cast<double>(ai[CHARGE_OF]);
+      if (Z == 0.0) continue;
+      int home = -1;
+      for (int ish = 0; ish < nbas && home < 0; ++ish)
+        if (bas[static_cast<std::size_t>(ish) * 8 + ATOM_OF] == a) home = ish;
+      if (home < 0) return -3; // a charge with no basis shell on it
+      cch.push_back(intti::PointCharge<double>{-Z, {c[0], c[1], c[2]}});
+      cch_shell.push_back(home);
+    }
+    const auto &cgrid = default_grid();
+    const auto cHs = intti::overlap_hessian(cbasis, W);
+    const auto cHk = intti::kinetic_hessian(cbasis, dm);
+    const auto cHv =
+        intti::nuclear_attraction_hessian(cbasis, cch, cgrid, cch_shell, dm);
+    const auto cH2 = intti::two_electron_hessian(cbasis, dm, cgrid, tau);
+    const std::size_t cd = static_cast<std::size_t>(3) * nbas;
+    for (std::size_t i = 0; i < cd * cd; ++i)
+      hess[i] = cHk[i] + cHv[i] - cHs[i] + cH2[i];
+    return 0;
+  }
   std::vector<intti::PrimitiveShell<double>> shells;
   std::vector<double> scale;
   std::vector<int> shell_atom;
@@ -625,6 +661,25 @@ extern "C" int intti_ip1_h1_jk(double *vj1, double *vj2, double *vk1, double *vk
                                int natm, const int *bas, int nbas, const double *env,
                                double tau) {
   ensure_kokkos();
+  // Contracted basis: the same digest fan-out as intti_get_jk_ip1. [shl0, shl1)
+  // stays a CONTRACTED shell range (PySCF's aoslice_by_atom), translated inside.
+  bool contracted = false;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const int *b = bas + static_cast<std::size_t>(ish) * 8;
+    if (b[NPRIM_OF] != 1 || b[NCTR_OF] != 1) contracted = true;
+  }
+  if (contracted) {
+    const auto cbasis = contracted_basis_from(atm, bas, nbas, env);
+    const std::size_t cN = static_cast<std::size_t>(cbasis.nao) * cbasis.nao;
+    const auto cr =
+        intti::ip1_h1_contractions(cbasis, dm, shl0, shl1, default_grid(), tau);
+    double *couts[4] = {vj1, vj2, vk1, vk2};
+    const std::vector<double> *csrcs[4] = {&cr.vj1, &cr.vj2, &cr.vk1, &cr.vk2};
+    for (int w = 0; w < 4; ++w)
+      if (couts[w])
+        for (std::size_t o = 0; o < 3 * cN; ++o) couts[w][o] = (*csrcs[w])[o];
+    return 0;
+  }
   std::vector<intti::PrimitiveShell<double>> shells;
   std::vector<double> scale;
   for (int ish = 0; ish < nbas; ++ish) {

@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "contracted.hpp"
 #include "fock.hpp"
 #include "gto.hpp"
 #include "hermite1d.hpp"
@@ -102,6 +103,128 @@ std::vector<Real> overlap_1d_deriv(Real alpha, Real A, Real beta, Real B, int la
   return apply_shifts(std::move(s), la + na, lb + nb, na, nb, alpha, beta);
 }
 
+/// Per-primitive-pair geometric-derivative blocks, out[ka*ncb+kb]. Single
+/// source of truth for the shift algebra: the primitive builders below loop
+/// them over shell pairs, and the contraction-aware builders drive the same
+/// blocks over PRIMITIVE pairs through contracted_1e_multi, so a
+/// generally-contracted geometric derivative evaluates each primitive-pair
+/// block exactly once. Each block OVERWRITES its output.
+
+template <class Real>
+void overlap_geoderiv_block(const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb,
+                            const std::array<int, 3> &na, const std::array<int, 3> &nb,
+                            Real *out) {
+  const int la = sa.l, lb = sb.l, lb1 = lb + 1, ncb = ncart(lb);
+  std::vector<Real> f[3];
+  for (int d = 0; d < 3; ++d)
+    f[d] = overlap_1d_deriv(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb, na[d],
+                            nb[d]);
+  for (int ka = 0; ka < ncart(la); ++ka) {
+    int a3[3];
+    cart_comp(la, ka, a3[0], a3[1], a3[2]);
+    for (int kb = 0; kb < ncb; ++kb) {
+      int b3[3];
+      cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+      out[static_cast<std::size_t>(ka) * ncb + kb] = f[0][a3[0] * lb1 + b3[0]] *
+                                                     f[1][a3[1] * lb1 + b3[1]] *
+                                                     f[2][a3[2] * lb1 + b3[2]];
+    }
+  }
+}
+
+template <class Real>
+void kinetic_geoderiv_block(const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb,
+                            const std::array<int, 3> &na, const std::array<int, 3> &nb,
+                            Real *out) {
+  const int la = sa.l, lb = sb.l, lb1 = lb + 1, ncb = ncart(lb);
+  std::vector<Real> Sf[3], Tf[3]; // shifted 1D overlap and kinetic factors
+  for (int d = 0; d < 3; ++d) {
+    std::vector<Real> s2, sS;
+    int lbx2, lbxS;
+    // overlap for the kinetic recursion (ket +2) and for the S factors
+    overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb, na[d], nb[d] + 2, s2,
+               lbx2);
+    overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb, na[d], nb[d], sS,
+               lbxS);
+    std::vector<Real> t1;
+    kinetic_1d(s2, lbx2, la + na[d], lb + nb[d], sb.alpha, t1);
+    Sf[d] = apply_shifts(std::move(sS), la + na[d], lb + nb[d], na[d], nb[d], sa.alpha,
+                         sb.alpha);
+    Tf[d] = apply_shifts(std::move(t1), la + na[d], lb + nb[d], na[d], nb[d], sa.alpha,
+                         sb.alpha);
+  }
+  for (int ka = 0; ka < ncart(la); ++ka) {
+    int a3[3];
+    cart_comp(la, ka, a3[0], a3[1], a3[2]);
+    for (int kb = 0; kb < ncb; ++kb) {
+      int b3[3];
+      cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+      auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
+      auto T = [&](int d) { return Tf[d][a3[d] * lb1 + b3[d]]; };
+      out[static_cast<std::size_t>(ka) * ncb + kb] =
+          T(0) * S(1) * S(2) + S(0) * T(1) * S(2) + S(0) * S(1) * T(2);
+    }
+  }
+}
+
+template <class Real>
+void nuclear_geoderiv_block(const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb,
+                            const std::vector<PointCharge<Real>> &charges,
+                            const TGrid<Real> &grid, const std::array<int, 3> &na,
+                            const std::array<int, 3> &nb, Real *out) {
+  const Real pi = pi_v<Real>();
+  const int la = sa.l, lb = sb.l, lb1 = lb + 1;
+  const int nca = ncart(la), ncb = ncart(lb);
+  for (std::size_t i = 0; i < static_cast<std::size_t>(nca) * ncb; ++i) out[i] = Real(0);
+  const int lae[3] = {la + na[0], la + na[1], la + na[2]};
+  const int lbe[3] = {lb + nb[0], lb + nb[1], lb + nb[2]};
+  const Real p = sa.alpha + sb.alpha, mu = sa.alpha * sb.alpha / p;
+  Real Pd[3];
+  std::vector<Real> E[3];
+  for (int d = 0; d < 3; ++d) {
+    Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
+    const Real ab = sa.center[d] - sb.center[d];
+    E[d].assign(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1) * (lae[d] + lbe[d] + 1),
+                Real(0));
+    e_coeffs(lae[d], lbe[d], p, Pd[d] - sa.center[d], Pd[d] - sb.center[d],
+             exp_(-mu * ab * ab), E[d].data());
+  }
+  std::vector<Real> Bv(la + lb + std::max({na[0], na[1], na[2], nb[0], nb[1], nb[2]}) * 2 + 1);
+  const int nt = grid.n();
+  for (const auto &c : charges)
+    for (int it = 0; it < nt; ++it) {
+      const Real t = grid.t[it], denom = p + t * t;
+      const Real theta = p * t * t / denom, pref = sqrt_(pi / denom);
+      const Real wt = grid.w[it] * c.weight;
+      // per direction: build g_d table then apply the derivative shifts
+      std::vector<Real> gsh[3];
+      for (int d = 0; d < 3; ++d) {
+        const int L = lae[d] + lbe[d];
+        hermite_b(L, theta, Pd[d] - c.R[d], Bv.data());
+        std::vector<Real> g(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1));
+        for (int i = 0; i <= lae[d]; ++i)
+          for (int j = 0; j <= lbe[d]; ++j) {
+            Real acc = 0;
+            for (int tau = 0; tau <= i + j; ++tau)
+              acc += E[d][(i * (lbe[d] + 1) + j) * (L + 1) + tau] * Bv[tau];
+            g[i * (lbe[d] + 1) + j] = pref * acc;
+          }
+        gsh[d] = apply_shifts(std::move(g), lae[d], lbe[d], na[d], nb[d], sa.alpha, sb.alpha);
+      }
+      for (int ka = 0; ka < nca; ++ka) {
+        int a3[3];
+        cart_comp(la, ka, a3[0], a3[1], a3[2]);
+        for (int kb = 0; kb < ncb; ++kb) {
+          int b3[3];
+          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+          out[static_cast<std::size_t>(ka) * ncb + kb] +=
+              wt * gsh[0][a3[0] * lb1 + b3[0]] * gsh[1][a3[1] * lb1 + b3[1]] *
+              gsh[2][a3[2] * lb1 + b3[2]];
+        }
+      }
+    }
+}
+
 } // namespace detail
 
 /// Geometric derivative of the overlap matrix: d^na_A d^nb_B S, where
@@ -115,25 +238,17 @@ std::vector<Real> overlap_geoderiv(const ShellBasis<Real> &basis,
   const int nao = basis.nao;
   std::vector<Real> G(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
+  std::vector<Real> blk;
   for (int a = 0; a < ns; ++a)
     for (int b = 0; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
-      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
-      std::vector<Real> f[3];
-      for (int d = 0; d < 3; ++d)
-        f[d] = detail::overlap_1d_deriv(sa.alpha, sa.center[d], sb.alpha, sb.center[d],
-                                        la, lb, na[d], nb[d]);
-      for (int ka = 0; ka < ncart(la); ++ka) {
-        int a3[3];
-        cart_comp(la, ka, a3[0], a3[1], a3[2]);
-        for (int kb = 0; kb < ncart(lb); ++kb) {
-          int b3[3];
-          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+      const int ncb = ncart(sb.l);
+      blk.assign(static_cast<std::size_t>(ncart(sa.l)) * ncb, Real(0));
+      detail::overlap_geoderiv_block(sa, sb, na, nb, blk.data());
+      for (int ka = 0; ka < ncart(sa.l); ++ka)
+        for (int kb = 0; kb < ncb; ++kb)
           G[(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
-              f[0][a3[0] * lb1 + b3[0]] * f[1][a3[1] * lb1 + b3[1]] *
-              f[2][a3[2] * lb1 + b3[2]];
-        }
-      }
+              blk[static_cast<std::size_t>(ka) * ncb + kb];
     }
   return G;
 }
@@ -148,38 +263,17 @@ std::vector<Real> kinetic_geoderiv(const ShellBasis<Real> &basis,
   const int nao = basis.nao;
   std::vector<Real> G(static_cast<std::size_t>(nao) * nao, Real(0));
   const int ns = static_cast<int>(basis.shells.size());
+  std::vector<Real> blk;
   for (int a = 0; a < ns; ++a)
     for (int b = 0; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
-      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
-      std::vector<Real> Sf[3], Tf[3]; // shifted 1D overlap and kinetic factors
-      for (int d = 0; d < 3; ++d) {
-        std::vector<Real> s2, sS;
-        int lbx2, lbxS;
-        // overlap for the kinetic recursion (ket +2) and for the S factors
-        detail::overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb,
-                           na[d], nb[d] + 2, s2, lbx2);
-        detail::overlap_1d(sa.alpha, sa.center[d], sb.alpha, sb.center[d], la, lb,
-                           na[d], nb[d], sS, lbxS);
-        std::vector<Real> t1;
-        detail::kinetic_1d(s2, lbx2, la + na[d], lb + nb[d], sb.alpha, t1);
-        Sf[d] = detail::apply_shifts(std::move(sS), la + na[d], lb + nb[d], na[d],
-                                     nb[d], sa.alpha, sb.alpha);
-        Tf[d] = detail::apply_shifts(std::move(t1), la + na[d], lb + nb[d], na[d],
-                                     nb[d], sa.alpha, sb.alpha);
-      }
-      for (int ka = 0; ka < ncart(la); ++ka) {
-        int a3[3];
-        cart_comp(la, ka, a3[0], a3[1], a3[2]);
-        for (int kb = 0; kb < ncart(lb); ++kb) {
-          int b3[3];
-          cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-          auto S = [&](int d) { return Sf[d][a3[d] * lb1 + b3[d]]; };
-          auto T = [&](int d) { return Tf[d][a3[d] * lb1 + b3[d]]; };
+      const int ncb = ncart(sb.l);
+      blk.assign(static_cast<std::size_t>(ncart(sa.l)) * ncb, Real(0));
+      detail::kinetic_geoderiv_block(sa, sb, na, nb, blk.data());
+      for (int ka = 0; ka < ncart(sa.l); ++ka)
+        for (int kb = 0; kb < ncb; ++kb)
           G[(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
-              T(0) * S(1) * S(2) + S(0) * T(1) * S(2) + S(0) * S(1) * T(2);
-        }
-      }
+              blk[static_cast<std::size_t>(ka) * ncb + kb];
     }
   return G;
 }
@@ -198,64 +292,17 @@ std::vector<Real> nuclear_geoderiv(const ShellBasis<Real> &basis,
   std::vector<Real> G(static_cast<std::size_t>(nao) * nao, Real(0));
   const Real pi = pi_v<Real>();
   const int ns = static_cast<int>(basis.shells.size());
-  const int nt = grid.n();
+  std::vector<Real> blk;
   for (int a = 0; a < ns; ++a)
     for (int b = 0; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
-      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
-      const int lae[3] = {la + na[0], la + na[1], la + na[2]};
-      const int lbe[3] = {lb + nb[0], lb + nb[1], lb + nb[2]};
-      const Real p = sa.alpha + sb.alpha, mu = sa.alpha * sb.alpha / p;
-      Real Pd[3];
-      std::vector<Real> E[3];
-      for (int d = 0; d < 3; ++d) {
-        Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
-        const Real ab = sa.center[d] - sb.center[d];
-        E[d].assign(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1) * (lae[d] + lbe[d] + 1),
-                    Real(0));
-        e_coeffs(lae[d], lbe[d], p, Pd[d] - sa.center[d], Pd[d] - sb.center[d],
-                 exp_(-mu * ab * ab), E[d].data());
-      }
-      const int nca = ncart(la), ncb = ncart(lb);
-      std::vector<Real> acc(static_cast<std::size_t>(nca) * ncb, Real(0));
-      std::vector<Real> Bv(la + lb + std::max({na[0], na[1], na[2], nb[0], nb[1], nb[2]}) * 2 + 1);
-      for (const auto &c : charges)
-        for (int it = 0; it < nt; ++it) {
-          const Real t = grid.t[it], denom = p + t * t;
-          const Real theta = p * t * t / denom, pref = sqrt_(pi / denom);
-          const Real wt = grid.w[it] * c.weight;
-          // per direction: build g_d table then apply the derivative shifts
-          std::vector<Real> gsh[3];
-          for (int d = 0; d < 3; ++d) {
-            const int L = lae[d] + lbe[d];
-            hermite_b(L, theta, Pd[d] - c.R[d], Bv.data());
-            std::vector<Real> g(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1));
-            for (int i = 0; i <= lae[d]; ++i)
-              for (int j = 0; j <= lbe[d]; ++j) {
-                Real s = 0;
-                for (int tau = 0; tau <= i + j; ++tau)
-                  s += E[d][(i * (lbe[d] + 1) + j) * (L + 1) + tau] * Bv[tau];
-                g[i * (lbe[d] + 1) + j] = pref * s;
-              }
-            gsh[d] = detail::apply_shifts(std::move(g), lae[d], lbe[d], na[d], nb[d],
-                                          sa.alpha, sb.alpha);
-          }
-          for (int ka = 0; ka < nca; ++ka) {
-            int a3[3];
-            cart_comp(la, ka, a3[0], a3[1], a3[2]);
-            for (int kb = 0; kb < ncb; ++kb) {
-              int b3[3];
-              cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-              acc[ka * ncb + kb] += wt * gsh[0][a3[0] * lb1 + b3[0]] *
-                                    gsh[1][a3[1] * lb1 + b3[1]] *
-                                    gsh[2][a3[2] * lb1 + b3[2]];
-            }
-          }
-        }
-      for (int ka = 0; ka < nca; ++ka)
+      const int ncb = ncart(sb.l);
+      blk.assign(static_cast<std::size_t>(ncart(sa.l)) * ncb, Real(0));
+      detail::nuclear_geoderiv_block(sa, sb, charges, grid, na, nb, blk.data());
+      for (int ka = 0; ka < ncart(sa.l); ++ka)
         for (int kb = 0; kb < ncb; ++kb)
           G[(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
-              acc[ka * ncb + kb];
+              blk[static_cast<std::size_t>(ka) * ncb + kb];
     }
   return G;
 }
@@ -269,6 +316,95 @@ namespace detail {
 /// extract each derivative with a cheap sub-table + apply_shifts. Returns one
 /// nao x nao matrix per (na,nb) request, in request order. Equivalent to
 /// calling nuclear_geoderiv once per request but ~(#requests)x cheaper.
+/// nuclear_geoderiv_multi for ONE primitive pair, component-major
+/// out[r*nca*ncb + ka*ncb + kb]. mna/mnb are the per-direction maximum bra/ket
+/// elevations across the requests (the caller computes them once).
+template <class Real>
+void nuclear_geoderiv_multi_block(
+    const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb,
+    const std::vector<PointCharge<Real>> &charges, const TGrid<Real> &grid,
+    const std::vector<std::pair<std::array<int, 3>, std::array<int, 3>>> &reqs,
+    const int mna[3], const int mnb[3], Real *out) {
+  const Real pi = pi_v<Real>();
+  const int nr = static_cast<int>(reqs.size());
+  const int nt = grid.n();
+  const int la = sa.l, lb = sb.l, lb1 = lb + 1;
+  const int lae[3] = {la + mna[0], la + mna[1], la + mna[2]};
+  const int lbe[3] = {lb + mnb[0], lb + mnb[1], lb + mnb[2]};
+  const Real p = sa.alpha + sb.alpha, mu = sa.alpha * sb.alpha / p;
+  Real Pd[3];
+  std::vector<Real> E[3];
+  int Lmax = 0;
+  for (int d = 0; d < 3; ++d) {
+    Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
+    const Real ab = sa.center[d] - sb.center[d];
+    E[d].assign(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1) * (lae[d] + lbe[d] + 1),
+                Real(0));
+    e_coeffs(lae[d], lbe[d], p, Pd[d] - sa.center[d], Pd[d] - sb.center[d],
+             exp_(-mu * ab * ab), E[d].data());
+    Lmax = std::max(Lmax, lae[d] + lbe[d]);
+  }
+  const int nca = ncart(la), ncb = ncart(lb);
+  const std::size_t pstride = static_cast<std::size_t>(nca) * ncb;
+  for (std::size_t z = 0; z < static_cast<std::size_t>(nr) * pstride; ++z) out[z] = Real(0);
+  std::vector<Real> Bv(Lmax + 1);
+  for (const auto &c : charges)
+    for (int it = 0; it < nt; ++it) {
+      const Real t = grid.t[it], denom = p + t * t;
+      const Real theta = p * t * t / denom, pref = sqrt_(pi / denom);
+      const Real wt = grid.w[it] * c.weight;
+      // g-table at maximum elevation, per direction
+      std::vector<Real> gmax[3];
+      for (int d = 0; d < 3; ++d) {
+        const int L = lae[d] + lbe[d];
+        hermite_b(L, theta, Pd[d] - c.R[d], Bv.data());
+        std::vector<Real> g(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1));
+        for (int i = 0; i <= lae[d]; ++i)
+          for (int j = 0; j <= lbe[d]; ++j) {
+            Real s = 0;
+            for (int tau = 0; tau <= i + j; ++tau)
+              s += E[d][(i * (lbe[d] + 1) + j) * (L + 1) + tau] * Bv[tau];
+            g[i * (lbe[d] + 1) + j] = pref * s;
+          }
+        gmax[d] = std::move(g);
+      }
+      // distinct 1D shifted tables per direction, keyed by (na_d, nb_d);
+      // na_d in [0, mna_d], nb_d in [0, mnb_d]. Computed on demand.
+      std::vector<Real> shift[3][3][3];
+      bool have[3][3][3] = {};
+      auto get_shift = [&](int d, int ia, int jb) -> const std::vector<Real> & {
+        if (!have[d][ia][jb]) {
+          const int laer = la + ia, lber = lb + jb;
+          std::vector<Real> sub(static_cast<std::size_t>(laer + 1) * (lber + 1));
+          for (int i = 0; i <= laer; ++i)
+            for (int j = 0; j <= lber; ++j)
+              sub[i * (lber + 1) + j] = gmax[d][i * (lbe[d] + 1) + j];
+          shift[d][ia][jb] = apply_shifts(std::move(sub), laer, lber, ia, jb, sa.alpha,
+                                          sb.alpha);
+          have[d][ia][jb] = true;
+        }
+        return shift[d][ia][jb];
+      };
+      for (int r = 0; r < nr; ++r) {
+        const auto &na = reqs[r].first, &nb = reqs[r].second;
+        const std::vector<Real> &g0 = get_shift(0, na[0], nb[0]);
+        const std::vector<Real> &g1 = get_shift(1, na[1], nb[1]);
+        const std::vector<Real> &g2 = get_shift(2, na[2], nb[2]);
+        for (int ka = 0; ka < nca; ++ka) {
+          int a3[3];
+          cart_comp(la, ka, a3[0], a3[1], a3[2]);
+          for (int kb = 0; kb < ncb; ++kb) {
+            int b3[3];
+            cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+            out[r * pstride + static_cast<std::size_t>(ka) * ncb + kb] +=
+                wt * g0[a3[0] * lb1 + b3[0]] * g1[a3[1] * lb1 + b3[1]] *
+                g2[a3[2] * lb1 + b3[2]];
+          }
+        }
+      }
+    }
+}
+
 template <class Real>
 std::vector<std::vector<Real>> nuclear_geoderiv_multi(
     const ShellBasis<Real> &basis, const std::vector<PointCharge<Real>> &charges,
@@ -289,91 +425,92 @@ std::vector<std::vector<Real>> nuclear_geoderiv_multi(
       mnb[d] = std::max(mnb[d], r.second[d]);
     }
 
+  std::vector<Real> blk;
   for (int a = 0; a < ns; ++a)
     for (int b = 0; b < ns; ++b) {
       const auto &sa = basis.shells[a], &sb = basis.shells[b];
-      const int la = sa.l, lb = sb.l, lb1 = lb + 1;
-      const int lae[3] = {la + mna[0], la + mna[1], la + mna[2]};
-      const int lbe[3] = {lb + mnb[0], lb + mnb[1], lb + mnb[2]};
-      const Real p = sa.alpha + sb.alpha, mu = sa.alpha * sb.alpha / p;
-      Real Pd[3];
-      std::vector<Real> E[3];
-      int Lmax = 0;
-      for (int d = 0; d < 3; ++d) {
-        Pd[d] = (sa.alpha * sa.center[d] + sb.alpha * sb.center[d]) / p;
-        const Real ab = sa.center[d] - sb.center[d];
-        E[d].assign(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1) * (lae[d] + lbe[d] + 1),
-                    Real(0));
-        e_coeffs(lae[d], lbe[d], p, Pd[d] - sa.center[d], Pd[d] - sb.center[d],
-                 exp_(-mu * ab * ab), E[d].data());
-        Lmax = std::max(Lmax, lae[d] + lbe[d]);
-      }
-      const int nca = ncart(la), ncb = ncart(lb);
-      std::vector<std::vector<Real>> acc(
-          nr, std::vector<Real>(static_cast<std::size_t>(nca) * ncb, Real(0)));
-      std::vector<Real> Bv(Lmax + 1);
-      for (const auto &c : charges)
-        for (int it = 0; it < nt; ++it) {
-          const Real t = grid.t[it], denom = p + t * t;
-          const Real theta = p * t * t / denom, pref = sqrt_(pi / denom);
-          const Real wt = grid.w[it] * c.weight;
-          // g-table at maximum elevation, per direction
-          std::vector<Real> gmax[3];
-          for (int d = 0; d < 3; ++d) {
-            const int L = lae[d] + lbe[d];
-            hermite_b(L, theta, Pd[d] - c.R[d], Bv.data());
-            std::vector<Real> g(static_cast<std::size_t>(lae[d] + 1) * (lbe[d] + 1));
-            for (int i = 0; i <= lae[d]; ++i)
-              for (int j = 0; j <= lbe[d]; ++j) {
-                Real s = 0;
-                for (int tau = 0; tau <= i + j; ++tau)
-                  s += E[d][(i * (lbe[d] + 1) + j) * (L + 1) + tau] * Bv[tau];
-                g[i * (lbe[d] + 1) + j] = pref * s;
-              }
-            gmax[d] = std::move(g);
-          }
-          // distinct 1D shifted tables per direction, keyed by (na_d, nb_d);
-          // na_d in [0, mna_d], nb_d in [0, mnb_d]. Computed on demand.
-          std::vector<Real> shift[3][3][3];
-          bool have[3][3][3] = {};
-          auto get_shift = [&](int d, int ia, int jb) -> const std::vector<Real> & {
-            if (!have[d][ia][jb]) {
-              const int laer = la + ia, lber = lb + jb;
-              std::vector<Real> sub(static_cast<std::size_t>(laer + 1) * (lber + 1));
-              for (int i = 0; i <= laer; ++i)
-                for (int j = 0; j <= lber; ++j)
-                  sub[i * (lber + 1) + j] = gmax[d][i * (lbe[d] + 1) + j];
-              shift[d][ia][jb] = apply_shifts(std::move(sub), laer, lber, ia, jb, sa.alpha,
-                                              sb.alpha);
-              have[d][ia][jb] = true;
-            }
-            return shift[d][ia][jb];
-          };
-          for (int r = 0; r < nr; ++r) {
-            const auto &na = reqs[r].first, &nb = reqs[r].second;
-            const std::vector<Real> &g0 = get_shift(0, na[0], nb[0]);
-            const std::vector<Real> &g1 = get_shift(1, na[1], nb[1]);
-            const std::vector<Real> &g2 = get_shift(2, na[2], nb[2]);
-            for (int ka = 0; ka < nca; ++ka) {
-              int a3[3];
-              cart_comp(la, ka, a3[0], a3[1], a3[2]);
-              for (int kb = 0; kb < ncb; ++kb) {
-                int b3[3];
-                cart_comp(lb, kb, b3[0], b3[1], b3[2]);
-                acc[r][ka * ncb + kb] += wt * g0[a3[0] * lb1 + b3[0]] *
-                                         g1[a3[1] * lb1 + b3[1]] * g2[a3[2] * lb1 + b3[2]];
-              }
-            }
-          }
-        }
+      const int nca = ncart(sa.l), ncb = ncart(sb.l);
+      const std::size_t pstride = static_cast<std::size_t>(nca) * ncb;
+      blk.assign(static_cast<std::size_t>(nr) * pstride, Real(0));
+      nuclear_geoderiv_multi_block(sa, sb, charges, grid, reqs, mna, mnb, blk.data());
       for (int r = 0; r < nr; ++r)
         for (int ka = 0; ka < nca; ++ka)
           for (int kb = 0; kb < ncb; ++kb)
-            G[r][(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] + kb] =
-                acc[r][ka * ncb + kb];
+            G[r][(basis.ao_off[a] + ka) * static_cast<std::size_t>(nao) + basis.ao_off[b] +
+                 kb] = blk[r * pstride + static_cast<std::size_t>(ka) * ncb + kb];
     }
   return G;
 }
+} // namespace detail
+
+// ---- geometric derivatives over a generally-contracted basis ----------------
+// Same blocks, driven by contracted_1e_multi: one primitive-pair evaluation is
+// shared across every contracted-function pair. mirror = 0 because a geometric
+// derivative matrix carries no transpose symmetry in general.
+
+/// d^na_A d^nb_B S over a contracted basis.
+template <class Real>
+std::vector<Real> overlap_geoderiv(const ContractedBasis<Real> &basis,
+                                   const std::array<int, 3> &na,
+                                   const std::array<int, 3> &nb) {
+  auto out = detail::contracted_1e_multi(
+      basis, 1, 0, Real(0),
+      [&](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        detail::overlap_geoderiv_block(sa, sb, na, nb, o);
+      });
+  return std::move(out[0]);
+}
+
+/// d^na_A d^nb_B T over a contracted basis.
+template <class Real>
+std::vector<Real> kinetic_geoderiv(const ContractedBasis<Real> &basis,
+                                   const std::array<int, 3> &na,
+                                   const std::array<int, 3> &nb) {
+  auto out = detail::contracted_1e_multi(
+      basis, 1, 0, Real(0),
+      [&](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        detail::kinetic_geoderiv_block(sa, sb, na, nb, o);
+      });
+  return std::move(out[0]);
+}
+
+/// d^na_A d^nb_B V over a contracted basis.
+template <class Real>
+std::vector<Real> nuclear_geoderiv(const ContractedBasis<Real> &basis,
+                                   const std::vector<PointCharge<Real>> &charges,
+                                   const TGrid<Real> &grid, const std::array<int, 3> &na,
+                                   const std::array<int, 3> &nb) {
+  auto out = detail::contracted_1e_multi(
+      basis, 1, 0, Real(0),
+      [&](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        detail::nuclear_geoderiv_block(sa, sb, charges, grid, na, nb, o);
+      });
+  return std::move(out[0]);
+}
+
+namespace detail {
+
+/// nuclear_geoderiv_multi over a contracted basis: all requests share the
+/// elevated per-node quadrature of a primitive pair, and that pair is evaluated
+/// once per contracted shell pair rather than once per contracted-function pair.
+template <class Real>
+std::vector<std::vector<Real>> nuclear_geoderiv_multi(
+    const ContractedBasis<Real> &basis, const std::vector<PointCharge<Real>> &charges,
+    const TGrid<Real> &grid,
+    const std::vector<std::pair<std::array<int, 3>, std::array<int, 3>>> &reqs) {
+  int mna[3] = {0, 0, 0}, mnb[3] = {0, 0, 0};
+  for (const auto &r : reqs)
+    for (int d = 0; d < 3; ++d) {
+      mna[d] = std::max(mna[d], r.first[d]);
+      mnb[d] = std::max(mnb[d], r.second[d]);
+    }
+  return contracted_1e_multi(
+      basis, static_cast<int>(reqs.size()), 0, Real(0),
+      [&](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        nuclear_geoderiv_multi_block(sa, sb, charges, grid, reqs, mna, mnb, o);
+      });
+}
+
 } // namespace detail
 
 } // namespace intti

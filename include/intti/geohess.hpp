@@ -15,6 +15,14 @@
 // energy-weighted density) and kinetic (weighted by the density) use this;
 // nuclear attraction additionally needs operator-centre derivatives and is
 // handled elsewhere.
+//
+// The assembly is templated on the BASIS type, not written twice: it touches a
+// basis only through nao, ao_off and shells.size(), which ShellBasis and
+// ContractedBasis both provide, and the geometric-derivative callable it is
+// handed already knows which one it is building over. So the contracted
+// molecular Hessian is the same code with a contracted geoderiv plugged in,
+// and the (3 nshell) x (3 nshell) result stays indexed by CONTRACTED shell --
+// which is what the caller folds onto atoms.
 
 #include <array>
 #include <cmath>
@@ -31,9 +39,8 @@ namespace intti {
 namespace detail {
 /// Assemble the (3 ns) x (3 ns) Hessian of sum_mn W_mn M_mn from a geometric-
 /// derivative callable gd(na, nb) -> whole nao x nao matrix d^na_A d^nb_B M.
-template <class Real, class GD>
-std::vector<Real> oneel_hessian_assemble(const ShellBasis<Real> &basis, const Real *W,
-                                         GD &&gd) {
+template <class Real, class Basis, class GD>
+std::vector<Real> oneel_hessian_assemble(const Basis &basis, const Real *W, GD &&gd) {
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao, dim = 3 * ns;
   std::vector<Real> H(static_cast<std::size_t>(dim) * dim, Real(0));
@@ -83,8 +90,8 @@ std::vector<Real> oneel_hessian_assemble(const ShellBasis<Real> &basis, const Re
 
 /// Hessian of sum_mn W_mn S_mn (W typically the energy-weighted density): the
 /// overlap/Pulay contribution to the molecular Hessian, (3 ns) x (3 ns).
-template <class Real>
-std::vector<Real> overlap_hessian(const ShellBasis<Real> &basis, const Real *W) {
+template <class Real, class Basis>
+std::vector<Real> overlap_hessian(const Basis &basis, const Real *W) {
   return detail::oneel_hessian_assemble(
       basis, W, [&](const std::array<int, 3> &na, const std::array<int, 3> &nb) {
         return overlap_geoderiv(basis, na, nb);
@@ -93,8 +100,8 @@ std::vector<Real> overlap_hessian(const ShellBasis<Real> &basis, const Real *W) 
 
 /// Hessian of sum_mn D_mn T_mn: the kinetic contribution to the molecular
 /// Hessian, (3 ns) x (3 ns).
-template <class Real>
-std::vector<Real> kinetic_hessian(const ShellBasis<Real> &basis, const Real *D) {
+template <class Real, class Basis>
+std::vector<Real> kinetic_hessian(const Basis &basis, const Real *D) {
   return detail::oneel_hessian_assemble(
       basis, D, [&](const std::array<int, 3> &na, const std::array<int, 3> &nb) {
         return kinetic_geoderiv(basis, na, nb);
@@ -111,9 +118,9 @@ std::vector<Real> kinetic_hessian(const ShellBasis<Real> &basis, const Real *D) 
 /// charge_shell[c] gives the shell index whose centre coincides with charge c
 /// (the atom carrying the nucleus); differentiating that shell moves the
 /// nucleus too.
-template <class Real>
+template <class Real, class Basis>
 std::vector<Real>
-nuclear_attraction_hessian(const ShellBasis<Real> &basis,
+nuclear_attraction_hessian(const Basis &basis,
                            const std::vector<PointCharge<Real>> &charges,
                            const TGrid<Real> &grid, const std::vector<int> &charge_shell,
                            const Real *D) {

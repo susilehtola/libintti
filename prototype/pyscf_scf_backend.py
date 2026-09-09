@@ -39,6 +39,7 @@ import numpy as np
 from pyscf import gto, scf
 from pyscf.grad import rhf as grad_rhf
 from pyscf.hessian import rhf as hess_rhf
+from pyscf.hessian import thermo
 
 # same molecule and uncontracted basis as tests/test_scf.cpp
 ATOM = [
@@ -394,7 +395,6 @@ def main():
     dH = np.abs(np.asarray(H_ours) - np.asarray(H_ref)).max()
     print(f"full Hessian agreement = {dH:.3e}  (|H| = {np.abs(H_ref).max():.3e})")
 
-    from pyscf.hessian import thermo
     f_ref = thermo.harmonic_analysis(mol, H_ref)["freq_wavenumber"]
     f_our = thermo.harmonic_analysis(mol, np.asarray(H_ours))["freq_wavenumber"]
     print("harmonic frequencies (cm^-1):")
@@ -446,6 +446,39 @@ def main():
             d = np.abs(o - r).max()
             print(f"    {bname:9s} {tag:8s} d {d:.2e}  |ref| {np.abs(r).max():.2e}")
             ok = ok and d < 1e-10 * max(np.abs(r).max(), 1.0)
+        # THE WHOLE PIPELINE on a contracted basis: SCF, gradient, skeleton
+        # Hessian, full Hessian and harmonic frequencies, with every integral
+        # coming from intti (2e via the matrix hooks, 1e via mol.intor
+        # interception). This is the capstone repeated on a real basis set
+        # rather than the uncontracted demonstrator above; cc-pVDZ is generally
+        # contracted (nctr = 2), which is the case that exercises the shared
+        # primitive intermediates rather than mere segmentation.
+        cg_ref = cref.nuc_grad_method().kernel()
+        cH_ref = cref.Hessian().kernel()
+        chobj = cref.Hessian()
+        ch_ref = hess_rhf.partial_hess_elec(chobj)
+        install_intti_intor(make_1e(fn_1e, cmol), cmol)  # after the references
+        ch_our = make_partial_hess(fn_hess, cmol)(chobj)
+        dch = np.abs(np.asarray(ch_our) - np.asarray(ch_ref)).max()
+        cg = cmf.nuc_grad_method()
+        cg.get_jk = make_grad_get_jk(fn_ip1, cmol)
+        cg_our = cg.kernel()
+        dcg = np.abs(np.asarray(cg_our) - np.asarray(cg_ref)).max()
+        ch2 = cmf.Hessian()
+        ch2.partial_hess_elec = make_partial_hess(fn_hess, cmol).__get__(ch2, type(ch2))
+        ch2.make_h1 = make_h1_intti(fn_h1, cmol).__get__(ch2, type(ch2))
+        cH_our = ch2.kernel()
+        dcH = np.abs(np.asarray(cH_our) - np.asarray(cH_ref)).max()
+        cf_ref = thermo.harmonic_analysis(cmol, cH_ref)["freq_wavenumber"]
+        cf_our = thermo.harmonic_analysis(cmol, np.asarray(cH_our))["freq_wavenumber"]
+        dcf = np.abs(np.atleast_1d(cf_our) - np.atleast_1d(cf_ref)).max()
+        print(f"    {bname:9s} gradient {dcg:.2e}  skeleton-H {dch:.2e}  "
+              f"full-H {dcH:.2e}  freq {dcf:.2e} cm^-1")
+        print(f"    {bname:9s} freqs " +
+              " ".join(f"{x:.4f}" for x in np.atleast_1d(cf_our)))
+        # each reference must be non-trivial, or agreement means nothing
+        ok = (ok and dcg < 1e-9 and dch < 1e-9 and dcH < 1e-8 and dcf < 1e-4
+              and np.abs(cg_ref).max() > 1e-3 and np.abs(cH_ref).max() > 1e-2)
     print("mol.intor calls served by intti:", dict(sorted(served.items())))
     # a patch that never fired would look identical to success
     assert served.get("int1e_ipovlp", 0) > 0, "mol.intor interception never fired"

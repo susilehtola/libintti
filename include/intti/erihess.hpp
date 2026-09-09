@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "batch.hpp"   // PairTable, make_batch, eri_quartets
+#include "contracted.hpp" // detail::ShellFanout
 #include "device.hpp"  // detail::to_device / to_host
 #include "erigrad.hpp" // detail::comp_index, detail::eri_block4, pair_schwarz_margin
 #include "fock.hpp"
@@ -50,15 +51,16 @@ namespace detail {
 // same family. tau > 0 applies the host Schwarz(+2 margin)+density screen.
 // l <= LMAX-2.
 template <class Real>
-std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const Real *D,
+std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis,
+                                           const ShellFanout<Real> &fan, const Real *D,
                                            const TGrid<Real> &grid, Real tau) {
   const int ns = static_cast<int>(basis.shells.size());
-  const int nao = basis.nao, dim = 3 * ns;
+  const int nao = fan.nao, dim = 3 * fan.nsh;
   std::vector<int> hL(ns), hOff(ns);
   std::vector<Real> hAl(ns);
   for (int i = 0; i < ns; ++i) {
     hL[i] = basis.shells[i].l;
-    hOff[i] = basis.ao_off[i];
+    hOff[i] = fan.base[i];
     hAl[i] = basis.shells[i].alpha;
   }
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
@@ -72,10 +74,18 @@ std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const 
         ai.l += 2;
         aj.l += 2;
         Q[i * ns + j] = pair_schwarz_margin(ai, aj, grid);
+        // EFFECTIVE density bound: the primitive pair (i,j) enters the energy
+        // weighted by its contraction coefficients, so the bound must carry them.
+        const int nci = ncart(basis.shells[i].l), ncj = ncart(basis.shells[j].l);
         Real m = 0;
-        for (int ki = 0; ki < ncart(basis.shells[i].l); ++ki)
-          for (int kj = 0; kj < ncart(basis.shells[j].l); ++kj)
-            m = std::max(m, std::abs(Dm(basis.ao_off[i] + ki, basis.ao_off[j] + kj)));
+        for (int ci = 0; ci < fan.nctr[i]; ++ci)
+          for (int cj = 0; cj < fan.nctr[j]; ++cj) {
+            const Real wij = std::abs(fan.w[fan.coff[i] + ci] * fan.w[fan.coff[j] + cj]);
+            for (int ki = 0; ki < nci; ++ki)
+              for (int kj = 0; kj < ncj; ++kj)
+                m = std::max(m, wij * std::abs(Dm(fan.base[i] + ci * nci + ki,
+                                                  fan.base[j] + cj * ncj + kj)));
+          }
         Dmax[i * ns + j] = m;
       }
   }
@@ -177,6 +187,9 @@ std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const 
   auto p0v = to_device(jp0, "h2::p0"), p1v = to_device(jp1, "h2::p1");
   auto p2v = to_device(jp2, "h2::p2"), p3v = to_device(jp3, "h2::p3");
   auto dEnt = to_device(cqEnt, "intti::h2::ent"), didx = to_device(idxkey, "intti::h2::idx");
+  auto fnc = to_device(fan.nctr, "h2::nctr"), fco = to_device(fan.coff, "h2::coff");
+  auto fpar = to_device(fan.parent, "h2::parent");
+  auto fw = to_device(fan.w, "h2::w");
   auto offv = batch.out_offset;
   Kokkos::View<Real *> Hd("intti::h2::H", static_cast<std::size_t>(dim) * dim);
   Kokkos::parallel_for(
@@ -228,9 +241,32 @@ std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const 
               cart_comp(L[2], kc, bm[2][0], bm[2][1], bm[2][2]);
               for (int kd = 0; kd < nd; ++kd) {
                 cart_comp(L[3], kd, bm[3][0], bm[3][1], bm[3][2]);
-                const Real coeff =
-                    Real(0.5) * Dmk(off[0] + ka, off[1] + kb) * Dmk(off[2] + kc, off[3] + kd) -
-                    Real(0.25) * Dmk(off[0] + ka, off[2] + kc) * Dmk(off[1] + kb, off[3] + kd);
+                // Contraction fan-out. The Hessian's shell indices and the
+                // derivative value d2 below depend only on the primitive shells,
+                // never on which contracted function of a shell is meant, so the
+                // whole nctr^4 sum collapses into this ONE density prefactor --
+                // computed per Cartesian quartet, not per (e,f) pair. All trip
+                // counts are 1 for a primitive basis.
+                Real coeff = 0;
+                const int nca0 = ncart(L[0]);
+                for (int cA = 0; cA < fnc(mem[0]); ++cA) {
+                  const Real wA = fw(fco(mem[0]) + cA);
+                  const int I = off[0] + cA * nca0 + ka;
+                  for (int cB = 0; cB < fnc(mem[1]); ++cB) {
+                    const Real wAB = wA * fw(fco(mem[1]) + cB);
+                    const int Jj = off[1] + cB * nb + kb;
+                    for (int cC = 0; cC < fnc(mem[2]); ++cC) {
+                      const Real wABC = wAB * fw(fco(mem[2]) + cC);
+                      const int Kk = off[2] + cC * ncc + kc;
+                      for (int cD = 0; cD < fnc(mem[3]); ++cD) {
+                        const Real w = wABC * fw(fco(mem[3]) + cD);
+                        const int Ll = off[3] + cD * nd + kd;
+                        coeff += w * (Real(0.5) * Dmk(I, Jj) * Dmk(Kk, Ll) -
+                                      Real(0.25) * Dmk(I, Kk) * Dmk(Jj, Ll));
+                      }
+                    }
+                  }
+                }
                 if (coeff == Real(0)) continue;
                 auto mset = [&](int p, const int mp[3], int q, const int mq[3], int mm[4][3]) {
                   for (int r = 0; r < 4; ++r)
@@ -294,8 +330,8 @@ std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const 
                         }
                         if (d2 != Real(0))
                           Kokkos::atomic_add(
-                              &Hd((3 * mem[p] + e) * static_cast<std::size_t>(dim) + 3 * mem[q] +
-                                  fdir),
+                              &Hd((3 * fpar(mem[p]) + e) * static_cast<std::size_t>(dim) +
+                                  3 * fpar(mem[q]) + fdir),
                               coeff * d2);
                       }
                   }
@@ -315,16 +351,17 @@ std::vector<Real> two_electron_hessian_dev(const ShellBasis<Real> &basis, const 
 /// nao x nao symmetric AO density (row-major). tau > 0 enables Schwarz +
 /// density screening (tau = 0, the default, is exact).
 template <class Real>
-std::vector<Real> two_electron_hessian(const ShellBasis<Real> &basis, const Real *D,
-                                       const TGrid<Real> &grid, Real tau = Real(0)) {
+std::vector<Real> two_electron_hessian_impl(const ShellBasis<Real> &basis,
+                                            const detail::ShellFanout<Real> &fan,
+                                            const Real *D, const TGrid<Real> &grid, Real tau) {
   if constexpr (kokkos_scalar_v<Real>) {
     bool ok = true;
     for (const auto &s : basis.shells)
       if (s.l > LMAX - 2) ok = false; // second derivative promotes by 2
-    if (ok) return detail::two_electron_hessian_dev(basis, D, grid, tau);
+    if (ok) return detail::two_electron_hessian_dev(basis, fan, D, grid, tau);
   }
   const int ns = static_cast<int>(basis.shells.size());
-  const int nao = basis.nao, dim = 3 * ns;
+  const int nao = fan.nao, dim = 3 * fan.nsh;
   std::vector<Real> H(static_cast<std::size_t>(dim) * dim, Real(0));
   auto Dm = [&](int i, int j) { return D[static_cast<std::size_t>(i) * nao + j]; };
   auto Hadd = [&](int p, int e, int q, int f, Real v) {
@@ -344,10 +381,17 @@ std::vector<Real> two_electron_hessian(const ShellBasis<Real> &basis, const Real
         ai.l += 2;
         aj.l += 2;
         Q[i * ns + j] = detail::pair_schwarz_margin(ai, aj, grid);
+        // effective (contraction-weighted) density bound; see the device path
+        const int nci = ncart(basis.shells[i].l), ncj = ncart(basis.shells[j].l);
         Real m = 0;
-        for (int ki = 0; ki < ncart(basis.shells[i].l); ++ki)
-          for (int kj = 0; kj < ncart(basis.shells[j].l); ++kj)
-            m = std::max(m, std::abs(Dm(basis.ao_off[i] + ki, basis.ao_off[j] + kj)));
+        for (int ci = 0; ci < fan.nctr[i]; ++ci)
+          for (int cj = 0; cj < fan.nctr[j]; ++cj) {
+            const Real wij = std::abs(fan.w[fan.coff[i] + ci] * fan.w[fan.coff[j] + cj]);
+            for (int ki = 0; ki < nci; ++ki)
+              for (int kj = 0; kj < ncj; ++kj)
+                m = std::max(m, wij * std::abs(Dm(fan.base[i] + ci * nci + ki,
+                                                  fan.base[j] + cj * ncj + kj)));
+          }
         Dmax[i * ns + j] = m;
       }
   }
@@ -382,9 +426,29 @@ std::vector<Real> two_electron_hessian(const ShellBasis<Real> &basis, const Real
           cart_comp(L[2], kc, bm[2][0], bm[2][1], bm[2][2]);
           for (int kd = 0; kd < nd; ++kd) {
             cart_comp(L[3], kd, bm[3][0], bm[3][1], bm[3][2]);
-            const Real coeff =
-                Real(0.5) * Dm(off[0] + ka, off[1] + kb) * Dm(off[2] + kc, off[3] + kd) -
-                Real(0.25) * Dm(off[0] + ka, off[2] + kc) * Dm(off[1] + kb, off[3] + kd);
+            // Contraction fan-out; see the device path. The whole nctr^4 sum
+            // collapses into this one density prefactor because neither d2 nor
+            // the Hessian's shell indices depend on the contracted-function index.
+            Real coeff = 0;
+            const int nca0 = ncart(L[0]);
+            for (int cA = 0; cA < fan.nctr[mem[0]]; ++cA) {
+              const Real wA = fan.w[fan.coff[mem[0]] + cA];
+              const int I = off[0] + cA * nca0 + ka;
+              for (int cB = 0; cB < fan.nctr[mem[1]]; ++cB) {
+                const Real wAB = wA * fan.w[fan.coff[mem[1]] + cB];
+                const int Jj = off[1] + cB * nb + kb;
+                for (int cC = 0; cC < fan.nctr[mem[2]]; ++cC) {
+                  const Real wABC = wAB * fan.w[fan.coff[mem[2]] + cC];
+                  const int Kk = off[2] + cC * nc + kc;
+                  for (int cD = 0; cD < fan.nctr[mem[3]]; ++cD) {
+                    const Real w = wABC * fan.w[fan.coff[mem[3]] + cD];
+                    const int Ll = off[3] + cD * nd + kd;
+                    coeff += w * (Real(0.5) * Dm(I, Jj) * Dm(Kk, Ll) -
+                                  Real(0.25) * Dm(I, Kk) * Dm(Jj, Ll));
+                  }
+                }
+              }
+            }
             if (coeff == Real(0)) continue;
 
             auto mset = [&](int p, const int mp[3], int q, const int mq[3], int mm[4][3]) {
@@ -448,7 +512,8 @@ std::vector<Real> two_electron_hessian(const ShellBasis<Real> &basis, const Real
                       mset(p, Pe0, q, Qf0, mm);
                       d2 += Real(mp[e]) * Real(mq[fdir]) * rawval(oo(-1, -1), mm);
                     }
-                    if (d2 != Real(0)) Hadd(mem[p], e, mem[q], fdir, coeff * d2);
+                    if (d2 != Real(0))
+                      Hadd(fan.parent[mem[p]], e, fan.parent[mem[q]], fdir, coeff * d2);
                   }
               }
           }
@@ -512,8 +577,8 @@ std::vector<Real> two_electron_hessian(const ShellBasis<Real> &basis, const Real
             const int Lm[4] = {Lc[pm[0]], Lc[pm[1]], Lc[pm[2]], Lc[pm[3]]};
             const Real alm[4] = {basis.shells[mem[0]].alpha, basis.shells[mem[1]].alpha,
                                  basis.shells[mem[2]].alpha, basis.shells[mem[3]].alpha};
-            const int offm[4] = {basis.ao_off[mem[0]], basis.ao_off[mem[1]],
-                                 basis.ao_off[mem[2]], basis.ao_off[mem[3]]};
+            const int offm[4] = {fan.base[mem[0]], fan.base[mem[1]], fan.base[mem[2]],
+                                 fan.base[mem[3]]};
 
             // member block accessor: permute the canonical block at the permuted
             // offset into member layout, cached per member offset.
@@ -536,6 +601,27 @@ std::vector<Real> two_electron_hessian(const ShellBasis<Real> &basis, const Real
         }
     }
   return H;
+}
+
+/// Two-electron contribution to the molecular Hessian, (3 nshell) x (3 nshell),
+/// contracted with the closed-shell two-particle density built from D.
+template <class Real>
+std::vector<Real> two_electron_hessian(const ShellBasis<Real> &basis, const Real *D,
+                                       const TGrid<Real> &grid, Real tau = Real(0)) {
+  return two_electron_hessian_impl(basis, detail::identity_fanout(basis), D, grid, tau);
+}
+
+/// Same, over a generally-contracted basis. The kernel runs on the expanded
+/// primitive shells; the contraction enters only through the density prefactor
+/// and the primitive-to-contracted shell map, so every primitive quartet's
+/// second derivatives are evaluated once and the result stays indexed by
+/// CONTRACTED shell -- which is what a caller folds onto atoms.
+template <class Real>
+std::vector<Real> two_electron_hessian(const ContractedBasis<Real> &cb, const Real *D,
+                                       const TGrid<Real> &grid, Real tau = Real(0)) {
+  ShellBasis<Real> prims;
+  auto fan = detail::expand_contracted(cb, prims);
+  return two_electron_hessian_impl(prims, fan, D, grid, tau);
 }
 
 } // namespace intti

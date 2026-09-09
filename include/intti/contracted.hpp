@@ -504,6 +504,91 @@ void exchange_build(const ContractedBasis<Real> &basis, const Real *D,
                                          maxDeff, K);
 }
 
+namespace detail {
+
+/// Fan-out from a PRIMITIVE shell to the contracted AOs it feeds.
+///
+/// The two-electron DERIVATIVE kernels are driven over primitive shells, since
+/// the MD shift acts on a primitive (each primitive carries its own alpha,
+/// while the contraction coefficient is a position-independent constant). A
+/// generally-contracted basis is therefore handled by expanding it to its
+/// primitives and letting the DIGEST -- not the integral evaluation -- carry the
+/// contraction: every primitive quartet is evaluated exactly once and scattered,
+/// coefficient-weighted, into all nctr^4 contracted index combinations it feeds.
+/// That keeps the shared-intermediate property of the contracted energy
+/// builders; a decontract/recontract at the matrix level would instead pay
+/// O(nprim^4) integrals and defeat the point of general contraction.
+///
+/// For an already-primitive basis every nctr is 1 and every weight is 1, so the
+/// SAME kernel serves both bases with no second code path and no cost beyond a
+/// unit-trip loop -- which is why this is a fan-out map rather than a separate
+/// contracted kernel.
+///
+/// Contracted AO of primitive shell s, contracted function c, Cartesian k:
+///     base[s] + c*ncart(l) + k,  weight w[coff[s] + c]
+/// Shell-indexed outputs (the geometric Hessian) additionally need
+/// parent[s]: the CONTRACTED shell that primitive shell s belongs to, so a
+/// (3 nshell) x (3 nshell) result stays indexed by contracted shell -- moving a
+/// contracted shell's centre moves all of its primitives together.
+template <class Real> struct ShellFanout {
+  int nao{0}, nsh{0};
+  std::vector<int> nctr, coff, base, parent;
+  std::vector<Real> w;
+};
+
+/// Trivial fan-out for a basis that is already primitive.
+template <class Real> ShellFanout<Real> identity_fanout(const ShellBasis<Real> &b) {
+  ShellFanout<Real> f;
+  const int ns = static_cast<int>(b.shells.size());
+  f.nao = b.nao;
+  f.nsh = ns;
+  f.nctr.assign(ns, 1);
+  f.coff.resize(ns);
+  f.base = b.ao_off;
+  f.parent.resize(ns);
+  f.w.assign(ns, Real(1));
+  for (int i = 0; i < ns; ++i) f.coff[i] = f.parent[i] = i;
+  return f;
+}
+
+/// Expand a contracted basis to primitive shells and build the fan-out that
+/// maps each primitive back onto the contracted AOs, carrying the PySCF
+/// cart=True effective coefficients (basis-set coefficient times the
+/// primitive's cart_norm_pyscf; see contracted.hpp).
+template <class Real>
+ShellFanout<Real> expand_contracted(const ContractedBasis<Real> &cb,
+                                    ShellBasis<Real> &prims) {
+  std::vector<PrimitiveShell<Real>> ps;
+  std::vector<int> cshell, cprim;
+  contracted_primitives(cb, ps, cshell, cprim);
+  prims = make_basis(ps);
+  ShellFanout<Real> f;
+  f.nao = cb.nao;
+  f.nsh = static_cast<int>(cb.shells.size());
+  const int nps = static_cast<int>(ps.size());
+  f.nctr.resize(nps);
+  f.coff.resize(nps);
+  f.base.resize(nps);
+  f.parent = cshell;
+  int tot = 0;
+  for (int i = 0; i < nps; ++i) {
+    const auto &sh = cb.shells[cshell[i]];
+    f.nctr[i] = sh.nctr();
+    f.coff[i] = tot;
+    f.base[i] = cb.ao_off[cshell[i]];
+    tot += f.nctr[i];
+  }
+  f.w.resize(tot);
+  for (int i = 0; i < nps; ++i) {
+    const auto &sh = cb.shells[cshell[i]];
+    for (int c = 0; c < f.nctr[i]; ++c)
+      f.w[f.coff[i] + c] = effective_coeff(sh, c, cprim[i]);
+  }
+  return f;
+}
+
+} // namespace detail
+
 // ---- derivative integrals over a generally-contracted basis -----------------
 // The shift algebra lives once, in deriv.hpp's per-primitive-pair blocks; here
 // it is driven by contracted_1e_multi, so a primitive-pair block is evaluated

@@ -8,6 +8,8 @@
 
 #include "intti/contracted.hpp"
 #include "intti/deriv.hpp"
+#include "intti/erihess.hpp"
+#include "intti/geohess.hpp"
 #include "intti/fock.hpp"
 #include "intti/jk.hpp"
 #include "intti/kernel.hpp"
@@ -504,6 +506,125 @@ TEST(Contracted, DerivJKVsDecontractRecontract) {
       }
     }
   }
+}
+
+// One-electron geometric HESSIANS over a contracted basis. The assembly is the
+// same code as the primitive one (it is templated on the basis type); what is
+// new is the contracted geoderiv it is handed. The result is indexed by
+// CONTRACTED shell, so the reference cannot be a congruence transform of the
+// primitive Hessian -- the primitive basis has more shells. Instead the
+// primitive Hessian is folded from primitive shells onto their parent
+// contracted shells, which is what the physical derivative means: moving a
+// contracted shell's centre moves all of its primitives together.
+TEST(Contracted, OneElectronHessiansVsDecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao, ncs = static_cast<int>(cb.shells.size());
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  // The charges must sit on shell centres: the nuclear Hessian routes the
+  // operator-centre derivative through the shell that carries the nucleus.
+  std::vector<intti::PointCharge<double>> chg = {
+      {-8.0, {cb.shells[0].center[0], cb.shells[0].center[1], cb.shells[0].center[2]}},
+      {-1.0, {cb.shells[1].center[0], cb.shells[1].center[1], cb.shells[1].center[2]}}};
+  intti::ShellBasis<double> pbasis;
+  std::vector<double> C;
+  const int npao = decontract(cb, pbasis, C);
+
+  auto W = sym_density(n);
+  auto Weff = pushdown(C, n, npao, W);
+
+  // primitive shell -> parent contracted shell
+  std::vector<int> parent;
+  for (int a = 0; a < ncs; ++a)
+    for (int p = 0; p < cb.shells[a].nprim(); ++p) parent.push_back(a);
+  const int nps = static_cast<int>(parent.size());
+  ASSERT_EQ(nps, static_cast<int>(pbasis.shells.size()));
+
+  // charge_shell: the shell whose centre carries each charge, in each basis
+  auto home = [](const auto &shells, const auto &c, int nsh) {
+    for (int i = 0; i < nsh; ++i) {
+      double d = 0;
+      for (int k = 0; k < 3; ++k) d += std::abs(shells[i].center[k] - c.R[k]);
+      if (d < 1e-12) return i;
+    }
+    return -1;
+  };
+  std::vector<int> csh_c, csh_p;
+  for (const auto &c : chg) {
+    csh_c.push_back(home(cb.shells, c, ncs));
+    csh_p.push_back(home(pbasis.shells, c, nps));
+    ASSERT_GE(csh_c.back(), 0);
+    ASSERT_GE(csh_p.back(), 0);
+  }
+
+  auto fold = [&](const std::vector<double> &Hp) {
+    std::vector<double> H(static_cast<std::size_t>(3 * ncs) * 3 * ncs, 0.0);
+    for (int i = 0; i < nps; ++i)
+      for (int e = 0; e < 3; ++e)
+        for (int j = 0; j < nps; ++j)
+          for (int f = 0; f < 3; ++f)
+            H[(3 * parent[i] + e) * static_cast<std::size_t>(3 * ncs) + 3 * parent[j] + f] +=
+                Hp[(3 * i + e) * static_cast<std::size_t>(3 * nps) + 3 * j + f];
+    return H;
+  };
+
+  struct Case { const char *name; std::vector<double> got, ref; };
+  std::vector<Case> cases;
+  cases.push_back({"overlap", intti::overlap_hessian(cb, W.data()),
+                   fold(intti::overlap_hessian(pbasis, Weff.data()))});
+  cases.push_back({"kinetic", intti::kinetic_hessian(cb, W.data()),
+                   fold(intti::kinetic_hessian(pbasis, Weff.data()))});
+  cases.push_back({"nuclear",
+                   intti::nuclear_attraction_hessian(cb, chg, grid, csh_c, W.data()),
+                   fold(intti::nuclear_attraction_hessian(pbasis, chg, grid, csh_p,
+                                                          Weff.data()))});
+  for (const auto &c : cases) {
+    ASSERT_EQ(c.got.size(), c.ref.size()) << c.name;
+    double worst = 0, scale = 0;
+    for (std::size_t i = 0; i < c.got.size(); ++i) {
+      worst = std::max(worst, std::abs(c.got[i] - c.ref[i]));
+      scale = std::max(scale, std::abs(c.ref[i]));
+    }
+    EXPECT_LT(worst, 1e-10 * std::max(scale, 1.0)) << c.name << " Hessian != decontracted";
+    EXPECT_GT(scale, 1e-3) << c.name << " Hessian trivially zero";
+  }
+}
+
+// Two-electron geometric Hessian over a contracted basis. Reference: the
+// primitive Hessian folded from primitive shells onto their parent contracted
+// shells (see OneElectronHessiansVsDecontract for why folding, not congruence).
+TEST(Contracted, TwoElectronHessianVsDecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao, ncs = static_cast<int>(cb.shells.size());
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  intti::ShellBasis<double> pbasis;
+  std::vector<double> C;
+  const int npao = decontract(cb, pbasis, C);
+  auto D = sym_density(n);
+  auto Deff = pushdown(C, n, npao, D);
+
+  std::vector<int> parent;
+  for (int a = 0; a < ncs; ++a)
+    for (int p = 0; p < cb.shells[a].nprim(); ++p) parent.push_back(a);
+  const int nps = static_cast<int>(parent.size());
+
+  auto got = intti::two_electron_hessian(cb, D.data(), grid);
+  auto Hp = intti::two_electron_hessian(pbasis, Deff.data(), grid);
+  std::vector<double> ref(static_cast<std::size_t>(3 * ncs) * 3 * ncs, 0.0);
+  for (int i = 0; i < nps; ++i)
+    for (int e = 0; e < 3; ++e)
+      for (int j = 0; j < nps; ++j)
+        for (int f = 0; f < 3; ++f)
+          ref[(3 * parent[i] + e) * static_cast<std::size_t>(3 * ncs) + 3 * parent[j] + f] +=
+              Hp[(3 * i + e) * static_cast<std::size_t>(3 * nps) + 3 * j + f];
+
+  ASSERT_EQ(got.size(), ref.size());
+  double worst = 0, scale = 0;
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    worst = std::max(worst, std::abs(got[i] - ref[i]));
+    scale = std::max(scale, std::abs(ref[i]));
+  }
+  EXPECT_LT(worst, 1e-10 * std::max(scale, 1.0)) << "2e Hessian != decontracted";
+  EXPECT_GT(scale, 1e-3) << "2e Hessian trivially zero";
 }
 
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum

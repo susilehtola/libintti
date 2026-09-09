@@ -430,83 +430,6 @@ JKDerivResult<Real> jk_deriv_build(const ShellBasis<Real> &basis,
   return detail::jk_deriv_general(basis, reqs, grid, tau);
 }
 
-namespace detail {
-
-/// Fan-out from a PRIMITIVE shell to the contracted AOs it feeds.
-///
-/// The two-electron DERIVATIVE kernels are driven over primitive shells, since
-/// the MD shift acts on a primitive (each primitive carries its own alpha,
-/// while the contraction coefficient is a position-independent constant). A
-/// generally-contracted basis is therefore handled by expanding it to its
-/// primitives and letting the DIGEST -- not the integral evaluation -- carry the
-/// contraction: every primitive quartet is evaluated exactly once and scattered,
-/// coefficient-weighted, into all nctr^4 contracted index combinations it feeds.
-/// That keeps the shared-intermediate property of the contracted energy
-/// builders; a decontract/recontract at the matrix level would instead pay
-/// O(nprim^4) integrals and defeat the point of general contraction.
-///
-/// For an already-primitive basis every nctr is 1 and every weight is 1, so the
-/// SAME kernel serves both bases with no second code path and no cost beyond a
-/// unit-trip loop -- which is why this is a fan-out map rather than a separate
-/// contracted kernel.
-///
-/// Contracted AO of primitive shell s, contracted function c, Cartesian k:
-///     base[s] + c*ncart(l) + k,  weight w[coff[s] + c]
-template <class Real> struct ShellFanout {
-  int nao{0};
-  std::vector<int> nctr, coff, base;
-  std::vector<Real> w;
-};
-
-/// Trivial fan-out for a basis that is already primitive.
-template <class Real> ShellFanout<Real> identity_fanout(const ShellBasis<Real> &b) {
-  ShellFanout<Real> f;
-  const int ns = static_cast<int>(b.shells.size());
-  f.nao = b.nao;
-  f.nctr.assign(ns, 1);
-  f.coff.resize(ns);
-  f.base = b.ao_off;
-  f.w.assign(ns, Real(1));
-  for (int i = 0; i < ns; ++i) f.coff[i] = i;
-  return f;
-}
-
-/// Expand a contracted basis to primitive shells and build the fan-out that
-/// maps each primitive back onto the contracted AOs, carrying the PySCF
-/// cart=True effective coefficients (basis-set coefficient times the
-/// primitive's cart_norm_pyscf; see contracted.hpp).
-template <class Real>
-ShellFanout<Real> expand_contracted(const ContractedBasis<Real> &cb,
-                                    ShellBasis<Real> &prims) {
-  std::vector<PrimitiveShell<Real>> ps;
-  std::vector<int> cshell, cprim;
-  contracted_primitives(cb, ps, cshell, cprim);
-  prims = make_basis(ps);
-  ShellFanout<Real> f;
-  f.nao = cb.nao;
-  const int nps = static_cast<int>(ps.size());
-  f.nctr.resize(nps);
-  f.coff.resize(nps);
-  f.base.resize(nps);
-  int tot = 0;
-  for (int i = 0; i < nps; ++i) {
-    const auto &sh = cb.shells[cshell[i]];
-    f.nctr[i] = sh.nctr();
-    f.coff[i] = tot;
-    f.base[i] = cb.ao_off[cshell[i]];
-    tot += f.nctr[i];
-  }
-  f.w.resize(tot);
-  for (int i = 0; i < nps; ++i) {
-    const auto &sh = cb.shells[cshell[i]];
-    for (int c = 0; c < f.nctr[i]; ++c)
-      f.w[f.coff[i] + c] = effective_coeff(sh, c, cprim[i]);
-  }
-  return f;
-}
-
-} // namespace detail
-
 /// Derivative J/K in the BRA-GRADIENT convention: the derivative acts only on
 /// the FIRST AO index, and the result is indexed by Cartesian component and AO
 /// pair rather than folded onto shell centres.
@@ -747,18 +670,23 @@ template <class Real> struct IP1Contractions {
   std::vector<Real> vj1, vj2, vk1, vk2; ///< each 3 x nao x nao
 };
 
+namespace detail {
+
+/// ip1_h1_contractions over primitive shells plus a contracted-AO fan-out.
+/// [shl0, shl1) is a PRIMITIVE shell range here; the contracted entry point
+/// translates the contracted slice into it.
 template <class Real>
-IP1Contractions<Real> ip1_h1_contractions(const ShellBasis<Real> &basis, const Real *D,
-                                          int shl0, int shl1, const TGrid<Real> &grid,
-                                          Real tau = Real(0)) {
+IP1Contractions<Real> ip1_h1_impl(const ShellBasis<Real> &basis, const ShellFanout<Real> &fan,
+                                  const Real *D, int shl0, int shl1, const TGrid<Real> &grid,
+                                  Real tau) {
   const int ns = static_cast<int>(basis.shells.size());
-  const int nao = basis.nao;
+  const int nao = fan.nao;
   const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
   std::vector<int> hL(ns), hOff(ns);
   std::vector<Real> hAl(ns);
   for (int i = 0; i < ns; ++i) {
     hL[i] = basis.shells[i].l;
-    hOff[i] = basis.ao_off[i];
+    hOff[i] = fan.base[i];
     hAl[i] = basis.shells[i].alpha;
   }
   std::vector<ShellPair<Real>> plist;
@@ -813,6 +741,9 @@ IP1Contractions<Real> ip1_h1_contractions(const ShellBasis<Real> &basis, const R
   auto Dd = detail::to_device(D, n2, "intti::ip1::D");
   auto shL = detail::to_device(hL, "ip1::L"), shOff = detail::to_device(hOff, "ip1::off");
   auto shAl = detail::to_device(hAl, "ip1::al");
+  auto fnc = detail::to_device(fan.nctr, "ip1::nctr");
+  auto fco = detail::to_device(fan.coff, "ip1::coff");
+  auto fw = detail::to_device(fan.w, "ip1::w");
   auto dja = detail::to_device(ja, "ip1::a"), djb = detail::to_device(jb, "ip1::b");
   auto djc = detail::to_device(jc, "ip1::c"), djd = detail::to_device(jd, "ip1::d");
   auto dap = detail::to_device(eap, "ip1::ap"), dam = detail::to_device(eam, "ip1::am");
@@ -833,7 +764,6 @@ IP1Contractions<Real> ip1_h1_contractions(const ShellBasis<Real> &basis, const R
           for (int kb = 0; kb < nb; ++kb)
             for (int kc = 0; kc < nc; ++kc)
               for (int kd = 0; kd < nd; ++kd) {
-                const int I = oa + ka, Jj = ob + kb, Kk = oc + kc, L = od + kd;
                 for (int e = 0; e < 3; ++e) {
                   int sg[2], ci[2];
                   Real co[2];
@@ -848,16 +778,33 @@ IP1Contractions<Real> ip1_h1_contractions(const ShellBasis<Real> &basis, const R
                   }
                   const Real dv = -v; // d/dA
                   const std::size_t xo = static_cast<std::size_t>(e) * n2;
-                  const std::size_t iI = static_cast<std::size_t>(I) * nao;
-                  const std::size_t iK = static_cast<std::size_t>(Kk) * nao;
-                  Kokkos::atomic_add(&J1(xo + iK + L),
-                                     dv * Dd(static_cast<std::size_t>(Jj) * nao + I));
-                  Kokkos::atomic_add(&J2(xo + iI + Jj),
-                                     dv * Dd(static_cast<std::size_t>(L) * nao + Kk));
-                  Kokkos::atomic_add(&K1(xo + iK + Jj),
-                                     dv * Dd(static_cast<std::size_t>(L) * nao + I));
-                  Kokkos::atomic_add(&K2(xo + iI + L),
-                                     dv * Dd(static_cast<std::size_t>(Jj) * nao + Kk));
+                  // Contraction fan-out (all trip counts 1 for a primitive basis).
+                  for (int cA = 0; cA < fnc(a); ++cA) {
+                    const Real wa = fw(fco(a) + cA) * dv;
+                    const int I = oa + cA * na + ka;
+                    const std::size_t iI = static_cast<std::size_t>(I) * nao;
+                    for (int cB = 0; cB < fnc(b); ++cB) {
+                      const Real wab = wa * fw(fco(b) + cB);
+                      const int Jj = ob + cB * nb + kb;
+                      for (int cC = 0; cC < fnc(c); ++cC) {
+                        const Real wabc = wab * fw(fco(c) + cC);
+                        const int Kk = oc + cC * nc + kc;
+                        const std::size_t iK = static_cast<std::size_t>(Kk) * nao;
+                        for (int cD = 0; cD < fnc(d); ++cD) {
+                          const Real w = wabc * fw(fco(d) + cD);
+                          const int L = od + cD * nd + kd;
+                          Kokkos::atomic_add(&J1(xo + iK + L),
+                                             w * Dd(static_cast<std::size_t>(Jj) * nao + I));
+                          Kokkos::atomic_add(&J2(xo + iI + Jj),
+                                             w * Dd(static_cast<std::size_t>(L) * nao + Kk));
+                          Kokkos::atomic_add(&K1(xo + iK + Jj),
+                                             w * Dd(static_cast<std::size_t>(L) * nao + I));
+                          Kokkos::atomic_add(&K2(xo + iI + L),
+                                             w * Dd(static_cast<std::size_t>(Jj) * nao + Kk));
+                        }
+                      }
+                    }
+                  }
                 }
               }
         }
@@ -870,6 +817,33 @@ IP1Contractions<Real> ip1_h1_contractions(const ShellBasis<Real> &basis, const R
   r.vk1 = detail::to_host(K1);
   r.vk2 = detail::to_host(K2);
   return r;
+}
+
+} // namespace detail
+
+template <class Real>
+IP1Contractions<Real> ip1_h1_contractions(const ShellBasis<Real> &basis, const Real *D,
+                                          int shl0, int shl1, const TGrid<Real> &grid,
+                                          Real tau = Real(0)) {
+  return detail::ip1_h1_impl(basis, detail::identity_fanout(basis), D, shl0, shl1, grid, tau);
+}
+
+/// Same, over a generally-contracted basis. [shl0, shl1) is a CONTRACTED shell
+/// range -- the atom's shells, as PySCF's aoslice_by_atom gives them -- and is
+/// translated to the corresponding contiguous primitive range, since
+/// contracted_primitives expands in shell order.
+template <class Real>
+IP1Contractions<Real> ip1_h1_contractions(const ContractedBasis<Real> &cb, const Real *D,
+                                          int shl0, int shl1, const TGrid<Real> &grid,
+                                          Real tau = Real(0)) {
+  ShellBasis<Real> prims;
+  auto fan = detail::expand_contracted(cb, prims);
+  int p0 = 0, p1 = 0;
+  for (int i = 0; i < static_cast<int>(cb.shells.size()); ++i) {
+    if (i < shl0) p0 += cb.shells[i].nprim();
+    if (i < shl1) p1 += cb.shells[i].nprim();
+  }
+  return detail::ip1_h1_impl(prims, fan, D, p0, p1, grid, tau);
 }
 
 } // namespace intti
