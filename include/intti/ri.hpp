@@ -37,6 +37,26 @@ template <class Real> struct RIFit {
 
 /// Build the RI fit for an orbital basis against an auxiliary basis.
 /// tau_lin drops metric eigenvalues below tau_lin*max (linear-dependence).
+///
+/// THIS IS THE CACHED PATH, and that is a capability, not a limitation. B is
+/// nao^2 x naux -- 32 GB at nao = 1000, naux = 4000 -- but it is built ONCE and
+/// every subsequent ri_jk costs only GEMMs. The tiled builders (ri_j_tiled,
+/// ri_k_occ_tiled, ri_jk_tiled) bound the memory instead, at the price of
+/// recomputing the three-centre integrals on EVERY call.
+///
+/// Which is right depends on how often the quantity is asked for, not on how
+/// big it is:
+///   * once per geometry (gradients, Hessians): the tiled form is free, because
+///     there is nothing to amortise. The dense RI-K gradient and Hessian were
+///     retired on exactly that ground.
+///   * once per SCF ITERATION (J/K): caching wins outright. Replacing ri_fit +
+///     ri_jk with the tiled builders in the capstone RI-RHF measured
+///     34 ms -> 570 s, because each iteration then pays a full integral pass
+///     instead of a GEMM.
+/// So keep this for iterated builds while B fits, and use the tiled builders
+/// when it does not -- or when the density is naturally factorised, where
+/// ri_k_occ_tiled is cheaper than this on both counts (its cost scales with the
+/// RANK of the density, nocc, rather than with nao).
 template <class Real>
 RIFit<Real> ri_fit(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                    const TGrid<Real> &grid, Real tau_lin = Real(1e-10)) {
