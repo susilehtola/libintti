@@ -24,9 +24,11 @@ gradient and Hessian code runs on intti integrals with no hook at all, and it
 reaches call sites that are not hookable -- hessian.rhf.hess_elec computes
 s1a = -mol.intor('int1e_ipovlp', comp=3) inline.
 
-NOTE the restriction: intti's matrix builders take PRIMITIVE shells, so the
-molecule must use an uncontracted Cartesian basis. intti_get_jk reports a
-violation rather than answering incorrectly.
+Generally contracted basis sets are served natively by the contraction-aware
+builders, at every density symmetry -- including the antisymmetric response
+densities magnetic properties need. The remaining restriction is Cartesian only
+(mol.cart = True); intti_get_jk reports a violation rather than answering
+incorrectly.
 
 usage: pyscf_scf_backend.py <path-to-libintti_cint.so>
 """
@@ -418,6 +420,19 @@ def main():
         print(f"    {bname:9s} nao={cmol.nao_nr():3d} max_nctr={nctr}  "
               f"E {ce:.12f}  diff {ce - ce_ref:+.2e}")
         ok = ok and abs(ce - ce_ref) < 1e-9
+        # Response densities are not symmetric. The contracted J/K route has no
+        # hermiticity restriction, so check it where it matters: a general dm
+        # (hermi=0) and the antisymmetric dm NMR response uses (hermi=2).
+        rng = np.random.default_rng(0)
+        g = rng.standard_normal((cmol.nao_nr(),) * 2) * 0.05
+        cjk = make_get_jk(fn, cmol)
+        for tag, dm, h in (("general", g, 0), ("antisym", g - g.T, 2)):
+            oj, ok_ = cjk(cmol, dm, hermi=h)
+            rj, rk = cref.get_jk(cmol, dm, hermi=h)
+            dj = np.abs(oj - rj).max()
+            dk = np.abs(ok_ - rk).max()
+            print(f"    {bname:9s} {tag:8s} hermi={h}  dJ {dj:.2e}  dK {dk:.2e}")
+            ok = ok and dj < 1e-11 and dk < 1e-11 and np.abs(rk).max() > 1e-3
     print("mol.intor calls served by intti:", dict(sorted(served.items())))
     # a patch that never fired would look identical to success
     assert served.get("int1e_ipovlp", 0) > 0, "mol.intor interception never fired"

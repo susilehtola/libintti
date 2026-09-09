@@ -365,10 +365,16 @@ intti::ContractedBasis<double> contracted_basis_from(const int *atm, const int *
 // hermi = 2 (anti-hermitian, as PySCF uses for some response densities) maps to
 // DensitySymmetry::Antisymmetric.
 //
+// General contraction (nctr > 1, nprim > 1) is served natively by the
+// contraction-aware builders, at every density symmetry: the contracted
+// exchange runs the full ordered primitive (a,b) loop with atomic accumulation
+// and no mirror, so it needs no hermiticity assumption, and the contracted
+// Coulomb folds D + D^T, which is exact because J sees only the symmetric part
+// of D. That matters because it is exactly the case magnetic response needs --
+// pyscf/prop/nmr/rhf.py drives its response with an antisymmetric
+// dm1 = d1 - d1^H, on a contracted basis.
+//
 // RESTRICTIONS, checked and reported rather than silently mis-answered:
-//   * every shell must be uncontracted (nctr == 1, nprim == 1). intti's matrix
-//     builders take primitive shells; general contraction is a separate piece
-//     of work. Build the molecule with an uncontracted basis.
 //   * Cartesian only (mol.cart = True). The spherical transform is available in
 //     the library but is not applied here.
 // Returns 0 on success, negative on a violated restriction.
@@ -398,9 +404,12 @@ extern "C" int intti_get_jk(double *vj, double *vk, const double *dms, int ndm,
     const auto cbasis = contracted_basis_from(atm, bas, nbas, env);
     const int cnao = cbasis.nao;
     const std::size_t cn2 = static_cast<std::size_t>(cnao) * cnao;
+    // No symmetry restriction here, unlike the primitive fused engines. The
+    // contracted exchange runs the FULL primitive (a,b) loop with atomic
+    // accumulation and no mirror (kbuild.hpp), so it is already correct for
+    // general and antisymmetric densities -- verified against the primitive
+    // general path. hermi is therefore only a hint and is not needed.
     for (int d = 0; d < ndm; ++d) {
-      const int h = hermi ? hermi[d] : 1;
-      if (h != 1) return -6; // contracted path: symmetric densities only for now
       if (with_j && vj) {
         std::vector<double> J(cn2, 0.0);
         intti::coulomb_build(cbasis, dms + static_cast<std::size_t>(d) * cn2, cgrid,

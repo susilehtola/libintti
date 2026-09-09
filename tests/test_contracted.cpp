@@ -8,6 +8,7 @@
 
 #include "intti/contracted.hpp"
 #include "intti/fock.hpp"
+#include "intti/jk.hpp"
 #include "intti/kernel.hpp"
 #include "intti/ncenter.hpp"
 #include "intti/normalization.hpp"
@@ -317,6 +318,67 @@ TEST(Contracted, ExchangeVsDecontractRecontract) {
     scale = std::max(scale, std::abs(ref[i]));
   }
   EXPECT_LT(worst, 1e-11 * scale) << "contracted K != decontract/recontract";
+}
+
+// The contracted J/K builders carry NO density-symmetry restriction, unlike the
+// primitive fused engines. coulomb_build folds D + D^T, which is exact because J
+// only sees the symmetric part; exchange_build_contracted_impl runs the full
+// ordered primitive (a,b) loop with atomic accumulation and no mirror, so it is
+// correct for a general D. Reference: the primitive general path (jk.hpp), which
+// makes no symmetry assumption at all.
+//
+// This is what magnetic response needs -- pyscf/prop/nmr/rhf.py drives its
+// response with an antisymmetric dm1 = d1 - d1^H -- so it must not be blocked
+// off behind a "symmetric only" guard.
+TEST(Contracted, GeneralAndAntisymmetricDensity) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+
+  intti::ShellBasis<double> pbasis;
+  std::vector<double> C;
+  const int npao = decontract(cb, pbasis, C);
+
+  // A general (nonsymmetric) density and its antisymmetric part.
+  std::vector<double> Dg(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) Dg[i * n + j] = 0.1 + 0.3 * std::sin(0.7 * i + 1.9 * j * j);
+  std::vector<double> Da(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) Da[i * n + j] = 0.5 * (Dg[i * n + j] - Dg[j * n + i]);
+
+  for (int which = 0; which < 2; ++which) {
+    const std::vector<double> &D = which ? Da : Dg;
+    const char *tag = which ? "antisymmetric" : "general";
+
+    std::vector<double> J(static_cast<std::size_t>(n) * n, 0.0);
+    std::vector<double> K(static_cast<std::size_t>(n) * n, 0.0);
+    intti::coulomb_build(cb, D.data(), grid, J.data());
+    intti::exchange_build(cb, D.data(), grid, K.data());
+
+    auto Deff = pushdown(C, n, npao, D);
+    std::vector<intti::JKRequest<double>> reqs{
+        {Deff.data(), intti::DensitySymmetry::General, intti::FockTerms::CoulombExchange}};
+    auto pr = intti::jk_build(pbasis, reqs, grid);
+    auto Jref = conjugate(C, n, npao, pr.J[0]);
+    auto Kref = conjugate(C, n, npao, pr.K[0]);
+
+    double dj = 0, dk = 0, sj = 0, sk = 0;
+    for (std::size_t i = 0; i < J.size(); ++i) {
+      dj = std::max(dj, std::abs(J[i] - Jref[i]));
+      dk = std::max(dk, std::abs(K[i] - Kref[i]));
+      sj = std::max(sj, std::abs(Jref[i]));
+      sk = std::max(sk, std::abs(Kref[i]));
+    }
+    EXPECT_LT(dj, 1e-11 * std::max(sj, 1.0)) << tag << " contracted J != primitive general";
+    EXPECT_LT(dk, 1e-11 * std::max(sk, 1.0)) << tag << " contracted K != primitive general";
+    if (which) {
+      // J of an antisymmetric density vanishes identically; K does not, so the
+      // agreement above is a real check and not two zeros matching.
+      EXPECT_LT(sj, 1e-14) << "J(antisymmetric) should vanish";
+      EXPECT_GT(sk, 1e-3) << "K(antisymmetric) should not vanish";
+    }
+  }
 }
 
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum
