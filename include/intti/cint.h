@@ -112,6 +112,20 @@ int intti_ri_deriv_jk(double *vj, double *vk, const double *dm, const double *co
                       int anatm, const int *abas, int anbas, const double *aenv,
                       double tau_lin);
 
+/* RI (density-fitted) J/K as an explicitly CACHED handle. intti_ri_open builds
+ * the fit ONCE (B is nao^2 x naux); each intti_ri_get_jk is then only GEMMs.
+ * There is deliberately no one-shot form: that signature would rebuild the fit
+ * on every call, which measured 34 ms -> 570 s across an SCF. Densities need not
+ * be symmetric -- the general and antisymmetric ones response theory produces
+ * are served exactly. vj/vk are ndm x nao x nao. Uncontracted Cartesian only.
+ * Returns NULL on a violated restriction; free with intti_ri_close. */
+void *intti_ri_open(const int *atm, int natm, const int *bas, int nbas,
+                    const double *env, const int *aatm, int anatm, const int *abas,
+                    int anbas, const double *aenv, double tau_lin);
+void intti_ri_close(void *handle);
+int intti_ri_get_jk(void *handle, double *vj, double *vk, const double *dms, int ndm,
+                    int with_j, int with_k);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);

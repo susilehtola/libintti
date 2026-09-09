@@ -29,6 +29,7 @@
 
 #include "intti/cint.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,7 @@
 #include "intti/contracted.hpp"
 #include "intti/deriv.hpp"
 #include "intti/nuclear.hpp"
+#include "intti/ri.hpp"
 #include "intti/rigrad.hpp"
 #include "intti/erihess.hpp"
 #include "intti/geohess.hpp"
@@ -482,6 +484,98 @@ extern "C" int intti_ri_deriv_jk(double *vj, double *vk, const double *dm,
           const std::size_t o = static_cast<std::size_t>(x) * N + i * nao + j;
           vk[o] = r.K[0][o] * oscale[i] * oscale[j];
         }
+  }
+  return 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// RI (density-fitted) J/K, as an explicitly CACHED handle.
+//
+// ri_fit builds B (nao^2 x naux) once and every subsequent ri_jk is only GEMMs.
+// That is the whole point: J/K is asked for once per SCF ITERATION, so caching
+// wins outright -- replacing ri_fit + ri_jk with the tiled builders in the
+// capstone RI-RHF measured 34 ms -> 570 s, because each iteration then pays a
+// full integral pass instead of a GEMM (ri.hpp records the criterion).
+//
+// So the facade does NOT offer a one-shot intti_ri_get_jk(mol, dm): that
+// signature would look convenient and rebuild the fit on every call, hiding a
+// four-order-of-magnitude cost in an innocuous-looking function. The handle
+// makes the caching part of the interface, and its lifetime part of the
+// caller's job. B is nao^2 x naux -- 32 GB at nao = 1000, naux = 4000 -- so
+// when it does not fit, the tiled builders are the answer, not this.
+//
+// Densities need not be symmetric: ri_jk contracts K = sum_P B^P D B^P as two
+// GEMMs and assumes nothing about D, so the general and antisymmetric densities
+// that response theory produces are served exactly.
+namespace {
+struct RIHandle {
+  intti::RIFit<double> fit;
+  std::vector<double> scale; // per-AO PySCF <-> intti conversion
+  int nao{0};
+};
+} // namespace
+
+extern "C" void *intti_ri_open(const int *atm, int natm, const int *bas, int nbas,
+                               const double *env, const int *aatm, int anatm,
+                               const int *abas, int anbas, const double *aenv,
+                               double tau_lin) {
+  ensure_kokkos();
+  (void)natm;
+  (void)anatm;
+  auto build = [](const int *a, const int *b, int nb, const double *e,
+                  std::vector<double> &scale, intti::ShellBasis<double> &out) {
+    std::vector<intti::PrimitiveShell<double>> shells;
+    for (int ish = 0; ish < nb; ++ish) {
+      const ShellInfo s = decode_shell(ish, a, b, e);
+      if (s.nctr != 1 || s.nprim != 1) return -1;
+      shells.push_back(intti::PrimitiveShell<double>{
+          s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+      const double c = s.coeff[0] * coeff_rescale(s.l);
+      for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+    }
+    out = intti::make_basis(shells);
+    return 0;
+  };
+  std::vector<double> oscale, ascale;
+  intti::ShellBasis<double> orb, aux;
+  if (build(atm, bas, nbas, env, oscale, orb) != 0) return nullptr;
+  if (build(aatm, abas, anbas, aenv, ascale, aux) != 0) return nullptr;
+  auto *h = new RIHandle;
+  h->nao = orb.nao;
+  h->scale = std::move(oscale);
+  h->fit = intti::ri_fit(orb, aux, default_grid(), tau_lin);
+  return h;
+}
+
+extern "C" void intti_ri_close(void *handle) { delete static_cast<RIHandle *>(handle); }
+
+extern "C" int intti_ri_get_jk(void *handle, double *vj, double *vk, const double *dms,
+                               int ndm, int with_j, int with_k) {
+  auto *h = static_cast<RIHandle *>(handle);
+  if (!h) return -1;
+  const int nao = h->nao;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  std::vector<double> Ds(N), J, K;
+  if (with_j) J.assign(N, 0.0);
+  if (with_k) K.assign(N, 0.0);
+  for (int d = 0; d < ndm; ++d) {
+    const double *D = dms + static_cast<std::size_t>(d) * N;
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j)
+        Ds[static_cast<std::size_t>(i) * nao + j] =
+            D[static_cast<std::size_t>(i) * nao + j] * h->scale[i] * h->scale[j];
+    if (with_j) std::fill(J.begin(), J.end(), 0.0);
+    if (with_k) std::fill(K.begin(), K.end(), 0.0);
+    intti::ri_jk(h->fit, Ds.data(), with_j ? J.data() : nullptr,
+                 with_k ? K.data() : nullptr);
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j) {
+        const std::size_t o = static_cast<std::size_t>(i) * nao + j;
+        const double sc = h->scale[i] * h->scale[j];
+        if (with_j && vj) vj[d * N + o] = J[o] * sc;
+        if (with_k && vk) vk[d * N + o] = K[o] * sc;
+      }
   }
   return 0;
 }

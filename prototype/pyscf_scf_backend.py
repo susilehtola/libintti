@@ -77,6 +77,16 @@ def load(lib_path):
     hs = lib.intti_hess_skeleton
     hs.restype = ctypes.c_int
     hs.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
+    v = ctypes.c_void_p
+    rop = lib.intti_ri_open
+    rop.restype = v
+    rop.argtypes = [i, ctypes.c_int, i, ctypes.c_int, d, i, ctypes.c_int, i,
+                    ctypes.c_int, d, ctypes.c_double]
+    rjk = lib.intti_ri_get_jk
+    rjk.restype = ctypes.c_int
+    rjk.argtypes = [v, d, d, d, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    rcl = lib.intti_ri_close
+    rcl.argtypes = [v]
     rid = lib.intti_ri_deriv_jk
     rid.restype = ctypes.c_int
     rid.argtypes = [d, d, d, d, ctypes.c_int, i, ctypes.c_int, i, ctypes.c_int, i,
@@ -85,7 +95,7 @@ def load(lib_path):
     rih.restype = ctypes.c_int
     rih.argtypes = [d, d, d, d, ctypes.c_int, i, ctypes.c_int, i, ctypes.c_int, d,
                     i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
-    return f, g, hs, ip1, e1, rih, rid
+    return f, g, hs, ip1, e1, rih, rid, (rop, rjk, rcl)
 
 
 def make_1e(fn, mol):
@@ -370,19 +380,21 @@ def df_hessian_check(fn_rih, atoms, orb_basis, aux_basis, label):
 
 
 
-def df_full_hessian_check(fn_rih, fn_rid, atoms, orb_basis, aux_basis, label):
+def df_full_hessian_check(fn_rih, fn_rid, fn_ri, atoms, orb_basis, aux_basis, label):
     """The whole DF Hessian on intti's RI derivative integrals.
 
     Two seams, both plain instance overrides:
       partial_hess_elec  <- intti_ri_hess_jk   (the ej / ek Hessians)
       make_h1            <- intti_ri_deriv_jk  (the CPHF right-hand side)
 
+    The SCF itself and the CPHF RESPONSE additionally run on intti's cached RI
+    J/K (intti_ri_open / intti_ri_get_jk), so every two-electron quantity in the
+    DF pipeline is ours. The response densities are NOT symmetric, which is
+    exactly why ri_jk contracts K as two GEMMs and assumes nothing about D.
+
     What is NOT ours, stated rather than glossed: the one-electron part e1 still
-    comes from PySCF's _partial_hess_ejk (though mol.intor is patched, so its
-    derivative integrals are ours), and the CPHF RESPONSE goes through PySCF's
-    density-fitted get_jk -- there is no facade entry for the RI *energy* J/K
-    yet. The two-electron DERIVATIVE integrals, which is what this exercise is
-    about, are entirely intti's.
+    comes from PySCF's _partial_hess_ejk -- though mol.intor is patched, so its
+    derivative integrals are ours.
 
     make_h1 asks for 3*natm x nao^2, so the shell -> atom map is passed straight
     into the builders: the shell-resolved object is never formed.
@@ -393,10 +405,10 @@ def df_full_hessian_check(fn_rih, fn_rid, atoms, orb_basis, aux_basis, label):
     iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
     mol = gto.M(atom=atoms, basis=orb_basis, unit="Bohr", cart=True, verbose=0)
     auxmol = df.addons.make_auxmol(mol, aux_basis)
-    mf = scf.RHF(mol).density_fit(auxbasis=aux_basis)
-    mf.conv_tol = 1e-12
-    mf.kernel()
-    H_ref = dfhess.Hessian(mf).set(auxbasis_response=2).kernel()
+    ref = scf.RHF(mol).density_fit(auxbasis=aux_basis)
+    ref.conv_tol = 1e-12
+    ref.kernel()
+    H_ref = dfhess.Hessian(ref).set(auxbasis_response=2).kernel()
 
     nao, natm = mol.nao_nr(), mol.natm
     atmA = np.asarray(mol._atm, dtype=np.int32, order="C")
@@ -407,6 +419,30 @@ def df_full_hessian_check(fn_rih, fn_rid, atoms, orb_basis, aux_basis, label):
     envB = np.asarray(auxmol._env, dtype=np.float64, order="C")
     grp = np.ascontiguousarray(np.concatenate([basA[:, 0], basB[:, 0]]).astype(np.int32))
     ncen = mol.nbas + auxmol.nbas
+
+    # the CACHED RI fit: built once here, reused by every SCF iteration and every
+    # CPHF response build. A one-shot get_jk would rebuild it each call.
+    ri_open, ri_get_jk, ri_close = fn_ri
+    handle = ri_open(iptr(atmA), natm, iptr(basA), mol.nbas, dptr(envA),
+                     iptr(atmB), auxmol.natm, iptr(basB), auxmol.nbas, dptr(envB), 1e-12)
+    assert handle, "intti_ri_open failed"
+
+    def ri_jk(mol_, dm, hermi=1, with_j=True, with_k=True, omega=None):
+        dm = np.asarray(dm)
+        squeeze = dm.ndim == 2
+        D = np.ascontiguousarray(dm.reshape(-1, nao, nao))
+        vj = np.zeros_like(D)
+        vk = np.zeros_like(D)
+        rc = ri_get_jk(handle, dptr(vj), dptr(vk), dptr(D), D.shape[0],
+                       int(with_j), int(with_k))
+        assert rc == 0, f"intti_ri_get_jk rc={rc}"
+        return (vj[0] if squeeze else vj), (vk[0] if squeeze else vk)
+
+    mf = scf.RHF(mol).density_fit(auxbasis=aux_basis)
+    mf.conv_tol = 1e-12
+    mf.get_jk = ri_jk
+    e_our = mf.kernel()
+    assert mf.converged, "DF-SCF on intti RI J/K did not converge"
 
     def fold(H):
         out = np.zeros((natm, natm, 3, 3))
@@ -446,21 +482,24 @@ def df_full_hessian_check(fn_rih, fn_rid, atoms, orb_basis, aux_basis, label):
     hobj.partial_hess_elec = partial.__get__(hobj, type(hobj))
     hobj.make_h1 = make_h1.__get__(hobj, type(hobj))
     H_our = np.asarray(hobj.kernel())
+    ri_close(handle)
+    dE = abs(e_our - ref.e_tot)
     dH = np.abs(H_our - np.asarray(H_ref)).max()
     f_ref = thermo.harmonic_analysis(mol, H_ref)["freq_wavenumber"]
     f_our = thermo.harmonic_analysis(mol, H_our)["freq_wavenumber"]
     dfreq = np.abs(np.atleast_1d(f_our) - np.atleast_1d(f_ref)).max()
-    print(f"    {label:22s} full-H {dH:.2e} (|{np.abs(H_ref).max():.2e}|)  "
+    print(f"    {label:22s} E {dE:.2e}  full-H {dH:.2e} (|{np.abs(H_ref).max():.2e}|)  "
           f"freq {dfreq:.2e} cm^-1")
     print(f"    {label:22s} freqs " + " ".join(f"{x:.4f}" for x in np.atleast_1d(f_our)))
-    return dH < 1e-9 and dfreq < 1e-4 and np.abs(H_ref).max() > 1e-2
+    return (dE < 1e-10 and dH < 1e-9 and dfreq < 1e-4
+            and np.abs(H_ref).max() > 1e-2)
 
 
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
-    fn, fn_ip1, fn_hess, fn_h1, fn_1e, fn_rih, fn_rid = load(sys.argv[1])
+    fn, fn_ip1, fn_hess, fn_h1, fn_1e, fn_rih, fn_rid, fn_ri = load(sys.argv[1])
     basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
     mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
 
@@ -669,7 +708,7 @@ def main():
     # ...and the whole DF Hessian driven on those derivative integrals
     print("DF Hessian on intti RI derivative integrals:")
     ok = df_full_hessian_check(
-        fn_rih, fn_rid, ATOM,
+        fn_rih, fn_rid, fn_ri, ATOM,
         {"O": uncontracted((0, [3.0, 0.9, 0.3]), (1, [1.1, 0.35])),
          "H": uncontracted((0, [1.3, 0.35]))},
         {"O": uncontracted((0, [6.0, 1.8, 0.6]), (1, [2.0, 0.7])),
