@@ -692,3 +692,92 @@ TEST(JK, ReinstatedRiExchangeDerivativeMatchesFiniteDifference) {
 }
 
 } // namespace
+
+// Perturbation GROUPING: folding shell centres onto atoms must be exactly the
+// shell-resolved result summed over each group. This is what makes the RI
+// derivative matrices affordable -- at nao = 1000 with ~1800 orbital and
+// auxiliary shells the shell-indexed output is 43 GB against 2.4 GB for the
+// 100-atom fold that the CPHF right-hand side actually needs -- so it has to be
+// exact, not approximate. It is: moving an atom moves every shell centred on
+// it, so d/dR_atom is the sum of the shell derivatives, and the sum is linear.
+TEST(RIDeriv, PerturbationGroupingEqualsShellSum) {
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  auto osh = jk_shells();
+  auto ash = jk_aux_shells();
+  auto orb = intti::make_basis(osh);
+  auto aux = intti::make_basis(ash);
+  const int n = orb.nao, nvec = 3;
+  const int nso = static_cast<int>(osh.size());
+  const int ncen = nso + static_cast<int>(ash.size());
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+
+  // group shells by their CENTRE, which is what an atom map is
+  std::vector<int> grp(ncen, -1);
+  std::vector<std::array<double, 3>> seen;
+  for (int i = 0; i < ncen; ++i) {
+    const auto &c = (i < nso) ? osh[i].center : ash[i - nso].center;
+    int hit = -1;
+    for (int k = 0; k < static_cast<int>(seen.size()); ++k) {
+      double d = 0;
+      for (int t = 0; t < 3; ++t) d += std::abs(seen[k][t] - c[t]);
+      if (d < 1e-12) hit = k;
+    }
+    if (hit < 0) {
+      hit = static_cast<int>(seen.size());
+      seen.push_back({c[0], c[1], c[2]});
+    }
+    grp[i] = hit;
+  }
+  const int ngrp = static_cast<int>(seen.size());
+  ASSERT_GT(ngrp, 1) << "grouping must be non-trivial";
+  ASSERT_LT(ngrp, ncen) << "grouping must actually merge shells";
+
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec),
+      CR(static_cast<std::size_t>(n) * nvec);
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < nvec; ++k) {
+      CL[i * nvec + k] = 0.3 * std::cos(0.7 * i + k) / (1.0 + i);
+      CR[i * nvec + k] = 0.2 * std::sin(0.4 * i - 2.0 * k) + 0.05 * k;
+    }
+  std::vector<double> D(n2, 0.0);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) {
+      double acc = 0;
+      for (int k = 0; k < nvec; ++k) acc += CL[i * nvec + k] * CR[j * nvec + k];
+      D[i * n + j] = acc;
+    }
+
+  auto check = [&](const char *what, const std::vector<double> &shellwise,
+                   const std::vector<double> &grouped) {
+    std::vector<double> ref(static_cast<std::size_t>(3 * ngrp) * n2, 0.0);
+    for (int x = 0; x < ncen; ++x)
+      for (int e = 0; e < 3; ++e)
+        for (std::size_t i = 0; i < n2; ++i)
+          ref[(static_cast<std::size_t>(3 * grp[x] + e)) * n2 + i] +=
+              shellwise[(static_cast<std::size_t>(3 * x + e)) * n2 + i];
+    ASSERT_EQ(grouped.size(), ref.size()) << what;
+    double worst = 0, scale = 0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      worst = std::max(worst, std::abs(grouped[i] - ref[i]));
+      scale = std::max(scale, std::abs(ref[i]));
+    }
+    EXPECT_LT(worst, 1e-11 * std::max(scale, 1.0)) << what << ": grouped != shell sum";
+    EXPECT_GT(scale, 1e-4) << what << ": reference trivially zero";
+  };
+
+  std::vector<intti::JKRequest<double>> reqs{
+      {D.data(), intti::DensitySymmetry::General, intti::FockTerms::Coulomb}};
+  const auto js = intti::ri_j_deriv_build(orb, aux, reqs, grid);
+  const auto jg = intti::ri_j_deriv_build(orb, aux, reqs, grid, 1e-10, 0, grp);
+  EXPECT_EQ(js.nshell, ncen);
+  EXPECT_EQ(jg.nshell, ngrp);
+  check("RI-J", js.J[0], jg.J[0]);
+
+  const auto ks = intti::ri_k_deriv_occ(orb, aux, CL.data(), CR.data(), nvec, grid);
+  const auto kg =
+      intti::ri_k_deriv_occ(orb, aux, CL.data(), CR.data(), nvec, grid, 1e-10, 0, grp);
+  EXPECT_EQ(ks.nshell, ncen);
+  EXPECT_EQ(kg.nshell, ngrp);
+  check("RI-K", ks.K[0], kg.K[0]);
+}
+

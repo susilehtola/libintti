@@ -976,6 +976,27 @@ std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
 
 
 
+namespace detail {
+/// Expand an optional shell-centre -> perturbation-group map. Empty means one
+/// group per centre (the identity), which is the shell-resolved behaviour.
+/// Folding shell perturbations onto ATOMS is exact: moving an atom moves every
+/// shell centred on it, so d/dR_atom is the sum of the shell derivatives, and
+/// the sum is linear so it may be taken at any stage. Taking it at the
+/// accumulation keeps the npert-sized objects at atom resolution -- the
+/// difference between 43 GB and 2.4 GB at nao = 1000 with ~1800 shells.
+inline std::vector<int> perturbation_groups(const std::vector<int> &group, int ncen,
+                                            int &ngrp) {
+  std::vector<int> g(group);
+  if (g.empty()) {
+    g.resize(ncen);
+    for (int i = 0; i < ncen; ++i) g[i] = i;
+  }
+  ngrp = 0;
+  for (int v : g) ngrp = std::max(ngrp, v + 1);
+  return g;
+}
+} // namespace detail
+
 /// Derivative RI Coulomb MATRICES: for each shell centre (orbital shells first,
 /// then auxiliary, as in RIGrad) and Cartesian direction,
 ///   dJ_mn/dx = sum_P d(mn|P)/dx gamma_P + sum_P (mn|P) dgamma_P/dx.
@@ -1000,11 +1021,15 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
                                      const std::vector<JKRequest<Real>> &reqs,
                                      const TGrid<Real> &grid,
                                      Real tau_lin = Real(1e-10),
-                                     int aux_tile_shells = 0) {
+                                     int aux_tile_shells = 0,
+                                     const std::vector<int> &group = {}) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
-  const int ncen = nso + nsa, npert = 3 * ncen;
+  const int ncen = nso + nsa;
+  int ngrp = 0;
+  const auto grp = detail::perturbation_groups(group, ncen, ngrp);
+  const int npert = 3 * ngrp;
   const int nreq = static_cast<int>(reqs.size());
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
 
@@ -1130,6 +1155,8 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
     auto dg = detail::to_device(hg, "rijd::g"), dD = detail::to_device(hD, "rijd::D");
     auto offv = batch.out_offset;
     Kokkos::View<Real *> Ad("rijd::A", A.size()), Dxd("rijd::dx", dxv.size());
+    auto dgrp = detail::to_device(grp, "rijd::grp");
+    const std::size_t npert_ = static_cast<std::size_t>(npert);
     const std::size_t nn2 = N, nax = naux;
     Kokkos::parallel_for(
         "intti::rijd::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
@@ -1174,14 +1201,15 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
                   dv[2] = -(dv[0] + dv[1]); // d/dP by translational invariance
                   const int tgt[3] = {m, n, nso + a};
                   for (int slot = 0; slot < 3; ++slot) {
-                    const std::size_t px = static_cast<std::size_t>(3 * tgt[slot] + e);
+                    // fold onto the perturbation group (atoms, typically)
+                    const std::size_t px = static_cast<std::size_t>(3 * dgrp(tgt[slot]) + e);
                     for (int r = 0; r < nreq; ++r) {
-                      Kokkos::atomic_add(&Ad((static_cast<std::size_t>(r) * (3 * (nso + nsa)) +
-                                              px) * nn2 + imn),
-                                         dv[slot] * dg(r * nax + Pg));
-                      Kokkos::atomic_add(&Dxd((static_cast<std::size_t>(r) * (3 * (nso + nsa)) +
-                                               px) * nax + Pg),
-                                         dv[slot] * dD(r * nn2 + imn));
+                      Kokkos::atomic_add(
+                          &Ad((static_cast<std::size_t>(r) * npert_ + px) * nn2 + imn),
+                          dv[slot] * dg(r * nax + Pg));
+                      Kokkos::atomic_add(
+                          &Dxd((static_cast<std::size_t>(r) * npert_ + px) * nax + Pg),
+                          dv[slot] * dD(r * nn2 + imn));
                     }
                   }
                 }
@@ -1253,7 +1281,9 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
     auto offv = batch.out_offset;
     Kokkos::View<Real *> Mg("rijd2::Mg", Mxg.size());
     const std::size_t nax = naux;
-    const int nso_ = nso, ncen_ = ncen;
+    const int nso_ = nso;
+    auto dgrp = detail::to_device(grp, "rijd::grp2");
+    const std::size_t npert_ = static_cast<std::size_t>(npert);
     Kokkos::parallel_for(
         "intti::rijd2::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
           const int P = djp(j), Qs = djq(j);
@@ -1283,10 +1313,10 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
                 const int tgt[2] = {nso_ + P, nso_ + Qs};
                 const Real dvv[2] = {dP, dQ};
                 for (int slot = 0; slot < 2; ++slot) {
-                  const std::size_t px = static_cast<std::size_t>(3 * tgt[slot] + e);
+                  const std::size_t px = static_cast<std::size_t>(3 * dgrp(tgt[slot]) + e);
                   for (int r = 0; r < nreq; ++r)
                     Kokkos::atomic_add(
-                        &Mg((static_cast<std::size_t>(r) * (3 * ncen_) + px) * nax + oP + kp),
+                        &Mg((static_cast<std::size_t>(r) * npert_ + px) * nax + oP + kp),
                         dvv[slot] * dg(r * nax + oQ + kq));
                 }
               }
@@ -1298,7 +1328,7 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
 
   // ---- assemble: dJ^x = A^x + T gamma_x, gamma_x = M^+ (d_x - M_x gamma) --
   JKDerivResult<Real> res;
-  res.nshell = ncen;
+  res.nshell = ngrp;
   res.nao = nao;
   res.J.resize(nreq);
   res.K.resize(nreq);
@@ -1731,11 +1761,15 @@ template <class Real>
 JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                                    const Real *CL, const Real *CR, int nvec,
                                    const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
-                                   int aux_tile_shells = 0) {
+                                   int aux_tile_shells = 0,
+                                   const std::vector<int> &group = {}) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
-  const int ncen = nso + nsa, npert = 3 * ncen;
+  const int ncen = nso + nsa;
+  int ngrp = 0;
+  const auto grp = detail::perturbation_groups(group, ncen, ngrp);
+  const int npert = 3 * ngrp;
   if (aux_tile_shells < 1) aux_tile_shells = nsa;
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
   const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
@@ -1779,7 +1813,7 @@ JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis
                Y.data(), static_cast<int>(slab), Real(0), Yh.data(), static_cast<int>(slab));
 
   JKDerivResult<Real> res;
-  res.nshell = ncen;
+  res.nshell = ngrp;
   res.nao = nao;
   res.J.resize(1);
   res.K.resize(1);
@@ -1798,7 +1832,7 @@ JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis
         for (int pos = 0; pos < 3; ++pos)
           for (int dir = 0; dir < 3; ++dir) {
             const auto blk = detail::quartet_pos_deriv_block(sl, sn, sc, gh, pos, dir, grid);
-            const int xi = 3 * cs[pos] + dir;
+            const int xi = 3 * grp[cs[pos]] + dir; // folded onto the group (atoms)
             for (int kl = 0; kl < nl; ++kl)
               for (int kn = 0; kn < nn; ++kn)
                 for (int kQ = 0; kQ < nP; ++kQ) {
@@ -1840,7 +1874,8 @@ JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis
           for (int pos : {0, 2}) {
             const int cs = (pos == 0) ? cshell(true, c) : cshell(true, ee);
             for (int dir = 0; dir < 3; ++dir) {
-              if (3 * cs + dir != x) continue;
+              // every shell in the group contributes to the group's perturbation
+              if (3 * grp[cs] + dir != x) continue;
               const auto blk =
                   detail::quartet_pos_deriv_block(sC, ghC, sE, ghE, pos, dir, grid);
               for (int kQ = 0; kQ < nC; ++kQ)
