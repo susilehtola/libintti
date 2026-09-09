@@ -1659,6 +1659,52 @@ RIGrad<Real> ri_k_gradient_occ(const ShellBasis<Real> &orb, const ShellBasis<Rea
 /// P is never built for all i at once and r is never built at all (it would be
 /// dim x naux x nao x nvec, 4.8 TB). Working set is
 /// 2 x dim x naux x vec_block x nvec: ~10 GB at vec_block = 1, ~50 GB at 5.
+// CONTRACTION, for the exchange derivative kernels below (ri_k_gradient_occ,
+// ri_k_hessian_occ, ri_k_deriv_occ). None of them takes a contracted basis yet;
+// ri_j_hessian does, and the same recipe carries over. Written down here so the
+// work starts from the design rather than from a re-derivation.
+//
+// The argument is the one that made the Coulomb case free: every three-centre
+// integral enters LINEARLY in each of its own indices, so the contraction can be
+// folded into whatever it is contracted against instead of into the integrals.
+// Concretely, with C the orbital and Ca the auxiliary fan-out matrices
+// (contracted x primitive, detail::fanout_matrix):
+//
+//   * ORBITAL-side factors push DOWN once, outside everything:
+//         CLp = C^T CL,  CRp = C^T CR      (nao_primitive x nvec)
+//     The exchange case is where this differs from Coulomb: the density arrives
+//     factorised, so it is the FACTORS that transform, not D by congruence.
+//
+//   * The metric M and hence M^{-1} stay in the CONTRACTED auxiliary space --
+//     the physically right space, since splitting an auxiliary contraction
+//     enlarges the fitting span and changes the answer.
+//
+//   * The mixed tensor (m n | P), primitive orbital and contracted auxiliary,
+//     is what Y and X are built from. There is no mixed builder, but none is
+//     needed: wrap the primitive orbital basis as a trivially-contracted
+//     ContractedBasis (one primitive per shell, coefficient
+//     1/cart_norm_pyscf(l, alpha) so the effective coefficient is 1) and call
+//     the contracted three-centre builder. tests/test_contracted.cpp already
+//     uses exactly this wrapper for its reference.
+//
+//   * Anything meeting a DERIVATIVE block at a primitive auxiliary index must be
+//     lifted there: Yhat_p[p] = sum_P Ca[P][p] Yhat[P]. That object is
+//     naux_primitive x nao_primitive x nvec -- a constant factor above the
+//     contracted one, and exactly the size an uncontracted run of the same
+//     primitive basis already pays, which is the honest baseline.
+//
+//   * Anything accumulated AT a primitive auxiliary index and then meeting
+//     M^{-1} is lifted the other way, r_c = r Ca^T, as ri_j_hessian_kernel does.
+//
+//   * Shell-indexed outputs (the Hessians) fold through a parent map;
+//     AO-indexed outputs (ri_k_deriv_occ's matrices) need the digest fan-out of
+//     detail::ShellFanout instead, since lifting a per-perturbation nao^2 matrix
+//     afterwards would materialise the primitive-sized output.
+//
+// The one piece with no counterpart in the Coulomb case is c2/W/Z, which are
+// nvec x nvec per auxiliary function: their auxiliary index is contracted
+// throughout and only meets M^{-1}, so they need no lift at all.
+
 template <class Real>
 std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                                    const Real *CL, const Real *CR, int nvec,
