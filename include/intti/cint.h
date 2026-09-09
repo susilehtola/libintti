@@ -127,6 +127,16 @@ void intti_ri_close(void *handle);
 int intti_ri_get_jk(void *handle, double *vj, double *vk, const double *dms, int ndm,
                     int with_j, int with_k);
 
+/* Two- and three-centre Coulomb tensors, for direct comparison with libcint's
+ * int2c2e (naux x naux) and int3c2e (nao x nao x naux). Whole tensors, not a
+ * per-quartet surface. Cartesian only; either basis may be generally
+ * contracted. */
+int intti_coulomb_2c(double *out, const int *aatm, int anatm, const int *abas,
+                     int anbas, const double *aenv);
+int intti_coulomb_3c(double *out, const int *atm, int natm, const int *bas, int nbas,
+                     const double *env, const int *aatm, int anatm, const int *abas,
+                     int anbas, const double *aenv);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);

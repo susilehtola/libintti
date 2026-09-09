@@ -78,6 +78,13 @@ def load(lib_path):
     hs.restype = ctypes.c_int
     hs.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
     v = ctypes.c_void_p
+    c2c = lib.intti_coulomb_2c
+    c2c.restype = ctypes.c_int
+    c2c.argtypes = [d, i, ctypes.c_int, i, ctypes.c_int, d]
+    c3c = lib.intti_coulomb_3c
+    c3c.restype = ctypes.c_int
+    c3c.argtypes = [d, i, ctypes.c_int, i, ctypes.c_int, d, i, ctypes.c_int, i,
+                    ctypes.c_int, d]
     rop = lib.intti_ri_open
     rop.restype = v
     rop.argtypes = [i, ctypes.c_int, i, ctypes.c_int, d, i, ctypes.c_int, i,
@@ -95,7 +102,7 @@ def load(lib_path):
     rih.restype = ctypes.c_int
     rih.argtypes = [d, d, d, d, ctypes.c_int, i, ctypes.c_int, i, ctypes.c_int, d,
                     i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
-    return f, g, hs, ip1, e1, rih, rid, (rop, rjk, rcl)
+    return f, g, hs, ip1, e1, rih, rid, (rop, rjk, rcl), (c2c, c3c)
 
 
 def make_1e(fn, mol):
@@ -559,11 +566,63 @@ def df_contracted_check(fn_ri, atoms, cases, label):
     return ok
 
 
+
+def ncentre_check(fn_nc, atoms, cases):
+    """The two- and three-centre Coulomb tensors against libcint directly.
+
+    Per-builder localisation, which the RI energy cannot give: the fit
+    T M^-1 T^T is INVARIANT to any diagonal rescaling of the auxiliary AOs
+    (T -> TS, M -> SMS leaves it unchanged), so an auxiliary-side convention
+    error cancels and only a genuine inconsistency BETWEEN M and T shows up --
+    as a wrong energy, with no indication of which builder is at fault.
+
+    That is not hypothetical. The contracted two-centre metric double-counted
+    the off-diagonal elements of a diagonal shell block, and it took a bisection
+    to find, because the unit tests compared contracted against contracted. It
+    was invisible below l = 2 as well: a same-centre two-centre integral
+    vanishes unless both components have even parity in every direction, so the
+    first nonzero off-diagonals in a diagonal block are the (xx|yy)-type trace
+    pairs. Hence the auxiliary angular momentum is pushed to g here.
+    """
+    c2c, c3c = fn_nc
+    dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+    ok = True
+    for ob, ab in cases:
+        mol = gto.M(atom=atoms, basis=ob, unit="Bohr", cart=True, verbose=0)
+        aux = df.addons.make_auxmol(mol, ab)
+        nao, naux = mol.nao_nr(), aux.nao_nr()
+        atmA = np.asarray(mol._atm, dtype=np.int32, order="C")
+        basA = np.asarray(mol._bas, dtype=np.int32, order="C")
+        envA = np.asarray(mol._env, dtype=np.float64, order="C")
+        atmB = np.asarray(aux._atm, dtype=np.int32, order="C")
+        basB = np.asarray(aux._bas, dtype=np.int32, order="C")
+        envB = np.asarray(aux._env, dtype=np.float64, order="C")
+        M = np.zeros((naux, naux))
+        assert c2c(dptr(M), iptr(atmB), aux.natm, iptr(basB), aux.nbas, dptr(envB)) == 0
+        Mref = aux.intor("int2c2e", aosym="s1")
+        T = np.zeros((nao, nao, naux))
+        assert c3c(dptr(T), iptr(atmA), mol.natm, iptr(basA), mol.nbas, dptr(envA),
+                   iptr(atmB), aux.natm, iptr(basB), aux.nbas, dptr(envB)) == 0
+        Tref = df.incore.aux_e2(mol, aux, intor="int3c2e", aosym="s1")
+        d2 = np.abs(M - Mref).max() / np.abs(Mref).max()
+        d3 = np.abs(T - Tref).max() / np.abs(Tref).max()
+        lo = max(int(mol._bas[k, 1]) for k in range(mol.nbas))
+        la = max(int(aux._bas[k, 1]) for k in range(aux.nbas))
+        nctr = max(int(mol._bas[k, 3]) for k in range(mol.nbas))
+        print(f"    {ob:8s}(l{lo},nctr{nctr}) / {ab:14s}(l{la}) naux={naux:3d}  "
+              f"2c {d2:.2e}  3c {d3:.2e}  (relative)")
+        ok = ok and d2 < 1e-12 and d3 < 1e-12
+        ok = ok and la >= 3   # the aux angular momentum must actually be high
+    return ok
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
-    fn, fn_ip1, fn_hess, fn_h1, fn_1e, fn_rih, fn_rid, fn_ri = load(sys.argv[1])
+    (fn, fn_ip1, fn_hess, fn_h1, fn_1e, fn_rih, fn_rid, fn_ri,
+     fn_nc) = load(sys.argv[1])
     basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
     mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
 
@@ -778,6 +837,12 @@ def main():
         {"O": uncontracted((0, [6.0, 1.8, 0.6]), (1, [2.0, 0.7])),
          "H": uncontracted((0, [2.4, 0.7]))},
         "H2O RI freqs") and ok
+    # per-builder oracle for the RI n-centre tensors, up to g in the auxiliary
+    print("2c/3c Coulomb tensors vs libcint:")
+    ok = ncentre_check(
+        fn_nc, ATOM,
+        [("sto-3g", "cc-pvdz-jkfit"), ("cc-pvdz", "cc-pvdz-jkfit"),
+         ("cc-pvdz", "cc-pvtz-jkfit")]) and ok
     # contracted RI: standard orbital basis AND a standard Coulomb-fitting set,
     # which is where the auxiliary angular momentum finally exceeds l = 1
     print("DF-RHF on contracted bases, intti RI J/K:")

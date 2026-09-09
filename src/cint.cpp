@@ -611,6 +611,102 @@ extern "C" int intti_ri_get_jk(void *handle, double *vj, double *vk, const doubl
   return 0;
 }
 
+
+// Two- and three-centre Coulomb TENSORS, for validation against libcint's
+// int2c2e / int3c2e.
+//
+// These are whole-tensor quantities -- (naux x naux) and (nao x nao x naux) --
+// not a per-quartet surface, so they sit inside the matrix-level API. They earn
+// their place: the contracted two-centre metric carried a silent double-count
+// for l >= 2 that the RI energy could only reveal indirectly, because the fit
+// T M^-1 T^T is invariant to any diagonal rescaling of the auxiliary AOs and
+// the unit tests compared contracted against contracted. A direct per-builder
+// oracle localises such an error instead of requiring a bisection.
+//
+// Cartesian only; either basis may be generally contracted.
+extern "C" int intti_coulomb_2c(double *out, const int *aatm, int anatm, const int *abas,
+                                int anbas, const double *aenv) {
+  ensure_kokkos();
+  (void)anatm;
+  bool contracted = false;
+  for (int ish = 0; ish < anbas; ++ish) {
+    const int *b = abas + static_cast<std::size_t>(ish) * 8;
+    if (b[NPRIM_OF] != 1 || b[NCTR_OF] != 1) contracted = true;
+  }
+  const auto &grid = default_grid();
+  if (contracted) {
+    const auto ca = contracted_basis_from(aatm, abas, anbas, aenv);
+    const auto M = intti::coulomb_2c(ca, grid);
+    for (std::size_t i = 0; i < M.size(); ++i) out[i] = M[i];
+    return 0;
+  }
+  std::vector<intti::PrimitiveShell<double>> shells;
+  std::vector<double> scale;
+  for (int ish = 0; ish < anbas; ++ish) {
+    const ShellInfo s = decode_shell(ish, aatm, abas, aenv);
+    shells.push_back(intti::PrimitiveShell<double>{
+        s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+    const double c = s.coeff[0] * coeff_rescale(s.l);
+    for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+  }
+  auto aux = intti::make_basis(shells);
+  const int n = aux.nao;
+  const auto M = intti::coulomb_2c(aux, grid);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j)
+      out[static_cast<std::size_t>(i) * n + j] =
+          M[static_cast<std::size_t>(i) * n + j] * scale[i] * scale[j];
+  return 0;
+}
+
+extern "C" int intti_coulomb_3c(double *out, const int *atm, int natm, const int *bas,
+                                int nbas, const double *env, const int *aatm, int anatm,
+                                const int *abas, int anbas, const double *aenv) {
+  ensure_kokkos();
+  (void)natm;
+  (void)anatm;
+  auto has_contraction = [](const int *b, int nb) {
+    for (int ish = 0; ish < nb; ++ish) {
+      const int *r = b + static_cast<std::size_t>(ish) * 8;
+      if (r[NPRIM_OF] != 1 || r[NCTR_OF] != 1) return true;
+    }
+    return false;
+  };
+  const auto &grid = default_grid();
+  if (has_contraction(bas, nbas) || has_contraction(abas, anbas)) {
+    const auto co = contracted_basis_from(atm, bas, nbas, env);
+    const auto ca = contracted_basis_from(aatm, abas, anbas, aenv);
+    const auto T = intti::coulomb_3c(co, ca, grid);
+    for (std::size_t i = 0; i < T.size(); ++i) out[i] = T[i];
+    return 0;
+  }
+  auto build = [](const int *a, const int *b, int nb, const double *e,
+                  std::vector<double> &scale, intti::ShellBasis<double> &basis) {
+    std::vector<intti::PrimitiveShell<double>> shells;
+    for (int ish = 0; ish < nb; ++ish) {
+      const ShellInfo s = decode_shell(ish, a, b, e);
+      shells.push_back(intti::PrimitiveShell<double>{
+          s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+      const double c = s.coeff[0] * coeff_rescale(s.l);
+      for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+    }
+    basis = intti::make_basis(shells);
+  };
+  std::vector<double> oscale, ascale;
+  intti::ShellBasis<double> orb, aux;
+  build(atm, bas, nbas, env, oscale, orb);
+  build(aatm, abas, anbas, aenv, ascale, aux);
+  const int nao = orb.nao, naux = aux.nao;
+  const auto T = intti::coulomb_3c(orb, aux, grid);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j)
+      for (int P = 0; P < naux; ++P) {
+        const std::size_t o = (static_cast<std::size_t>(i) * nao + j) * naux + P;
+        out[o] = T[o] * oscale[i] * oscale[j] * ascale[P];
+      }
+  return 0;
+}
+
 extern "C" int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                                 const int *bas, int nbas, const double *env, void * /*opt*/,
                                 double * /*cache*/) {
