@@ -399,6 +399,25 @@ def main():
     for a, b in zip(np.atleast_1d(f_ref), np.atleast_1d(f_our)):
         print(f"    PySCF {a:12.4f}    intti {b:12.4f}    diff {b - a:+.2e}")
     df = np.abs(np.atleast_1d(f_our) - np.atleast_1d(f_ref)).max()
+    # CONTRACTED basis sets: everything above runs on an uncontracted basis,
+    # which is what intti_get_jk used to accept. Standard basis sets are all
+    # contracted, so this is the difference between a demonstrator and something
+    # runnable. cc-pVDZ is generally contracted (nctr = 2), not merely segmented.
+    print("contracted basis sets, PySCF's SCF on intti J/K:")
+    for bname in ("sto-3g", "6-31g", "cc-pvdz"):
+        cmol = gto.M(atom=ATOM, basis=bname, unit="Bohr", cart=True, verbose=0)
+        cref = scf.RHF(cmol)
+        cref.conv_tol = 1e-12
+        ce_ref = cref.kernel()
+        cmf = scf.RHF(cmol)
+        cmf.conv_tol = 1e-12
+        cmf.get_jk = make_get_jk(fn, cmol)
+        ce = cmf.kernel()
+        assert cmf.converged, f"{bname}: SCF on intti J/K did not converge"
+        nctr = max(int(cmol._bas[i, 3]) for i in range(cmol.nbas))
+        print(f"    {bname:9s} nao={cmol.nao_nr():3d} max_nctr={nctr}  "
+              f"E {ce:.12f}  diff {ce - ce_ref:+.2e}")
+        ok = ok and abs(ce - ce_ref) < 1e-9
     print("mol.intor calls served by intti:", dict(sorted(served.items())))
     # a patch that never fired would look identical to success
     assert served.get("int1e_ipovlp", 0) > 0, "mol.intor interception never fired"

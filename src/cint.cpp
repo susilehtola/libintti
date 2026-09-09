@@ -44,11 +44,13 @@
 #include "intti/erihess.hpp"
 #include "intti/geohess.hpp"
 #include "intti/kernel.hpp"
+#include "intti/contracted.hpp"
 #include "intti/deriv.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/erihess.hpp"
 #include "intti/geohess.hpp"
 #include "intti/kernel.hpp"
+#include "intti/contracted.hpp"
 #include "intti/deriv.hpp"
 #include "intti/nuclear.hpp"
 #include "intti/math.hpp"
@@ -311,6 +313,40 @@ extern "C" int intti_int2e_sph(double *out, const int *shls, const int *atm, int
   return eval_int2e(out, shls, atm, natm, bas, nbas, env, true);
 }
 
+
+// Build a ContractedBasis from libcint's atm/bas/env, in PySCF's cart=True
+// convention.
+//
+// env's contraction coefficients already carry PySCF's internal gto_norm; the
+// contracted builders instead apply cart_norm_pyscf(l, alpha) to each primitive
+// (detail::effective_coeff). Absorbing the difference into the shell
+// coefficients here,
+//     coeff[c][p] = env_coeff[c][p] * coeff_rescale(l) / cart_norm_pyscf(l, a_p)
+// makes intti's contracted AO EQUAL PySCF's, so no output rescaling is needed at
+// all -- unlike the primitive path, which carries a per-AO diagonal through the
+// density and back. Same conversion factor, applied once and in the right place.
+intti::ContractedBasis<double> contracted_basis_from(const int *atm, const int *bas,
+                                                     int nbas, const double *env) {
+  std::vector<intti::ContractedShell<double>> shells;
+  shells.reserve(nbas);
+  for (int ish = 0; ish < nbas; ++ish) {
+    const ShellInfo si = decode_shell(ish, atm, bas, env);
+    intti::ContractedShell<double> sh;
+    sh.l = si.l;
+    for (int d = 0; d < 3; ++d) sh.center[d] = si.center[d];
+    sh.alpha.assign(si.alpha, si.alpha + si.nprim);
+    sh.coeff.resize(static_cast<std::size_t>(si.nctr) * si.nprim);
+    const double rs = coeff_rescale(si.l);
+    for (int c = 0; c < si.nctr; ++c)
+      for (int p = 0; p < si.nprim; ++p)
+        sh.coeff[static_cast<std::size_t>(c) * si.nprim + p] =
+            si.coeff[static_cast<std::size_t>(c) * si.nprim + p] * rs /
+            intti::cart_norm_pyscf(si.l, si.alpha[p]);
+    shells.push_back(std::move(sh));
+  }
+  return intti::make_contracted_basis(std::move(shells));
+}
+
 // ---------------------------------------------------------------------------
 // Matrix-level entry point: PySCF's get_jk, served by intti's J/K builders.
 //
@@ -347,6 +383,39 @@ extern "C" int intti_get_jk(double *vj, double *vk, const double *dms, int ndm,
                             int natm, const int *bas, int nbas, const double *env,
                             double omega, double tau) {
   ensure_kokkos();
+  // Contracted basis: route to the contraction-aware builders. They share each
+  // primitive intermediate across every contracted function and Cartesian
+  // component, so this is not a decontract-recontract -- the contraction enters
+  // only in the density fold and the output gather.
+  bool contracted = false;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const int *b = bas + static_cast<std::size_t>(ish) * 8;
+    if (b[NPRIM_OF] != 1 || b[NCTR_OF] != 1) contracted = true;
+  }
+  if (contracted) {
+    const intti::TGrid<double> cgrid =
+        (omega == 0.0) ? default_grid() : intti::make_tgrid(intti::erf_rs<double>(omega));
+    const auto cbasis = contracted_basis_from(atm, bas, nbas, env);
+    const int cnao = cbasis.nao;
+    const std::size_t cn2 = static_cast<std::size_t>(cnao) * cnao;
+    for (int d = 0; d < ndm; ++d) {
+      const int h = hermi ? hermi[d] : 1;
+      if (h != 1) return -6; // contracted path: symmetric densities only for now
+      if (with_j && vj) {
+        std::vector<double> J(cn2, 0.0);
+        intti::coulomb_build(cbasis, dms + static_cast<std::size_t>(d) * cn2, cgrid,
+                             J.data(), tau);
+        for (std::size_t i = 0; i < cn2; ++i) vj[d * cn2 + i] = J[i];
+      }
+      if (with_k && vk) {
+        std::vector<double> K(cn2, 0.0);
+        intti::exchange_build(cbasis, dms + static_cast<std::size_t>(d) * cn2, cgrid,
+                              K.data(), tau);
+        for (std::size_t i = 0; i < cn2; ++i) vk[d * cn2 + i] = K[i];
+      }
+    }
+    return 0;
+  }
   std::vector<intti::PrimitiveShell<double>> shells;
   std::vector<double> scale; // per-AO PySCF/intti conversion
   for (int ish = 0; ish < nbas; ++ish) {
