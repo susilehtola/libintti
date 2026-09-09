@@ -57,6 +57,22 @@ template <class Real> struct RIFit {
 /// when it does not -- or when the density is naturally factorised, where
 /// ri_k_occ_tiled is cheaper than this on both counts (its cost scales with the
 /// RANK of the density, nocc, rather than with nao).
+/// tau_lin is a RELATIVE eigenvalue cutoff on the auxiliary metric, and the
+/// default is not merely conservative -- it has to be. A standard Coulomb
+/// fitting set is ill-conditioned in Cartesian form: cc-pVDZ-JKFIT on water
+/// gives eigenvalues 4.0e-08 .. 8.1e+02, a condition number of 2e10. Two
+/// consequences, both measured against PySCF's density-fitted J/K:
+///   * tau_lin must stay BELOW the smallest eigenvalue relative to the largest,
+///     here ~5e-11. Raising it to 1e-10 discards a genuine fitting direction
+///     rather than a null one, and J/K degrade to 3e-06; 1e-08 gives 1.4e-04.
+///     These are silent -- the fit still succeeds, it just fits a smaller space.
+///   * even with nothing discarded, the attainable accuracy is bounded by
+///     cond * eps ~ 2e-06 relative in the coefficients, which shows up as ~5e-08
+///     in J/K. That is the metric's conditioning, not the quadrature: holding
+///     the basis fixed and sweeping the largest auxiliary exponent over
+///     10 .. 10^4 leaves the error flat at ~5e-13, so the t-grid is not the
+///     limit here.
+///
 /// Templated on the BASIS types rather than written twice: ri_fit touches a
 /// basis only through .nao and the two- and three-centre Coulomb builders, and
 /// those already have contraction-aware overloads (ncenter.hpp). So a
