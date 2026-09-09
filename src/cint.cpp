@@ -644,6 +644,49 @@ extern "C" int intti_ip1_h1_jk(double *vj1, double *vj2, double *vk1, double *vk
 extern "C" int intti_int1e_ip(double *out, int which, int iatm, const int *atm, int natm,
                               const int *bas, int nbas, const double *env) {
   ensure_kokkos();
+  // Charges for the nuclear-attraction variants, shared by both basis routes.
+  std::vector<intti::PointCharge<double>> charges;
+  if (which == 2) {
+    for (int a = 0; a < natm; ++a) {
+      const int *ai = atm + static_cast<std::size_t>(a) * 6;
+      const double *c = env + ai[PTR_COORD];
+      charges.push_back({-static_cast<double>(ai[CHARGE_OF]), {c[0], c[1], c[2]}});
+    }
+  } else if (which == 3) {
+    if (iatm < 0 || iatm >= natm) return -4;
+    const int *ai = atm + static_cast<std::size_t>(iatm) * 6;
+    const double *c = env + ai[PTR_COORD];
+    charges.push_back({1.0, {c[0], c[1], c[2]}}); // unweighted: caller applies -Z
+  } else if (which != 0 && which != 1) {
+    return -5;
+  }
+  // Contracted basis: the contraction-aware derivative builders (contracted.hpp)
+  // share each primitive-pair shift block across every contracted-function pair.
+  // Without this branch mol.intor interception worked only on an uncontracted
+  // basis, which is to say on no standard basis set -- PySCF's own gradient and
+  // Hessian code could not run on intti integrals for a real calculation.
+  // contracted_basis_from folds the PySCF normalization into the coefficients,
+  // so no per-AO rescale is applied on the way out.
+  bool contracted = false;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const int *b = bas + static_cast<std::size_t>(ish) * 8;
+    if (b[NPRIM_OF] != 1 || b[NCTR_OF] != 1) contracted = true;
+  }
+  if (contracted) {
+    const auto cbasis = contracted_basis_from(atm, bas, nbas, env);
+    const std::size_t cN = static_cast<std::size_t>(cbasis.nao) * cbasis.nao;
+    std::array<std::vector<double>, 3> Gc;
+    if (which == 0)
+      Gc = intti::overlap_deriv(cbasis);
+    else if (which == 1)
+      Gc = intti::kinetic_deriv(cbasis);
+    else
+      Gc = intti::nuclear_deriv(cbasis, charges, default_grid());
+    for (int x = 0; x < 3; ++x)
+      for (std::size_t o = 0; o < cN; ++o)
+        out[static_cast<std::size_t>(x) * cN + o] = Gc[x][o];
+    return 0;
+  }
   std::vector<intti::PrimitiveShell<double>> shells;
   std::vector<double> scale;
   for (int ish = 0; ish < nbas; ++ish) {
@@ -659,28 +702,12 @@ extern "C" int intti_int1e_ip(double *out, int which, int iatm, const int *atm, 
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
   if (static_cast<int>(scale.size()) != nao) return -2;
   std::array<std::vector<double>, 3> G;
-  if (which == 0) {
+  if (which == 0)
     G = intti::overlap_deriv(basis);
-  } else if (which == 1) {
+  else if (which == 1)
     G = intti::kinetic_deriv(basis);
-  } else {
-    std::vector<intti::PointCharge<double>> ch;
-    if (which == 2) {
-      for (int a = 0; a < natm; ++a) {
-        const int *ai = atm + static_cast<std::size_t>(a) * 6;
-        const double *c = env + ai[PTR_COORD];
-        ch.push_back({-static_cast<double>(ai[CHARGE_OF]), {c[0], c[1], c[2]}});
-      }
-    } else if (which == 3) {
-      if (iatm < 0 || iatm >= natm) return -4;
-      const int *ai = atm + static_cast<std::size_t>(iatm) * 6;
-      const double *c = env + ai[PTR_COORD];
-      ch.push_back({1.0, {c[0], c[1], c[2]}}); // unweighted: caller applies -Z
-    } else {
-      return -5;
-    }
-    G = intti::nuclear_deriv(basis, ch, default_grid());
-  }
+  else
+    G = intti::nuclear_deriv(basis, charges, default_grid());
   for (int x = 0; x < 3; ++x)
     for (int i = 0; i < nao; ++i)
       for (int j = 0; j < nao; ++j) {

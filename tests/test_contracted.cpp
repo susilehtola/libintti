@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include "intti/contracted.hpp"
+#include "intti/deriv.hpp"
 #include "intti/fock.hpp"
 #include "intti/jk.hpp"
 #include "intti/kernel.hpp"
@@ -378,6 +379,61 @@ TEST(Contracted, GeneralAndAntisymmetricDensity) {
       EXPECT_LT(sj, 1e-14) << "J(antisymmetric) should vanish";
       EXPECT_GT(sk, 1e-3) << "K(antisymmetric) should not vanish";
     }
+  }
+}
+
+// Derivative integrals over a contracted basis. The reference is the primitive
+// builder over the decontracted basis, congruence-transformed back -- the same
+// C M C^T identity the energy matrices use, which holds for the gradient
+// because differentiation is linear in the contraction coefficients (the
+// coefficients do not depend on the nuclear position).
+//
+// The gradient is NOT symmetric, so this also checks the mirror = 0 ordered-pair
+// path of contracted_1e_multi: a transpose-symmetric bug would be invisible on
+// the energy matrices and would silently halve the force.
+TEST(Contracted, DerivativesVsDecontractRecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  std::vector<intti::PointCharge<double>> chg = {{-8.0, {0.0, 0.0, 0.0}},
+                                                 {-1.0, {0.0, 0.1, 1.4}}};
+
+  intti::ShellBasis<double> pbasis;
+  std::vector<double> C;
+  const int npao = decontract(cb, pbasis, C);
+
+  auto cS = intti::overlap_deriv(cb);
+  auto cT = intti::kinetic_deriv(cb);
+  auto cV = intti::nuclear_deriv(cb, chg, grid);
+  auto pS = intti::overlap_deriv(pbasis);
+  auto pT = intti::kinetic_deriv(pbasis);
+  auto pV = intti::nuclear_deriv(pbasis, chg, grid);
+
+  const char *names[3] = {"ipovlp", "ipkin", "ipnuc"};
+  const std::array<std::vector<double>, 3> *ours[3] = {&cS, &cT, &cV};
+  const std::array<std::vector<double>, 3> *prim[3] = {&pS, &pT, &pV};
+  for (int op = 0; op < 3; ++op) {
+    double asym = 0;
+    for (int d = 0; d < 3; ++d) {
+      auto ref = conjugate(C, n, npao, (*prim[op])[d]);
+      const auto &got = (*ours[op])[d];
+      double worst = 0, scale = 0;
+      for (std::size_t i = 0; i < got.size(); ++i) {
+        worst = std::max(worst, std::abs(got[i] - ref[i]));
+        scale = std::max(scale, std::abs(ref[i]));
+      }
+      EXPECT_LT(worst, 1e-11 * std::max(scale, 1.0))
+          << names[op] << " component " << d << " != decontract/recontract";
+      EXPECT_GT(scale, 1e-3) << names[op] << " component " << d << " is trivially zero";
+      for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+          asym = std::max(asym, std::abs(got[i * n + j] + got[j * n + i]));
+    }
+    // The nuclear-attraction gradient is genuinely non-antisymmetric (the
+    // operator has its own centre dependence, so translational invariance does
+    // not close on the bra derivative alone). If it came out antisymmetric the
+    // ordered-pair path would not be doing anything.
+    if (op == 2) EXPECT_GT(asym, 1e-3) << "ipnuc unexpectedly antisymmetric";
   }
 }
 

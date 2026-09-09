@@ -433,6 +433,19 @@ def main():
             dk = np.abs(ok_ - rk).max()
             print(f"    {bname:9s} {tag:8s} hermi={h}  dJ {dj:.2e}  dK {dk:.2e}")
             ok = ok and dj < 1e-11 and dk < 1e-11 and np.abs(rk).max() > 1e-3
+        # One-electron DERIVATIVES on the contracted basis. These are what
+        # mol.intor interception serves, so without them PySCF's own gradient
+        # and Hessian code could only run on an uncontracted basis.
+        cget = make_1e(fn_1e, cmol)
+        checks = [("ipovlp", cget(0), cmol.intor("int1e_ipovlp", comp=3)),
+                  ("ipkin", cget(1), cmol.intor("int1e_ipkin", comp=3)),
+                  ("ipnuc", cget(2), cmol.intor("int1e_ipnuc", comp=3))]
+        with cmol.with_rinv_at_nucleus(1):
+            checks.append(("iprinv", cget(3, 1), cmol.intor("int1e_iprinv", comp=3)))
+        for tag, o, r in checks:
+            d = np.abs(o - r).max()
+            print(f"    {bname:9s} {tag:8s} d {d:.2e}  |ref| {np.abs(r).max():.2e}")
+            ok = ok and d < 1e-10 * max(np.abs(r).max(), 1.0)
     print("mol.intor calls served by intti:", dict(sorted(served.items())))
     # a patch that never fired would look identical to success
     assert served.get("int1e_ipovlp", 0) > 0, "mol.intor interception never fired"

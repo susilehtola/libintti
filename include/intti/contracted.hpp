@@ -33,6 +33,7 @@
 
 #include "gto.hpp"
 #include "normalization.hpp"
+#include "deriv.hpp"      // detail::overlap_deriv_block / kinetic_ / nuclear_
 #include "nuclear.hpp"    // detail::attraction_pair_block, PointCharge
 #include "oneel.hpp" // detail::overlap_1d / kinetic_1d / multipole_1d, pair_gauss_prefactor
 #include "tgrid.hpp"
@@ -148,8 +149,14 @@ void scatter_contracted(std::vector<Real> &M, const ContractedBasis<Real> &basis
 /// primitive pair and accumulates it, weighted by d_{cp} cart_norm_pyscf, into
 /// every contracted-function pair -- the shared-intermediate general-contraction
 /// path. Returns `ncomp` nao x nao matrices; `mirror` sets the transpose sign
-/// (+1 symmetric, -1 antisymmetric). A pair whose Gaussian prefactor is <= tau
-/// is skipped (tau=0 skips only exactly-zero blocks).
+/// (+1 symmetric, -1 antisymmetric, 0 = no symmetry). With mirror = 0 the
+/// driver walks ALL ordered shell pairs and writes each block once, which is
+/// what derivative matrices need: <nabla mu|nu> is neither symmetric nor
+/// antisymmetric in general (translational invariance does make the S and T
+/// gradients antisymmetric, but the nuclear-attraction gradient is not, so the
+/// derivative builders take one uniform ordered-pair path). A pair whose
+/// Gaussian prefactor is <= tau is skipped (tau=0 skips only exactly-zero
+/// blocks).
 template <class Real, class BlockFn>
 std::vector<std::vector<Real>>
 contracted_1e_multi(const ContractedBasis<Real> &basis, int ncomp, int mirror,
@@ -160,7 +167,7 @@ contracted_1e_multi(const ContractedBasis<Real> &basis, int ncomp, int mirror,
   const int ns = static_cast<int>(basis.shells.size());
   std::vector<Real> pblk, cblk;
   for (int a = 0; a < ns; ++a)
-    for (int b = a; b < ns; ++b) {
+    for (int b = (mirror ? a : 0); b < ns; ++b) {
       const auto &A = basis.shells[a], &B = basis.shells[b];
       const int la = A.l, lb = B.l, nca = ncart(la), ncb = ncart(lb);
       const int npa = A.nprim(), npb = B.nprim(), nctA = A.nctr(), nctB = B.nctr();
@@ -495,6 +502,58 @@ void exchange_build(const ContractedBasis<Real> &basis, const Real *D,
   detail::exchange_build_contracted_impl(prims, cshell, cprim, ecoef, ecoff, nprim_c,
                                          nctr_c, basis.ao_off, naoc, D, grid, tab, tau, Q,
                                          maxDeff, K);
+}
+
+// ---- derivative integrals over a generally-contracted basis -----------------
+// The shift algebra lives once, in deriv.hpp's per-primitive-pair blocks; here
+// it is driven by contracted_1e_multi, so a primitive-pair block is evaluated
+// ONCE and shared across every contracted-function pair -- the same
+// shared-intermediate property the energy builders have. Without this the
+// facade could only differentiate an uncontracted basis, i.e. no standard basis
+// set, so gradients and Hessians were a demonstrator rather than something
+// runnable. mirror = 0: gradient matrices carry no transpose symmetry.
+
+/// Overlap gradient <nabla mu | nu> over a contracted basis: three nao x nao
+/// matrices, PySCF int1e_ipovlp (cart=True) with the bra-gradient convention.
+template <class Real>
+std::array<std::vector<Real>, 3> overlap_deriv(const ContractedBasis<Real> &basis,
+                                               Real tau = Real(0)) {
+  auto out = detail::contracted_1e_multi(
+      basis, 3, 0, tau,
+      [](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        detail::overlap_deriv_block(sa, sb, o);
+      });
+  return {std::move(out[0]), std::move(out[1]), std::move(out[2])};
+}
+
+/// Kinetic-energy gradient <nabla mu | T | nu> over a contracted basis, PySCF
+/// int1e_ipkin.
+template <class Real>
+std::array<std::vector<Real>, 3> kinetic_deriv(const ContractedBasis<Real> &basis,
+                                               Real tau = Real(0)) {
+  auto out = detail::contracted_1e_multi(
+      basis, 3, 0, tau,
+      [](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        detail::kinetic_deriv_block(sa, sb, o);
+      });
+  return {std::move(out[0]), std::move(out[1]), std::move(out[2])};
+}
+
+/// Nuclear-attraction gradient <nabla mu | sum_C w_C/|r-R_C| | nu> over a
+/// contracted basis. Charges carrying w = -Z give PySCF int1e_ipnuc; a single
+/// unit charge gives int1e_iprinv. The Hellmann-Feynman dR_C term is a separate
+/// operator and is not included.
+template <class Real>
+std::array<std::vector<Real>, 3>
+nuclear_deriv(const ContractedBasis<Real> &basis,
+              const std::vector<PointCharge<Real>> &charges, const TGrid<Real> &grid,
+              Real tau = Real(0)) {
+  auto out = detail::contracted_1e_multi(
+      basis, 3, 0, tau,
+      [&](const PrimitiveShell<Real> &sa, const PrimitiveShell<Real> &sb, Real *o) {
+        detail::nuclear_deriv_block(sa, sb, charges, grid, o);
+      });
+  return {std::move(out[0]), std::move(out[1]), std::move(out[2])};
 }
 
 } // namespace intti
