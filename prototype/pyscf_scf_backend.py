@@ -36,7 +36,7 @@ import ctypes
 import sys
 
 import numpy as np
-from pyscf import gto, scf
+from pyscf import df, gto, scf
 from pyscf.grad import rhf as grad_rhf
 from pyscf.hessian import rhf as hess_rhf
 from pyscf.hessian import thermo
@@ -77,7 +77,11 @@ def load(lib_path):
     hs = lib.intti_hess_skeleton
     hs.restype = ctypes.c_int
     hs.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
-    return f, g, hs, ip1, e1
+    rih = lib.intti_ri_hess_jk
+    rih.restype = ctypes.c_int
+    rih.argtypes = [d, d, d, d, ctypes.c_int, i, ctypes.c_int, i, ctypes.c_int, d,
+                    i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
+    return f, g, hs, ip1, e1, rih
 
 
 def make_1e(fn, mol):
@@ -292,11 +296,80 @@ def make_get_jk(fn, mol, tau=0.0):
     return get_jk
 
 
+
+def df_hessian_check(fn_rih, atoms, orb_basis, aux_basis, label):
+    """The RI two-electron Hessians against pyscf.df.hessian.rhf, the seam.
+
+    Until now ri_j_hessian and ri_k_hessian_occ were checked only against finite
+    differences of OUR OWN RI gradients -- a real consistency check, but an
+    internal one. This is the independent oracle.
+
+    The conventions are derived, not fitted: both sides differentiate the same
+    energy expressions, so with D = CL CR^T,
+
+        ri_j_hessian(D)          = d^2[+1/2 Tr(D J)] ==  PySCF's ej
+        ri_k_hessian_occ(CL, CR) = d^2[-1/4 Tr(D K)] == -PySCF's ek
+
+    and a closed-shell dm0 = 2 C_occ C_occ^T is passed as CL = CR = sqrt(2)C_occ.
+    ej and ek are compared SEPARATELY; summing them first would let an error in
+    one hide inside the other.
+
+    Our Hessian is indexed by shell centre, orbital shells then auxiliary
+    shells. Folding both blocks onto atoms is what produces PySCF's
+    auxbasis_response = 2 -- the auxiliary response is not a separate term for
+    us, it is the auxiliary block of the same matrix.
+    """
+    from pyscf.df.hessian import rhf as dfhess
+    dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+    mol = gto.M(atom=atoms, basis=orb_basis, unit="Bohr", cart=True, verbose=0)
+    auxmol = df.addons.make_auxmol(mol, aux_basis)
+    mf = scf.RHF(mol).density_fit(auxbasis=aux_basis)
+    mf.conv_tol = 1e-12
+    mf.kernel()
+    hobj = dfhess.Hessian(mf)
+    hobj.auxbasis_response = 2
+    _, ej, ek = dfhess._partial_hess_ejk(hobj)
+
+    nocc = int((mf.mo_occ > 0).sum())
+    cocc = np.ascontiguousarray(mf.mo_coeff[:, mf.mo_occ > 0] * np.sqrt(2.0))
+    dm0 = np.ascontiguousarray(mf.make_rdm1())
+    ncen = mol.nbas + auxmol.nbas
+    hj = np.zeros((3 * ncen, 3 * ncen))
+    hk = np.zeros((3 * ncen, 3 * ncen))
+    atmA = np.asarray(mol._atm, dtype=np.int32, order="C")
+    basA = np.asarray(mol._bas, dtype=np.int32, order="C")
+    envA = np.asarray(mol._env, dtype=np.float64, order="C")
+    atmB = np.asarray(auxmol._atm, dtype=np.int32, order="C")
+    basB = np.asarray(auxmol._bas, dtype=np.int32, order="C")
+    envB = np.asarray(auxmol._env, dtype=np.float64, order="C")
+    rc = fn_rih(dptr(hj), dptr(hk), dptr(dm0), dptr(cocc), nocc,
+                iptr(atmA), mol.natm, iptr(basA), mol.nbas, dptr(envA),
+                iptr(atmB), auxmol.natm, iptr(basB), auxmol.nbas, dptr(envB), 1e-12)
+    assert rc == 0, f"intti_ri_hess_jk failed, rc={rc}"
+
+    sh_atom = np.concatenate([basA[:, 0], basB[:, 0]])
+
+    def fold(H):
+        out = np.zeros((mol.natm, mol.natm, 3, 3))
+        for p in range(ncen):
+            for q in range(ncen):
+                out[sh_atom[p], sh_atom[q]] += H[3 * p:3 * p + 3, 3 * q:3 * q + 3]
+        return out
+
+    dj = np.abs(fold(hj) - ej).max()
+    dk = np.abs(fold(hk) + ek).max()
+    print(f"    {label:22s} nao={mol.nao_nr():3d} naux={auxmol.nao_nr():3d}  "
+          f"ej {dj:.2e} (|{np.abs(ej).max():.2e}|)  -ek {dk:.2e} (|{np.abs(ek).max():.2e}|)")
+    return (dj < 1e-10 and dk < 1e-10
+            and np.abs(ej).max() > 1e-2 and np.abs(ek).max() > 1e-2)
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
-    fn, fn_ip1, fn_hess, fn_h1, fn_1e = load(sys.argv[1])
+    fn, fn_ip1, fn_hess, fn_h1, fn_1e, fn_rih = load(sys.argv[1])
     basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
     mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
 
@@ -479,6 +552,29 @@ def main():
         # each reference must be non-trivial, or agreement means nothing
         ok = (ok and dcg < 1e-9 and dch < 1e-9 and dcH < 1e-8 and dcf < 1e-4
               and np.abs(cg_ref).max() > 1e-3 and np.abs(cH_ref).max() > 1e-2)
+    # RI (density-fitted) two-electron Hessians vs pyscf.df.hessian.rhf. Both
+    # bases uncontracted: the RI derivative layer has no contraction-aware
+    # builders yet, unlike the direct J/K path.
+    print("RI two-electron Hessians vs pyscf.df.hessian.rhf:")
+    ok = df_hessian_check(
+        fn_rih, ATOM,
+        {"O": uncontracted((0, [3.0, 0.9, 0.3]), (1, [1.1, 0.35])),
+         "H": uncontracted((0, [1.3, 0.35]))},
+        {"O": uncontracted((0, [6.0, 1.8, 0.6]), (1, [2.0, 0.7])),
+         "H": uncontracted((0, [2.4, 0.7]))},
+        "H2O sp/sp-aux") and ok
+    # a second system with different connectivity, and an auxiliary basis
+    # carrying d functions -- the aux angular momentum is what the auxiliary
+    # response terms actually exercise
+    ok = df_hessian_check(
+        fn_rih,
+        [["N", (0.0, 0.0, 0.0)], ["H", (1.9, 0.0, 0.3)],
+         ["H", (-0.9, 1.6, 0.3)], ["H", (-0.9, -1.6, 0.3)]],
+        {"N": uncontracted((0, [4.0, 1.0]), (1, [0.9])),
+         "H": uncontracted((0, [1.2, 0.3]))},
+        {"N": uncontracted((0, [7.0, 2.0]), (1, [1.6]), (2, [1.1])),
+         "H": uncontracted((0, [2.2, 0.6]), (1, [0.8]))},
+        "NH3 d-aux") and ok
     print("mol.intor calls served by intti:", dict(sorted(served.items())))
     # a patch that never fired would look identical to success
     assert served.get("int1e_ipovlp", 0) > 0, "mol.intor interception never fired"

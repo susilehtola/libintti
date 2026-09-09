@@ -47,6 +47,7 @@
 #include "intti/contracted.hpp"
 #include "intti/deriv.hpp"
 #include "intti/nuclear.hpp"
+#include "intti/rigrad.hpp"
 #include "intti/erihess.hpp"
 #include "intti/geohess.hpp"
 #include "intti/kernel.hpp"
@@ -305,6 +306,92 @@ extern "C" int intti_int2e_cart(double *out, const int *shls, const int *atm, in
                                  const int *bas, int nbas, const double *env, void * /*opt*/,
                                  double * /*cache*/) {
   return eval_int2e(out, shls, atm, natm, bas, nbas, env, false);
+}
+
+
+// ---------------------------------------------------------------------------
+// Density-fitted (RI) two-electron Hessians.
+//
+// The seam is pyscf.df.hessian.rhf._partial_hess_ejk, which returns (e1, ej, ek)
+// with partial_hess_elec = e1 + ej - ek. The conventions line up because both
+// sides differentiate the same energy expressions:
+//
+//   ri_j_hessian(D)                 = d^2 [ +1/2 Tr(D J) ]  ==  PySCF ej
+//   ri_k_hessian_occ(CL, CR)        = d^2 [ -1/4 Tr(D K) ]  == -PySCF ek
+//
+// with D = CL CR^T, so a closed-shell dm0 = 2 C_occ C_occ^T is passed as
+// CL = CR = sqrt(2) C_occ. Both are returned separately rather than summed, so
+// a caller can check them independently -- summing first would let an error in
+// one hide inside the other.
+//
+// Output is (3 ncen) x (3 ncen) row-major with ncen = nbas + anbas: ORBITAL
+// shell centres first, then AUXILIARY shell centres. The caller folds shells
+// onto atoms with bas[:,ATOM_OF] / abas[:,ATOM_OF], which is also what makes
+// the auxiliary-basis response terms (PySCF's auxbasis_response) come out --
+// they are simply the auxiliary block of the same matrix.
+//
+// RESTRICTIONS: both bases must be uncontracted Cartesian. The RI derivative
+// layer has no contraction-aware builders yet -- unlike the direct J/K path,
+// which does. Reported rather than silently mis-answered.
+extern "C" int intti_ri_hess_jk(double *hj, double *hk, const double *dm,
+                                const double *cocc, int nvec, const int *atm, int natm,
+                                const int *bas, int nbas, const double *env,
+                                const int *aatm, int anatm, const int *abas, int anbas,
+                                const double *aenv, double tau_lin) {
+  ensure_kokkos();
+  (void)natm;
+  (void)anatm;
+  auto build = [](const int *a, const int *b, int nb, const double *e,
+                  std::vector<double> &scale, intti::ShellBasis<double> &out) {
+    std::vector<intti::PrimitiveShell<double>> shells;
+    for (int ish = 0; ish < nb; ++ish) {
+      const ShellInfo s = decode_shell(ish, a, b, e);
+      if (s.nctr != 1 || s.nprim != 1) return -1;
+      shells.push_back(intti::PrimitiveShell<double>{
+          s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+      const double c = s.coeff[0] * coeff_rescale(s.l);
+      for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+    }
+    out = intti::make_basis(shells);
+    return 0;
+  };
+  std::vector<double> oscale, ascale;
+  intti::ShellBasis<double> orb, aux;
+  if (build(atm, bas, nbas, env, oscale, orb) != 0) return -1;
+  if (build(aatm, abas, anbas, aenv, ascale, aux) != 0) return -1;
+  const int nao = orb.nao;
+  if (static_cast<int>(oscale.size()) != nao) return -2;
+  if (static_cast<int>(ascale.size()) != aux.nao) return -2;
+  const std::size_t dim = static_cast<std::size_t>(3) * (nbas + anbas);
+  const auto &grid = default_grid();
+
+  // The AUXILIARY normalization does not need rescaling on the way out: the
+  // Hessian is a scalar contraction over auxiliary indices, and the fit
+  // coefficients absorb whatever convention the auxiliary AOs carry, as long as
+  // the metric M and the three-centre integrals use the SAME one. Only the
+  // orbital-side density has to be converted.
+  if (hj) {
+    if (!dm) return -7;
+    std::vector<double> Ds(static_cast<std::size_t>(nao) * nao);
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j)
+        Ds[static_cast<std::size_t>(i) * nao + j] =
+            dm[static_cast<std::size_t>(i) * nao + j] * oscale[i] * oscale[j];
+    const auto H = intti::ri_j_hessian(orb, aux, Ds.data(), grid, tau_lin);
+    for (std::size_t i = 0; i < dim * dim; ++i) hj[i] = H[i];
+  }
+  if (hk) {
+    if (!cocc || nvec < 1) return -7;
+    std::vector<double> Cs(static_cast<std::size_t>(nao) * nvec);
+    for (int i = 0; i < nao; ++i)
+      for (int k = 0; k < nvec; ++k)
+        Cs[static_cast<std::size_t>(i) * nvec + k] =
+            cocc[static_cast<std::size_t>(i) * nvec + k] * oscale[i];
+    const auto H = intti::ri_k_hessian_occ(orb, aux, Cs.data(), Cs.data(), nvec, grid,
+                                           tau_lin);
+    for (std::size_t i = 0; i < dim * dim; ++i) hk[i] = H[i];
+  }
+  return 0;
 }
 
 extern "C" int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,

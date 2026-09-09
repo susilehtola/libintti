@@ -86,6 +86,19 @@ int intti_ip1_h1_jk(double *vj1, double *vj2, double *vk1, double *vk2, const do
 int intti_int1e_ip(double *out, int which, int iatm, const int *atm, int natm,
                    const int *bas, int nbas, const double *env);
 
+/* Density-fitted (RI) two-electron Hessians, the pyscf.df.hessian.rhf seam.
+ * hj = d^2[+1/2 Tr(D J)] (PySCF's ej); hk = d^2[-1/4 Tr(D K)] (PySCF's -ek),
+ * with D = cocc cocc^T -- pass cocc = sqrt(2) C_occ for a closed shell. Each is
+ * (3 ncen) x (3 ncen) row-major, ncen = nbas + anbas, ORBITAL shell centres
+ * then AUXILIARY shell centres; the caller folds shells onto atoms, which is
+ * also where the auxiliary-basis response comes from. Pass NULL to skip either.
+ * Both bases must be uncontracted Cartesian: the RI derivative layer has no
+ * contraction-aware builders yet. */
+int intti_ri_hess_jk(double *hj, double *hk, const double *dm, const double *cocc,
+                     int nvec, const int *atm, int natm, const int *bas, int nbas,
+                     const double *env, const int *aatm, int anatm, const int *abas,
+                     int anbas, const double *aenv, double tau_lin);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);
