@@ -394,6 +394,98 @@ extern "C" int intti_ri_hess_jk(double *hj, double *hk, const double *dm,
   return 0;
 }
 
+
+// Derivative RI J/K MATRICES, the pyscf.df.hessian.rhf._gen_jk seam (which
+// make_h1 wraps as h1ao[ia] = dh/dR_ia + vj1 - vk1/2, the CPHF right-hand side).
+//
+// vj[3*g + e] = dJ/dR_{g,e} and vk[3*g + e] = dK/dR_{g,e} at FIXED density, for
+// perturbation group g. `group` maps each of the nbas + anbas shell centres --
+// orbital shells first, then auxiliary -- onto a group; pass each shell's ATOM
+// and the output is per atom, which is both what the caller wants and what makes
+// this affordable. The library folds at the accumulation, so the shell-resolved
+// object (43 GB at nao = 1000 against a 2.4 GB atom-folded output) is never
+// built. Passing the identity map reproduces the shell-resolved form.
+//
+// The auxiliary-basis response is not a separate term here: it is the auxiliary
+// shells' contribution to whichever group carries them, so mapping aux shells to
+// their atoms is exactly PySCF's auxbasis_response = 2.
+//
+// D = cocc cocc^T, so a closed shell dm0 = 2 C_occ C_occ^T goes in as
+// cocc = sqrt(2) C_occ. Both bases must be uncontracted Cartesian.
+extern "C" int intti_ri_deriv_jk(double *vj, double *vk, const double *dm,
+                                 const double *cocc, int nvec, const int *group, int ngrp,
+                                 const int *atm, int natm, const int *bas, int nbas,
+                                 const double *env, const int *aatm, int anatm,
+                                 const int *abas, int anbas, const double *aenv,
+                                 double tau_lin) {
+  ensure_kokkos();
+  (void)natm;
+  (void)anatm;
+  auto build = [](const int *a, const int *b, int nb, const double *e,
+                  std::vector<double> &scale, intti::ShellBasis<double> &out) {
+    std::vector<intti::PrimitiveShell<double>> shells;
+    for (int ish = 0; ish < nb; ++ish) {
+      const ShellInfo s = decode_shell(ish, a, b, e);
+      if (s.nctr != 1 || s.nprim != 1) return -1;
+      shells.push_back(intti::PrimitiveShell<double>{
+          s.alpha[0], {s.center[0], s.center[1], s.center[2]}, s.l});
+      const double c = s.coeff[0] * coeff_rescale(s.l);
+      for (int k = 0; k < intti::ncart(s.l); ++k) scale.push_back(c);
+    }
+    out = intti::make_basis(shells);
+    return 0;
+  };
+  std::vector<double> oscale, ascale;
+  intti::ShellBasis<double> orb, aux;
+  if (build(atm, bas, nbas, env, oscale, orb) != 0) return -1;
+  if (build(aatm, abas, anbas, aenv, ascale, aux) != 0) return -1;
+  const int nao = orb.nao;
+  if (static_cast<int>(oscale.size()) != nao) return -2;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  if (!group || ngrp < 1) return -7;
+  std::vector<int> grp(group, group + (nbas + anbas));
+  for (int g : grp)
+    if (g < 0 || g >= ngrp) return -8;
+  const auto &grid = default_grid();
+
+  if (vj) {
+    if (!dm) return -7;
+    std::vector<double> Ds(N);
+    for (int i = 0; i < nao; ++i)
+      for (int j = 0; j < nao; ++j)
+        Ds[static_cast<std::size_t>(i) * nao + j] =
+            dm[static_cast<std::size_t>(i) * nao + j] * oscale[i] * oscale[j];
+    std::vector<intti::JKRequest<double>> reqs(1);
+    reqs[0].D = Ds.data();
+    reqs[0].sym = intti::DensitySymmetry::Symmetric;
+    reqs[0].terms = intti::FockTerms::Coulomb;
+    const auto r = intti::ri_j_deriv_build(orb, aux, reqs, grid, tau_lin, 0, grp);
+    for (int x = 0; x < 3 * ngrp; ++x)
+      for (int i = 0; i < nao; ++i)
+        for (int j = 0; j < nao; ++j) {
+          const std::size_t o = static_cast<std::size_t>(x) * N + i * nao + j;
+          vj[o] = r.J[0][o] * oscale[i] * oscale[j];
+        }
+  }
+  if (vk) {
+    if (!cocc || nvec < 1) return -7;
+    std::vector<double> Cs(static_cast<std::size_t>(nao) * nvec);
+    for (int i = 0; i < nao; ++i)
+      for (int k = 0; k < nvec; ++k)
+        Cs[static_cast<std::size_t>(i) * nvec + k] =
+            cocc[static_cast<std::size_t>(i) * nvec + k] * oscale[i];
+    const auto r = intti::ri_k_deriv_occ(orb, aux, Cs.data(), Cs.data(), nvec, grid,
+                                         tau_lin, 0, grp);
+    for (int x = 0; x < 3 * ngrp; ++x)
+      for (int i = 0; i < nao; ++i)
+        for (int j = 0; j < nao; ++j) {
+          const std::size_t o = static_cast<std::size_t>(x) * N + i * nao + j;
+          vk[o] = r.K[0][o] * oscale[i] * oscale[j];
+        }
+  }
+  return 0;
+}
+
 extern "C" int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                                 const int *bas, int nbas, const double *env, void * /*opt*/,
                                 double * /*cache*/) {

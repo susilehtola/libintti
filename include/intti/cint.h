@@ -99,6 +99,19 @@ int intti_ri_hess_jk(double *hj, double *hk, const double *dm, const double *coc
                      const double *env, const int *aatm, int anatm, const int *abas,
                      int anbas, const double *aenv, double tau_lin);
 
+/* Derivative RI J/K matrices, the pyscf.df.hessian.rhf._gen_jk seam: vj/vk are
+ * (3 ngrp) x nao x nao holding dJ/dR and dK/dR at fixed density. `group` maps
+ * the nbas + anbas shell centres (orbital first, then auxiliary) onto groups --
+ * pass each shell's ATOM for the per-atom form that make_h1 wants, which is
+ * also PySCF's auxbasis_response = 2. D = cocc cocc^T, so pass
+ * cocc = sqrt(2) C_occ for a closed shell. Pass NULL to skip either output.
+ * Both bases must be uncontracted Cartesian. */
+int intti_ri_deriv_jk(double *vj, double *vk, const double *dm, const double *cocc,
+                      int nvec, const int *group, int ngrp, const int *atm, int natm,
+                      const int *bas, int nbas, const double *env, const int *aatm,
+                      int anatm, const int *abas, int anbas, const double *aenv,
+                      double tau_lin);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);
