@@ -486,6 +486,32 @@ extern "C" int intti_get_jk_ip1(double *vj, double *vk, const double *dm, const 
                                 int natm, const int *bas, int nbas, const double *env,
                                 double tau) {
   ensure_kokkos();
+  // Contracted basis: the fan-out route (jk.hpp). The primitive quartet
+  // derivatives are evaluated once and scattered coefficient-weighted into
+  // every contracted index combination, so a generally-contracted gradient
+  // costs no more integrals than a segmented one. The density is taken as
+  // General -- PySCF's grad.rhf.get_jk convention transposes the ket indices,
+  // which is only immaterial for a symmetric D, and CPHF supplies densities
+  // that are not.
+  bool contracted = false;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const int *b = bas + static_cast<std::size_t>(ish) * 8;
+    if (b[NPRIM_OF] != 1 || b[NCTR_OF] != 1) contracted = true;
+  }
+  if (contracted) {
+    const auto cbasis = contracted_basis_from(atm, bas, nbas, env);
+    const std::size_t cN = static_cast<std::size_t>(cbasis.nao) * cbasis.nao;
+    std::vector<intti::JKRequest<double>> creq(1);
+    creq[0].D = dm;
+    creq[0].sym = intti::DensitySymmetry::General;
+    creq[0].terms = intti::FockTerms::CoulombExchange;
+    const auto cres = intti::jk_deriv_ao_build(cbasis, creq, default_grid(), tau);
+    for (std::size_t o = 0; o < 3 * cN; ++o) {
+      if (vj) vj[o] = cres.J[0][o];
+      if (vk) vk[o] = cres.K[0][o];
+    }
+    return 0;
+  }
   std::vector<intti::PrimitiveShell<double>> shells;
   std::vector<double> scale;
   for (int ish = 0; ish < nbas; ++ish) {

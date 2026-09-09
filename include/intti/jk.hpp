@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "batch.hpp"
+#include "contracted.hpp"
 #include "device.hpp"
 #include "erigrad.hpp" // detail::md_grad_terms, comp_index
 #include "fock.hpp"
@@ -429,6 +430,83 @@ JKDerivResult<Real> jk_deriv_build(const ShellBasis<Real> &basis,
   return detail::jk_deriv_general(basis, reqs, grid, tau);
 }
 
+namespace detail {
+
+/// Fan-out from a PRIMITIVE shell to the contracted AOs it feeds.
+///
+/// The two-electron DERIVATIVE kernels are driven over primitive shells, since
+/// the MD shift acts on a primitive (each primitive carries its own alpha,
+/// while the contraction coefficient is a position-independent constant). A
+/// generally-contracted basis is therefore handled by expanding it to its
+/// primitives and letting the DIGEST -- not the integral evaluation -- carry the
+/// contraction: every primitive quartet is evaluated exactly once and scattered,
+/// coefficient-weighted, into all nctr^4 contracted index combinations it feeds.
+/// That keeps the shared-intermediate property of the contracted energy
+/// builders; a decontract/recontract at the matrix level would instead pay
+/// O(nprim^4) integrals and defeat the point of general contraction.
+///
+/// For an already-primitive basis every nctr is 1 and every weight is 1, so the
+/// SAME kernel serves both bases with no second code path and no cost beyond a
+/// unit-trip loop -- which is why this is a fan-out map rather than a separate
+/// contracted kernel.
+///
+/// Contracted AO of primitive shell s, contracted function c, Cartesian k:
+///     base[s] + c*ncart(l) + k,  weight w[coff[s] + c]
+template <class Real> struct ShellFanout {
+  int nao{0};
+  std::vector<int> nctr, coff, base;
+  std::vector<Real> w;
+};
+
+/// Trivial fan-out for a basis that is already primitive.
+template <class Real> ShellFanout<Real> identity_fanout(const ShellBasis<Real> &b) {
+  ShellFanout<Real> f;
+  const int ns = static_cast<int>(b.shells.size());
+  f.nao = b.nao;
+  f.nctr.assign(ns, 1);
+  f.coff.resize(ns);
+  f.base = b.ao_off;
+  f.w.assign(ns, Real(1));
+  for (int i = 0; i < ns; ++i) f.coff[i] = i;
+  return f;
+}
+
+/// Expand a contracted basis to primitive shells and build the fan-out that
+/// maps each primitive back onto the contracted AOs, carrying the PySCF
+/// cart=True effective coefficients (basis-set coefficient times the
+/// primitive's cart_norm_pyscf; see contracted.hpp).
+template <class Real>
+ShellFanout<Real> expand_contracted(const ContractedBasis<Real> &cb,
+                                    ShellBasis<Real> &prims) {
+  std::vector<PrimitiveShell<Real>> ps;
+  std::vector<int> cshell, cprim;
+  contracted_primitives(cb, ps, cshell, cprim);
+  prims = make_basis(ps);
+  ShellFanout<Real> f;
+  f.nao = cb.nao;
+  const int nps = static_cast<int>(ps.size());
+  f.nctr.resize(nps);
+  f.coff.resize(nps);
+  f.base.resize(nps);
+  int tot = 0;
+  for (int i = 0; i < nps; ++i) {
+    const auto &sh = cb.shells[cshell[i]];
+    f.nctr[i] = sh.nctr();
+    f.coff[i] = tot;
+    f.base[i] = cb.ao_off[cshell[i]];
+    tot += f.nctr[i];
+  }
+  f.w.resize(tot);
+  for (int i = 0; i < nps; ++i) {
+    const auto &sh = cb.shells[cshell[i]];
+    for (int c = 0; c < f.nctr[i]; ++c)
+      f.w[f.coff[i] + c] = effective_coeff(sh, c, cprim[i]);
+  }
+  return f;
+}
+
+} // namespace detail
+
 /// Derivative J/K in the BRA-GRADIENT convention: the derivative acts only on
 /// the FIRST AO index, and the result is indexed by Cartesian component and AO
 /// pair rather than folded onto shell centres.
@@ -452,12 +530,17 @@ template <class Real> struct JKDerivAO {
   std::vector<std::vector<Real>> J, K; ///< per request, 3 x nao x nao
 };
 
+namespace detail {
+
+/// jk_deriv_ao_build over primitive shells plus a fan-out onto contracted AOs.
+/// The integrals are evaluated per PRIMITIVE quartet; the contraction enters
+/// only in the digest, so nothing is recomputed per contracted index.
 template <class Real>
-JKDerivAO<Real> jk_deriv_ao_build(const ShellBasis<Real> &basis,
-                                  const std::vector<JKRequest<Real>> &reqs,
-                                  const TGrid<Real> &grid, Real tau = Real(0)) {
+JKDerivAO<Real> jk_deriv_ao_impl(const ShellBasis<Real> &basis, const ShellFanout<Real> &fan,
+                                 const std::vector<JKRequest<Real>> &reqs,
+                                 const TGrid<Real> &grid, Real tau) {
   const int ns = static_cast<int>(basis.shells.size());
-  const int nao = basis.nao;
+  const int nao = fan.nao;
   const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
   const int nreq = static_cast<int>(reqs.size());
 
@@ -465,7 +548,7 @@ JKDerivAO<Real> jk_deriv_ao_build(const ShellBasis<Real> &basis,
   std::vector<Real> hAl(ns);
   for (int i = 0; i < ns; ++i) {
     hL[i] = basis.shells[i].l;
-    hOff[i] = basis.ao_off[i];
+    hOff[i] = fan.base[i];
     hAl[i] = basis.shells[i].alpha;
   }
   std::vector<ShellPair<Real>> plist;
@@ -529,6 +612,9 @@ JKDerivAO<Real> jk_deriv_ao_build(const ShellBasis<Real> &basis,
   auto wJ = detail::to_device(hwantJ, "intti::jkao::wj"), wK = detail::to_device(hwantK, "intti::jkao::wk");
   auto shL = detail::to_device(hL, "intti::jkao::L"), shOff = detail::to_device(hOff, "intti::jkao::off");
   auto shAl = detail::to_device(hAl, "intti::jkao::al");
+  auto fnc = detail::to_device(fan.nctr, "intti::jkao::nctr");
+  auto fco = detail::to_device(fan.coff, "intti::jkao::coff");
+  auto fw = detail::to_device(fan.w, "intti::jkao::w");
   auto dja = detail::to_device(ja, "jkao::a"), djb = detail::to_device(jb, "jkao::b");
   auto djc = detail::to_device(jc, "jkao::c"), djd = detail::to_device(jd, "jkao::d");
   auto dap = detail::to_device(eap, "jkao::ap"), dam = detail::to_device(eam, "jkao::am");
@@ -549,7 +635,6 @@ JKDerivAO<Real> jk_deriv_ao_build(const ShellBasis<Real> &basis,
           for (int kb = 0; kb < nb; ++kb)
             for (int kc = 0; kc < nc; ++kc)
               for (int kd = 0; kd < nd; ++kd) {
-                const int I = oa + ka, Jj = ob + kb, Kk = oc + kc, L = od + kd;
                 for (int e = 0; e < 3; ++e) {
                   int sg[2], ci[2];
                   Real co[2];
@@ -558,27 +643,46 @@ JKDerivAO<Real> jk_deriv_ao_build(const ShellBasis<Real> &basis,
                   for (int t = 0; t < nt; ++t) {
                     const int ee = ent[sg[t]];
                     if (ee < 0) continue;
-                    const int lp = (sg[t] == 0) ? 1 : -1;
                     const std::size_t idx =
                         ((static_cast<std::size_t>(ci[t]) * nb + kb) * nc + kc) * nd + kd;
-                    (void)lp;
                     v += co[t] * out(offv(ee) + idx);
                   }
                   // md_grad_terms is d/dx; the centre derivative d/dA -- which is
                   // what PySCF's (-nabla i) means -- is minus it
                   const Real dv = -v;
                   const std::size_t xo = static_cast<std::size_t>(e) * n2;
-                  for (int r = 0; r < nreq; ++r) {
-                    const std::size_t o = static_cast<std::size_t>(r) * stride + xo;
-                    const std::size_t db = static_cast<std::size_t>(r) * n2;
-                    // J^x_ij += dv D_lk ; K^x_il += dv D_jk  (ket indices
-                    // transposed, exactly as 'lk->s1ij' / 'jk->s1il')
-                    if (wJ(r))
-                      Kokkos::atomic_add(&Jd(o + static_cast<std::size_t>(I) * nao + Jj),
-                                         dv * Dd(db + static_cast<std::size_t>(L) * nao + Kk));
-                    if (wK(r))
-                      Kokkos::atomic_add(&Kd(o + static_cast<std::size_t>(I) * nao + L),
-                                         dv * Dd(db + static_cast<std::size_t>(Jj) * nao + Kk));
+                  // Contraction fan-out: one primitive quartet feeds every
+                  // combination of contracted functions on its four shells. All
+                  // trip counts are 1 for a primitive basis.
+                  for (int cA = 0; cA < fnc(a); ++cA) {
+                    const Real wa = fw(fco(a) + cA) * dv;
+                    const int I = oa + cA * na + ka;
+                    for (int cB = 0; cB < fnc(b); ++cB) {
+                      const Real wab = wa * fw(fco(b) + cB);
+                      const int Jj = ob + cB * nb + kb;
+                      for (int cC = 0; cC < fnc(c); ++cC) {
+                        const Real wabc = wab * fw(fco(c) + cC);
+                        const int Kk = oc + cC * nc + kc;
+                        for (int cD = 0; cD < fnc(d); ++cD) {
+                          const Real w = wabc * fw(fco(d) + cD);
+                          const int L = od + cD * nd + kd;
+                          for (int r = 0; r < nreq; ++r) {
+                            const std::size_t o = static_cast<std::size_t>(r) * stride + xo;
+                            const std::size_t db = static_cast<std::size_t>(r) * n2;
+                            // J^x_ij += dv D_lk ; K^x_il += dv D_jk  (ket indices
+                            // transposed, exactly as 'lk->s1ij' / 'jk->s1il')
+                            if (wJ(r))
+                              Kokkos::atomic_add(
+                                  &Jd(o + static_cast<std::size_t>(I) * nao + Jj),
+                                  w * Dd(db + static_cast<std::size_t>(L) * nao + Kk));
+                            if (wK(r))
+                              Kokkos::atomic_add(
+                                  &Kd(o + static_cast<std::size_t>(I) * nao + L),
+                                  w * Dd(db + static_cast<std::size_t>(Jj) * nao + Kk));
+                          }
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -595,6 +699,28 @@ JKDerivAO<Real> jk_deriv_ao_build(const ShellBasis<Real> &basis,
     if (hwantK[r]) res.K[r].assign(hK.begin() + r * stride, hK.begin() + (r + 1) * stride);
   }
   return res;
+}
+
+} // namespace detail
+
+template <class Real>
+JKDerivAO<Real> jk_deriv_ao_build(const ShellBasis<Real> &basis,
+                                  const std::vector<JKRequest<Real>> &reqs,
+                                  const TGrid<Real> &grid, Real tau = Real(0)) {
+  return detail::jk_deriv_ao_impl(basis, detail::identity_fanout(basis), reqs, grid, tau);
+}
+
+/// Same, over a generally-contracted basis. No density-symmetry restriction:
+/// the kernel walks all ordered quartets and reads D at explicit index pairs,
+/// so a general or antisymmetric density -- what magnetic response and the CPHF
+/// right-hand side actually supply -- is served exactly as a symmetric one is.
+template <class Real>
+JKDerivAO<Real> jk_deriv_ao_build(const ContractedBasis<Real> &cb,
+                                  const std::vector<JKRequest<Real>> &reqs,
+                                  const TGrid<Real> &grid, Real tau = Real(0)) {
+  ShellBasis<Real> prims;
+  auto fan = detail::expand_contracted(cb, prims);
+  return detail::jk_deriv_ao_impl(prims, fan, reqs, grid, tau);
 }
 
 /// The four int2e_ip1 contractions pyscf.hessian.rhf.make_h1 needs, with the

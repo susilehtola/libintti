@@ -437,6 +437,75 @@ TEST(Contracted, DerivativesVsDecontractRecontract) {
   }
 }
 
+// Two-electron derivative J/K over a contracted basis, in the bra-gradient
+// convention (PySCF grad.rhf.get_jk). The contraction is carried by the DIGEST
+// fan-out: each primitive quartet is evaluated once and scattered into every
+// contracted index combination it feeds. Reference: the primitive builder over
+// the decontracted basis, congruence-transformed back.
+//
+// Checked for a symmetric, a general and an antisymmetric density, because the
+// ket density indices in this convention are TRANSPOSED relative to the
+// quartet's slot order (D_lk and D_jk) -- immaterial for a symmetric D and not
+// for a general one, which is what CPHF and magnetic response supply.
+TEST(Contracted, DerivJKVsDecontractRecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  intti::ShellBasis<double> pbasis;
+  std::vector<double> C;
+  const int npao = decontract(cb, pbasis, C);
+
+  std::vector<double> Dg(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) Dg[i * n + j] = 0.1 + 0.3 * std::sin(0.7 * i + 1.9 * j * j);
+  auto Ds = sym_density(n);
+  std::vector<double> Da(static_cast<std::size_t>(n) * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) Da[i * n + j] = 0.5 * (Dg[i * n + j] - Dg[j * n + i]);
+
+  const char *tags[3] = {"symmetric", "general", "antisymmetric"};
+  const std::vector<double> *Ds3[3] = {&Ds, &Dg, &Da};
+  const intti::DensitySymmetry syms[3] = {intti::DensitySymmetry::Symmetric,
+                                          intti::DensitySymmetry::General,
+                                          intti::DensitySymmetry::Antisymmetric};
+  for (int w = 0; w < 3; ++w) {
+    std::vector<intti::JKRequest<double>> creq{
+        {Ds3[w]->data(), syms[w], intti::FockTerms::CoulombExchange}};
+    auto got = intti::jk_deriv_ao_build(cb, creq, grid);
+
+    auto Deff = pushdown(C, n, npao, *Ds3[w]);
+    std::vector<intti::JKRequest<double>> preq{
+        {Deff.data(), syms[w], intti::FockTerms::CoulombExchange}};
+    auto ref = intti::jk_deriv_ao_build(pbasis, preq, grid);
+
+    const std::size_t pn2 = static_cast<std::size_t>(npao) * npao;
+    for (int x = 0; x < 3; ++x) {
+      for (int t = 0; t < 2; ++t) {
+        const std::vector<double> &g = t ? got.K[0] : got.J[0];
+        const std::vector<double> &p = t ? ref.K[0] : ref.J[0];
+        std::vector<double> slice(p.begin() + x * pn2, p.begin() + (x + 1) * pn2);
+        auto rc = conjugate(C, n, npao, slice);
+        double worst = 0, scale = 0;
+        const std::size_t n2 = static_cast<std::size_t>(n) * n;
+        for (std::size_t i = 0; i < n2; ++i) {
+          worst = std::max(worst, std::abs(g[x * n2 + i] - rc[i]));
+          scale = std::max(scale, std::abs(rc[i]));
+        }
+        EXPECT_LT(worst, 1e-10 * std::max(scale, 1.0))
+            << tags[w] << (t ? " K^" : " J^") << x << " != decontract/recontract";
+        // The derivative J contracts the ket over D_lk, and (ij|kl) is symmetric
+        // under k<->l, so J^x sees only the symmetric part of D -- an
+        // antisymmetric density gives exactly zero, just as the energy J does.
+        // K^x does not, so the antisymmetric case still checks something real.
+        if (w == 2 && t == 0)
+          EXPECT_LT(scale, 1e-13) << "J^" << x << "(antisymmetric) should vanish";
+        else
+          EXPECT_GT(scale, 1e-4) << tags[w] << (t ? " K^" : " J^") << x << " trivially zero";
+      }
+    }
+  }
+}
+
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum
 // of nctr*ncart(l) over shells.
 TEST(Contracted, SymmetricAndSized) {
