@@ -13,6 +13,7 @@
 #include "batch.hpp"
 #include "jbuild.hpp"
 #include "kbuild.hpp"
+#include "space.hpp"
 #include "tgrid.hpp"
 
 namespace intti {
@@ -269,8 +270,36 @@ void exchange_build(const ShellBasis<Real> &basis, const Real *D,
       plist.push_back(make_pair(basis.shells[a], basis.shells[c]));
   auto tab = make_pair_table(plist);
   auto Q = schwarz(tab, plist, grid);
-  detail::exchange_build_impl(basis.shells, basis.ao_off, basis.nao, D, grid, K,
-                              tau, Q, tab, rank, nranks, sym);
+  const std::size_t N = static_cast<std::size_t>(basis.nao) * basis.nao;
+  auto Dv = detail::to_device(D, N, "intti::k::D");
+  Kokkos::View<Real *> Kv("intti::k::Kout", N);
+  detail::exchange_build_impl(basis.shells, basis.ao_off, basis.nao, Dv, grid, Kv, tau, Q,
+                              tab, rank, nranks, sym);
+  const auto hK = detail::to_host(Kv);
+  for (std::size_t i = 0; i < N; ++i) K[i] = hK[i];
+}
+
+/// Exchange with the density and the result in EITHER memory space; nothing is
+/// copied that is already where the kernel needs it (space.hpp). The
+/// host-pointer form above is unchanged and remains the right call for a
+/// host-only code.
+template <class Real, class DView, class KView>
+void exchange_build_into(const ShellBasis<Real> &basis, const DView &D,
+                         const TGrid<Real> &grid, const KView &K,
+                         Real tau = Real(0), Symmetry sym = Symmetry::None) {
+  const int ns = static_cast<int>(basis.shells.size());
+  std::vector<ShellPair<Real>> plist;
+  plist.reserve(static_cast<std::size_t>(ns) * ns);
+  for (int a = 0; a < ns; ++a)
+    for (int c = 0; c < ns; ++c)
+      plist.push_back(make_pair(basis.shells[a], basis.shells[c]));
+  auto tab = make_pair_table(plist);
+  auto Q = schwarz(tab, plist, grid);
+  auto Dv = device_in(D); // no copy when already device-resident
+  DeviceOut<Real> out(K, "intti::k::Kout");
+  detail::exchange_build_impl(basis.shells, basis.ao_off, basis.nao, Dv, grid, out.view(),
+                              tau, Q, tab, 0, 1, sym);
+  out.commit();
 }
 
 /// Memory-tiled exchange build for GPUs that cannot hold the whole K on device.
@@ -295,11 +324,16 @@ void exchange_build_tiled(const ShellBasis<Real> &basis, const Real *D,
       plist.push_back(make_pair(basis.shells[a], basis.shells[c]));
   auto tab = make_pair_table(plist);
   auto Q = schwarz(tab, plist, grid);
+  const std::size_t N = static_cast<std::size_t>(basis.nao) * basis.nao;
+  auto Dv = detail::to_device(D, N, "intti::kt::D");
+  Kokkos::View<Real *> Kv("intti::kt::Kout", N);
   for (int a0 = 0; a0 < ns; a0 += tile_shells) {
     const int a1 = std::min(a0 + tile_shells, ns);
-    detail::exchange_build_impl(basis.shells, basis.ao_off, basis.nao, D, grid, K,
-                                tau, Q, tab, 0, 1, Symmetry::None, a0, a1, true);
+    detail::exchange_build_impl(basis.shells, basis.ao_off, basis.nao, Dv, grid, Kv, tau, Q,
+                                tab, 0, 1, Symmetry::None, a0, a1, true);
   }
+  const auto hK = detail::to_host(Kv);
+  for (std::size_t i = 0; i < N; ++i) K[i] = hK[i];
 }
 
 } // namespace intti

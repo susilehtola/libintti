@@ -128,3 +128,54 @@ TEST(Space, DeviceInAliasesDeviceData) {
     EXPECT_NE(static_cast<const void *>(moved.data()), static_cast<const void *>(h.data()))
         << "host data must be staged to the device";
 }
+
+// exchange_build, the routine an SCF calls every iteration, across the same
+// four combinations. Its Schwarz density bound used to be a HOST loop over D,
+// which forced the density to be host-resident even though every other use of
+// it was on the device; that bound is now computed where D lives.
+TEST(Space, ExchangeAgreesAcrossAllFourCombinations) {
+  auto basis = small_basis();
+  const int n = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+
+  std::vector<double> Dh(n2);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) Dh[i * n + j] = 0.1 + 0.3 * std::sin(0.7 * i + 1.3 * j);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) Dh[i * n + j] = Dh[j * n + i];
+
+  std::vector<double> ref(n2, 0.0);
+  intti::exchange_build(basis, Dh.data(), grid, ref.data());
+  double sk = 0;
+  for (double v : ref) sk = std::max(sk, std::abs(v));
+  ASSERT_GT(sk, 1e-3);
+
+  HostView Dhost("Dhost", n2);
+  for (std::size_t i = 0; i < n2; ++i) Dhost(i) = Dh[i];
+  DevView Ddev("Ddev", n2);
+  Kokkos::deep_copy(Ddev, Dhost);
+
+  auto check = [&](const char *what, const std::vector<double> &K) {
+    double dk = 0;
+    for (std::size_t i = 0; i < n2; ++i) dk = std::max(dk, std::abs(K[i] - ref[i]));
+    EXPECT_LT(dk, 1e-13 * sk) << what << ": K differs by memory space";
+  };
+  auto grab = [&](const auto &V) {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, V);
+    return std::vector<double>(h.data(), h.data() + n2);
+  };
+
+  { HostView K("K", n2);
+    intti::exchange_build_into(basis, Dhost, grid, K);
+    check("host in / host out", grab(K)); }
+  { DevView K("K", n2);
+    intti::exchange_build_into(basis, Ddev, grid, K);
+    check("device in / device out", grab(K)); }
+  { HostView K("K", n2);
+    intti::exchange_build_into(basis, Ddev, grid, K);
+    check("device in / host out", grab(K)); }
+  { DevView K("K", n2);
+    intti::exchange_build_into(basis, Dhost, grid, K);
+    check("host in / device out", grab(K)); }
+}

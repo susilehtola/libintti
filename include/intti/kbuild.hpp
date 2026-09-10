@@ -17,6 +17,7 @@
 #include "device.hpp"
 #include "gto.hpp"
 #include "hermite1d.hpp"
+#include "space.hpp"
 #include "symmetry.hpp"
 #include "tgrid.hpp"
 
@@ -54,17 +55,42 @@ void exchange_build(const ShellBasis<Real> &basis, const Real *D,
 
 namespace detail {
 
-template <class Real>
+template <class Real, class DV, class KV>
 void exchange_build_impl_sym8(const std::vector<PrimitiveShell<Real>> &shells,
-                              const std::vector<int> &ao_off, int nao, const Real *D,
-                              const TGrid<Real> &grid, Real *K, Real tau,
+                              const std::vector<int> &ao_off, int nao, const DV &Dv,
+                              const TGrid<Real> &grid, const KV &Kout, Real tau,
                               const std::vector<Real> &Qex, const PairTable<Real> &tab,
                               int rank, int nranks);
 
-template <class Real>
+/// Per-shell-pair max |D|, the density factor of the Schwarz bound, computed
+/// WHERE D LIVES. It used to be a host loop over D, which forced the density to
+/// be host-resident even though every other use of it is on the device.
+template <class Real, class DV>
+Kokkos::View<Real *> shell_pair_maxabs(const DV &Dv, int nao,
+                                       const Kokkos::View<int *> &aov,
+                                       const Kokkos::View<int *> &lv, int ns,
+                                       const char *label) {
+  Kokkos::View<Real *> m(std::string(label), static_cast<std::size_t>(ns) * ns);
+  Kokkos::parallel_for(
+      "intti::maxabs", Kokkos::RangePolicy<>(0, ns * ns), KOKKOS_LAMBDA(int cd) {
+        const int c = cd / ns, d = cd % ns;
+        Real best = 0;
+        for (int kc = 0; kc < ncart(lv(c)); ++kc)
+          for (int kd = 0; kd < ncart(lv(d)); ++kd) {
+            const Real v = Dv(static_cast<std::size_t>(aov(c) + kc) * nao + aov(d) + kd);
+            const Real a = v < 0 ? -v : v;
+            if (a > best) best = a;
+          }
+        m(cd) = best;
+      });
+  Kokkos::fence();
+  return m;
+}
+
+template <class Real, class DV, class KV>
 void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
-                         const std::vector<int> &ao_off, int nao, const Real *D,
-                         const TGrid<Real> &grid, Real *K, Real tau,
+                         const std::vector<int> &ao_off, int nao, const DV &Dv,
+                         const TGrid<Real> &grid, const KV &Kout, Real tau,
                          const std::vector<Real> &Qex,
                          const PairTable<Real> &tab, int rank = 0,
                          int nranks = 1, Symmetry sym = Symmetry::None,
@@ -72,7 +98,8 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
   static_assert(kokkos_scalar_v<Real>,
                 "exchange_build requires a builtin floating-point type in M5");
   if (sym == Symmetry::Full) {
-    exchange_build_impl_sym8(shells, ao_off, nao, D, grid, K, tau, Qex, tab, rank, nranks);
+    exchange_build_impl_sym8(shells, ao_off, nao, Dv, grid, Kout, tau, Qex, tab, rank,
+                             nranks);
     return;
   }
   // Output tiling: when tiled, compute only the K rows of shells [a0,a1) (all
@@ -96,27 +123,14 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
       throw std::invalid_argument("exchange_build: shell angular momentum exceeds KLMAX");
 
   // per-(c,d) shell-block density maxima for screening
-  std::vector<Real> maxD(static_cast<std::size_t>(ns) * ns, Real(0));
-  for (int c = 0; c < ns; ++c)
-    for (int d = 0; d < ns; ++d) {
-      Real m = 0;
-      for (int kc = 0; kc < ncart(shells[c].l); ++kc)
-        for (int kd = 0; kd < ncart(shells[d].l); ++kd) {
-          const Real v = D[(ao_off[c] + kc) * nao + ao_off[d] + kd];
-          const Real a = v < 0 ? -v : v;
-          if (a > m) m = a;
-        }
-      maxD[c * ns + d] = m;
-    }
 
-  // stage everything on device
-  auto Dv = detail::to_device(D, static_cast<std::size_t>(nao) * nao, "intti::k::D");
+  // stage everything on device; the density is already there
   auto Qv = detail::to_device(Qex, "intti::k::Q");
-  auto mDv = detail::to_device(maxD, "intti::k::maxD");
   auto aov = detail::to_device(ao_off, "intti::k::ao");
   std::vector<int> ls(ns);
   for (int i = 0; i < ns; ++i) ls[i] = shells[i].l;
   auto lv = detail::to_device(ls, "intti::k::l");
+  auto mDv = shell_pair_maxabs<Real>(Dv, nao, aov, lv, ns, "intti::k::maxD");
   Kokkos::View<Real *> Kv("intti::k::K", static_cast<std::size_t>(tile_rows) * nao);
   Kokkos::deep_copy(Kv, Real(0));
   auto pv = tab.p;
@@ -268,12 +282,10 @@ void exchange_build_impl(const std::vector<PrimitiveShell<Real>> &shells,
           }
       });
 
-  auto hK = Kokkos::create_mirror_view(Kv);
-  Kokkos::deep_copy(hK, Kv);
+  // write straight into the caller's device buffer -- no host round trip
   const std::size_t ntile = static_cast<std::size_t>(tile_rows) * nao;
   const std::size_t base = static_cast<std::size_t>(row0) * nao;
-  for (std::size_t i = 0; i < ntile; ++i)
-    K[base + i] = hK(i);
+  Kokkos::deep_copy(Kokkos::subview(Kout, Kokkos::make_pair(base, base + ntile)), Kv);
 }
 
 /// Memory-lean generally-contracted exchange (M-SHARK #5). Runs the SAME
@@ -491,10 +503,10 @@ void exchange_build_contracted_impl(
 /// contractions are accumulated over the t-nodes and the deduplicated 8-element
 /// orbit is atomic-scattered into K. ~4x fewer quartet evals than the
 /// deterministic build; nondeterministic summation order (see ExchangeAlgo).
-template <class Real>
+template <class Real, class DV, class KV>
 void exchange_build_impl_sym8(const std::vector<PrimitiveShell<Real>> &shells,
-                              const std::vector<int> &ao_off, int nao, const Real *D,
-                              const TGrid<Real> &grid, Real *K, Real tau,
+                              const std::vector<int> &ao_off, int nao, const DV &Dv,
+                              const TGrid<Real> &grid, const KV &Kout, Real tau,
                               const std::vector<Real> &Qex, const PairTable<Real> &tab,
                               int rank, int nranks) {
   static_assert(kokkos_scalar_v<Real>,
@@ -510,18 +522,6 @@ void exchange_build_impl_sym8(const std::vector<PrimitiveShell<Real>> &shells,
     if (sh.l > KLMAX)
       throw std::invalid_argument("exchange_build: shell angular momentum exceeds KLMAX");
 
-  std::vector<Real> maxD(static_cast<std::size_t>(ns) * ns, Real(0));
-  for (int c = 0; c < ns; ++c)
-    for (int d = 0; d < ns; ++d) {
-      Real m = 0;
-      for (int kc = 0; kc < ncart(shells[c].l); ++kc)
-        for (int kd = 0; kd < ncart(shells[d].l); ++kd) {
-          const Real v = D[(ao_off[c] + kc) * nao + ao_off[d] + kd];
-          const Real a = v < 0 ? -v : v;
-          if (a > m) m = a;
-        }
-      maxD[c * ns + d] = m;
-    }
 
   // triangular bra/ket pair list (a<=c), and its pair index a*ns+c into the
   // rectangular PairTable
@@ -534,13 +534,12 @@ void exchange_build_impl_sym8(const std::vector<PrimitiveShell<Real>> &shells,
     }
   const int nptri = static_cast<int>(trA.size());
 
-  auto Dv = detail::to_device(D, static_cast<std::size_t>(nao) * nao, "intti::k8::D");
   auto Qv = detail::to_device(Qex, "intti::k8::Q");
-  auto mDv = detail::to_device(maxD, "intti::k8::maxD");
   auto aov = detail::to_device(ao_off, "intti::k8::ao");
   std::vector<int> ls(ns);
   for (int i = 0; i < ns; ++i) ls[i] = shells[i].l;
   auto lv = detail::to_device(ls, "intti::k8::l");
+  auto mDv = shell_pair_maxabs<Real>(Dv, nao, aov, lv, ns, "intti::k8::maxD");
   auto trAv = detail::to_device(trA, "intti::k8::trA");
   auto trCv = detail::to_device(trC, "intti::k8::trC");
   auto trPv = detail::to_device(trP, "intti::k8::trP");
@@ -707,10 +706,7 @@ void exchange_build_impl_sym8(const std::vector<PrimitiveShell<Real>> &shells,
         }
       });
 
-  auto hK = Kokkos::create_mirror_view(Kv);
-  Kokkos::deep_copy(hK, Kv);
-  for (std::size_t i = 0; i < static_cast<std::size_t>(nao) * nao; ++i)
-    K[i] = hK(i);
+  Kokkos::deep_copy(Kout, Kv);
 }
 
 } // namespace detail
