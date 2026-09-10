@@ -919,30 +919,104 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
     r[(static_cast<std::size_t>(3 * cs + dir)) * naux + P] += v;
   };
   const auto ghost = [&](const PrimitiveShell<Real> &s) { return detail::ghost_shell(s); };
-  // d_x: 3-centre (m n | a ghost)
-  for (int m = 0; m < nso; ++m)
-    for (int n = 0; n < nso; ++n)
-      for (int a = 0; a < nsa; ++a) {
-        const auto &sm = orb.shells[m], &sn = orb.shells[n], &sP = aux.shells[a];
-        const auto gh = ghost(sP);
-        const int om = orb.ao_off[m], on = orb.ao_off[n], oP = aux.ao_off[a];
-        const int nm = ncart(sm.l), nn = ncart(sn.l), nP = ncart(sP.l);
-        const int cs[3] = {cshell(false, m), cshell(false, n), cshell(true, a)};
-        const auto blkall = detail::ghost_quartet_deriv(sm, sn, sP, gh, grid);
-        for (int pos = 0; pos < 3; ++pos) {
-          for (int dir = 0; dir < 3; ++dir) {
-            const auto &blk = blkall[pos][dir];
-            for (int km = 0; km < nm; ++km)
-              for (int kn = 0; kn < nn; ++kn) {
-                const Real dmn = Dm(om + km, on + kn);
-                if (dmn == Real(0)) continue;
-                for (int kP = 0; kP < nP; ++kP)
-                  radd(cs[pos], dir, oP + kP,
-                       dmn * blk[((static_cast<std::size_t>(km) * nn + kn) * nP + kP)]);
+  // d_x: 3-centre (m n | a ghost), through the BATCHED engine -- the same
+  // construction ri_j_deriv_kernel and ri_k_deriv_kernel use. Only the two bra
+  // positions are emitted; the auxiliary one follows from translational
+  // invariance, the ghost being exponent-free.
+  {
+    std::vector<ShellPair<Real>> plist;
+    std::vector<int> pid(static_cast<std::size_t>(nso) * 3 * nso * 3, -1);
+    auto orb_pair = [&](int si, int di, int sj, int dj) {
+      if (orb.shells[si].l + di < 0 || orb.shells[sj].l + dj < 0) return -1;
+      const std::size_t key =
+          ((static_cast<std::size_t>(si) * 3 + (di + 1)) * nso + sj) * 3 + (dj + 1);
+      if (pid[key] < 0) {
+        PrimitiveShell<Real> a = orb.shells[si], b = orb.shells[sj];
+        a.l += di;
+        b.l += dj;
+        plist.push_back(make_pair(a, b));
+        pid[key] = static_cast<int>(plist.size()) - 1;
+      }
+      return pid[key];
+    };
+    for (int m = 0; m < nso; ++m)
+      for (int n = 0; n < nso; ++n) {
+        orb_pair(m, 1, n, 0);
+        orb_pair(m, -1, n, 0);
+        orb_pair(m, 0, n, 1);
+        orb_pair(m, 0, n, -1);
+      }
+    const int nbra = static_cast<int>(plist.size());
+    for (int a = 0; a < nsa; ++a) plist.push_back(detail::ghost_pair(aux.shells[a]));
+    std::vector<std::pair<int, int>> quartets;
+    std::vector<int> jm, jn, ja, emp, emm, enp, enm;
+    for (int m = 0; m < nso; ++m)
+      for (int n = 0; n < nso; ++n)
+        for (int a = 0; a < nsa; ++a) {
+          auto emit = [&](int bra) {
+            if (bra < 0) return -1;
+            const int e = static_cast<int>(quartets.size());
+            quartets.push_back({bra, nbra + a});
+            return e;
+          };
+          jm.push_back(m); jn.push_back(n); ja.push_back(a);
+          emp.push_back(emit(orb_pair(m, 1, n, 0)));
+          emm.push_back(emit(orb_pair(m, -1, n, 0)));
+          enp.push_back(emit(orb_pair(m, 0, n, 1)));
+          enm.push_back(emit(orb_pair(m, 0, n, -1)));
+        }
+    auto tab = make_pair_table(plist);
+    auto batch = make_batch(tab, quartets);
+    QuartetWorkspace<Real> ws;
+    Kokkos::View<Real *> qout("intti::rijh::out", batch.nout_total);
+    eri_quartets(tab, batch, grid, qout, ws);
+    const auto hq = detail::to_host(qout);
+    const auto hoff = detail::to_host(batch.out_offset);
+    for (std::size_t j = 0; j < jm.size(); ++j) {
+      const int m = jm[j], n = jn[j], a = ja[j];
+      const auto &sm = orb.shells[m], &sn = orb.shells[n], &sP = aux.shells[a];
+      const int om = orb.ao_off[m], on = orb.ao_off[n], oP = aux.ao_off[a];
+      const int nm = ncart(sm.l), nn = ncart(sn.l), nP = ncart(sP.l);
+      const int cs[3] = {cshell(false, m), cshell(false, n), cshell(true, a)};
+      const int ent[2][2] = {{emp[j], emm[j]}, {enp[j], enm[j]}};
+      for (int km = 0; km < nm; ++km) {
+        int m3[3];
+        cart_comp(sm.l, km, m3[0], m3[1], m3[2]);
+        for (int kn = 0; kn < nn; ++kn) {
+          const Real dmn = Dm(om + km, on + kn);
+          if (dmn == Real(0)) continue;
+          int n3[3];
+          cart_comp(sn.l, kn, n3[0], n3[1], n3[2]);
+          for (int kP = 0; kP < nP; ++kP)
+            for (int dir = 0; dir < 3; ++dir) {
+              Real dv[3];
+              for (int slot = 0; slot < 2; ++slot) {
+                int sg[2], ci[2];
+                Real co[2];
+                const int nt =
+                    slot == 0 ? detail::md_grad_terms(sm.l, m3, sm.alpha, dir, sg, ci, co)
+                              : detail::md_grad_terms(sn.l, n3, sn.alpha, dir, sg, ci, co);
+                Real v = 0;
+                for (int t = 0; t < nt; ++t) {
+                  const int ee = ent[slot][sg[t]];
+                  if (ee < 0) continue;
+                  const int sh = (sg[t] == 0) ? 1 : -1;
+                  const int mn2 = (slot == 1) ? ncart(sn.l + sh) : nn;
+                  const int ia = (slot == 0) ? ci[t] : km;
+                  const int ib = (slot == 1) ? ci[t] : kn;
+                  v += co[t] *
+                       hq[hoff[ee] + (static_cast<std::size_t>(ia) * mn2 + ib) * nP + kP];
+                }
+                dv[slot] = -v;
               }
-          }
+              dv[2] = -(dv[0] + dv[1]);
+              for (int pos = 0; pos < 3; ++pos)
+                if (dv[pos] != Real(0)) radd(cs[pos], dir, oP + kP, dmn * dv[pos]);
+            }
         }
       }
+    }
+  }
   // -(M_x gamma): 2-centre (a ghost | b ghost), free aux index = a
   for (int a = 0; a < nsa; ++a)
     for (int b = 0; b < nsa; ++b) {
@@ -2103,42 +2177,116 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
       return static_cast<std::size_t>(x) * pstride +
              (static_cast<std::size_t>(Q) * ib + ii) * nvec + j;
     };
-    // three-centre: P_x^Q[i,j] += C_R[l,i] C_L[a,j] d(l a|Q)/dx
+    // three-centre: P_x^Q[i,j] += C_R[l,i] C_L[a,j] d(l a|Q)/dx, BATCHED
+    {
+    std::vector<ShellPair<Real>> plist;
+    std::vector<int> pid(static_cast<std::size_t>(nso) * 3 * nso * 3, -1);
+    auto orb_pair = [&](int si, int di, int sj, int dj) {
+      if (orb.shells[si].l + di < 0 || orb.shells[sj].l + dj < 0) return -1;
+      const std::size_t key =
+          ((static_cast<std::size_t>(si) * 3 + (di + 1)) * nso + sj) * 3 + (dj + 1);
+      if (pid[key] < 0) {
+        PrimitiveShell<Real> a = orb.shells[si], b = orb.shells[sj];
+        a.l += di;
+        b.l += dj;
+        plist.push_back(make_pair(a, b));
+        pid[key] = static_cast<int>(plist.size()) - 1;
+      }
+      return pid[key];
+    };
+    for (int l = 0; l < nso; ++l)
+      for (int n = 0; n < nso; ++n) {
+        orb_pair(l, 1, n, 0);
+        orb_pair(l, -1, n, 0);
+        orb_pair(l, 0, n, 1);
+        orb_pair(l, 0, n, -1);
+      }
+    const int nbra = static_cast<int>(plist.size());
+    for (int c = 0; c < nsa; ++c) plist.push_back(detail::ghost_pair(aux.shells[c]));
+    std::vector<std::pair<int, int>> quartets;
+    std::vector<int> jl, jn2, jc, elp, elm, enp2, enm2;
     for (int l = 0; l < nso; ++l)
       for (int n = 0; n < nso; ++n)
         for (int c = 0; c < nsa; ++c) {
+          auto emit = [&](int bra) {
+            if (bra < 0) return -1;
+            const int e = static_cast<int>(quartets.size());
+            quartets.push_back({bra, nbra + c});
+            return e;
+          };
+          jl.push_back(l); jn2.push_back(n); jc.push_back(c);
+          elp.push_back(emit(orb_pair(l, 1, n, 0)));
+          elm.push_back(emit(orb_pair(l, -1, n, 0)));
+          enp2.push_back(emit(orb_pair(l, 0, n, 1)));
+          enm2.push_back(emit(orb_pair(l, 0, n, -1)));
+        }
+    auto tab = make_pair_table(plist);
+    auto batch = make_batch(tab, quartets);
+    QuartetWorkspace<Real> ws;
+    Kokkos::View<Real *> qout("intti::rikh::out", batch.nout_total);
+    eri_quartets(tab, batch, grid, qout, ws);
+    const auto hq = detail::to_host(qout);
+    const auto hoff = detail::to_host(batch.out_offset);
+    for (std::size_t j = 0; j < jl.size(); ++j) {
+          const int l = jl[j], n = jn2[j], c = jc[j];
           const auto &sl = orb.shells[l], &sn = orb.shells[n], &sc = aux.shells[c];
-          const auto gh = ghost(sc);
           const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
           const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
           const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
-          const auto blkall = detail::ghost_quartet_deriv(sl, sn, sc, gh, grid);
-          for (int pos = 0; pos < 3; ++pos) {
-            for (int dir = 0; dir < 3; ++dir) {
-              const auto &blk = blkall[pos][dir];
-              const int xi = 3 * cs[pos] + dir;
-              for (int kl = 0; kl < nl; ++kl)
-                for (int kn = 0; kn < nn; ++kn)
-                  for (int kQ = 0; kQ < nP; ++kQ) {
-                    const Real dv = blk[(static_cast<std::size_t>(kl) * nn + kn) * nP + kQ];
+          const int ent[2][2] = {{elp[j], elm[j]}, {enp2[j], enm2[j]}};
+          for (int kl = 0; kl < nl; ++kl) {
+            int l3[3];
+            cart_comp(sl.l, kl, l3[0], l3[1], l3[2]);
+            for (int kn = 0; kn < nn; ++kn) {
+              int n3[3];
+              cart_comp(sn.l, kn, n3[0], n3[1], n3[2]);
+              for (int kQ = 0; kQ < nP; ++kQ)
+                for (int dir = 0; dir < 3; ++dir) {
+                  Real dvv[3];
+                  for (int slot = 0; slot < 2; ++slot) {
+                    int sg[2], ci[2];
+                    Real co[2];
+                    const int nt =
+                        slot == 0
+                            ? detail::md_grad_terms(sl.l, l3, sl.alpha, dir, sg, ci, co)
+                            : detail::md_grad_terms(sn.l, n3, sn.alpha, dir, sg, ci, co);
+                    Real v = 0;
+                    for (int t = 0; t < nt; ++t) {
+                      const int ee = ent[slot][sg[t]];
+                      if (ee < 0) continue;
+                      const int sh = (sg[t] == 0) ? 1 : -1;
+                      const int mn2 = (slot == 1) ? ncart(sn.l + sh) : nn;
+                      const int ia = (slot == 0) ? ci[t] : kl;
+                      const int ib = (slot == 1) ? ci[t] : kn;
+                      v += co[t] * hq[hoff[ee] +
+                                      (static_cast<std::size_t>(ia) * mn2 + ib) * nP + kQ];
+                    }
+                    dvv[slot] = -v;
+                  }
+                  dvv[2] = -(dvv[0] + dvv[1]);
+                  for (int pos = 0; pos < 3; ++pos) {
+                    const Real dv = dvv[pos];
                     if (dv == Real(0)) continue;
+                    const int xi = 3 * cs[pos] + dir;
                     const int lam = ol + kl, aa = on + kn, QQ = oc + kQ;
                     for (int ii = 0; ii < ib; ++ii) {
                       const Real cri = CR[static_cast<std::size_t>(lam) * nvec + i0 + ii];
                       const Real clj = CL[static_cast<std::size_t>(aa) * nvec + i0 + ii];
-                      for (int j = 0; j < nvec; ++j) {
+                      for (int jj = 0; jj < nvec; ++jj) {
                         // Pa: block index is i (from C_R), free index j (from C_L)
-                        Pa[Pidx(xi, QQ, ii, j)] +=
-                            dv * cri * CL[static_cast<std::size_t>(aa) * nvec + j];
+                        Pa[Pidx(xi, QQ, ii, jj)] +=
+                            dv * cri * CL[static_cast<std::size_t>(aa) * nvec + jj];
                         // Pb: block index is j (from C_L), free index i (from C_R)
-                        Pb[Pidx(xi, QQ, ii, j)] +=
-                            dv * clj * CR[static_cast<std::size_t>(lam) * nvec + j];
+                        Pb[Pidx(xi, QQ, ii, jj)] +=
+                            dv * clj * CR[static_cast<std::size_t>(lam) * nvec + jj];
                       }
                     }
                   }
+                }
             }
           }
-        }
+    }
+    }
     // two-centre: P_x^Q[i,j] -= dM_QR/dx V^R[i,j]
     for (int c = 0; c < nsa; ++c)
       for (int ee = 0; ee < nsa; ++ee) {
@@ -2362,7 +2510,7 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
                                       const std::vector<Real> &Yh,
                                       const ShellFanout<Real> *fo,
                                       const std::vector<int> &grp, int ngrp,
-                                      const TGrid<Real> &grid) {
+                                      const TGrid<Real> &grid, int aux_tile_shells) {
   const int naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
@@ -2386,14 +2534,77 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
     res.K[0][static_cast<std::size_t>(x) * N + static_cast<std::size_t>(m) * nao_out + n] +=
         v;
   };
+  // ---- three-centre derivative pass, BATCHED -----------------------------
+  // The quartets go through eri_quartets rather than one eri_block4 call per
+  // shell triple, which is what ri_j_deriv_kernel has always done and is the
+  // reason it measured 1 s where this kernel measured 68 s for the same number
+  // of blocks. Pair intermediates are shared across the batch and the
+  // evaluation is parallel; the digest below stays on the host, because its
+  // inner work is a length-nao_out gemv and axpy rather than a scalar scatter.
+  //
+  // Only the two BRA positions are emitted -- the auxiliary derivative comes
+  // from translational invariance, the ghost being exponent-free.
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  for (int C0 = 0; C0 < nsa; C0 += aux_tile_shells) {
+  const int C1 = std::min(C0 + aux_tile_shells, nsa);
+  std::vector<ShellPair<Real>> plist;
+  std::vector<int> pid(static_cast<std::size_t>(nso) * 3 * nso * 3, -1);
+  auto orb_pair = [&](int si, int di, int sj, int dj) {
+    if (orb.shells[si].l + di < 0 || orb.shells[sj].l + dj < 0) return -1;
+    const std::size_t key =
+        ((static_cast<std::size_t>(si) * 3 + (di + 1)) * nso + sj) * 3 + (dj + 1);
+    if (pid[key] < 0) {
+      PrimitiveShell<Real> a = orb.shells[si], b = orb.shells[sj];
+      a.l += di;
+      b.l += dj;
+      plist.push_back(make_pair(a, b));
+      pid[key] = static_cast<int>(plist.size()) - 1;
+    }
+    return pid[key];
+  };
+  for (int l = 0; l < nso; ++l)
+    for (int n = 0; n < nso; ++n) {
+      orb_pair(l, 1, n, 0);
+      orb_pair(l, -1, n, 0);
+      orb_pair(l, 0, n, 1);
+      orb_pair(l, 0, n, -1);
+    }
+  const int nbra = static_cast<int>(plist.size());
+  for (int c = C0; c < C1; ++c) plist.push_back(detail::ghost_pair(aux.shells[c]));
+  std::vector<std::pair<int, int>> quartets;
+  std::vector<int> jl, jn, jc, elp, elm, enp, enm;
   for (int l = 0; l < nso; ++l)
     for (int n = 0; n < nso; ++n)
-      for (int c = 0; c < nsa; ++c) {
+      for (int c = C0; c < C1; ++c) {
+        auto emit = [&](int bra) {
+          if (bra < 0) return -1;
+          const int e = static_cast<int>(quartets.size());
+          quartets.push_back({bra, nbra + (c - C0)});
+          return e;
+        };
+        jl.push_back(l); jn.push_back(n); jc.push_back(c);
+        elp.push_back(emit(orb_pair(l, 1, n, 0)));
+        elm.push_back(emit(orb_pair(l, -1, n, 0)));
+        enp.push_back(emit(orb_pair(l, 0, n, 1)));
+        enm.push_back(emit(orb_pair(l, 0, n, -1)));
+      }
+  const int njob = static_cast<int>(jl.size());
+  auto tab = make_pair_table(plist);
+  auto batch = make_batch(tab, quartets);
+  QuartetWorkspace<Real> ws;
+  Kokkos::View<Real *> qout("intti::rikd::out", batch.nout_total);
+  eri_quartets(tab, batch, grid, qout, ws);
+  const auto hq = detail::to_host(qout);
+  const auto hoff = detail::to_host(batch.out_offset);
+
+  for (int j = 0; j < njob; ++j) {
+      const int l = jl[j], n = jn[j], c = jc[j];
+      {
         const auto &sl = orb.shells[l], &sn = orb.shells[n], &sc = aux.shells[c];
-        const auto gh = ghost(sc);
-        const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
+        const int on = orb.ao_off[n], oc = aux.ao_off[c];
         const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
         const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
+        const int ent[2][2] = {{elp[j], elm[j]}, {enp[j], enm[j]}};
         // The two contractions y1 and y3 below depend only on (B, P) -- NOT on
         // kl, pos or dir. Leaving them inside those loops recomputed each one
         // 9 * nl times, and they are the whole cost of this kernel: with the
@@ -2404,7 +2615,6 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
         //
         // The nine derivative blocks are therefore evaluated up front, and the
         // loop order becomes (kn, kQ) outside (pos, dir, kl).
-        const auto blk3all = detail::ghost_quartet_deriv(sl, sn, sc, gh, grid);
         std::vector<Real> y1(nao_out), y3(nao_out);
         for (int kn = 0; kn < nn; ++kn)
           for (int kQ = 0; kQ < nP; ++kQ) {
@@ -2416,20 +2626,44 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
             detail::gemm('N', 'N', nao_out, 1, nvec, Real(1),
                          Xh.data() + static_cast<std::size_t>(P) * slab, nvec,
                          CR + static_cast<std::size_t>(B) * nvec, 1, Real(0), y3.data(), 1);
-            for (int pos = 0; pos < 3; ++pos) {
-              for (int dir = 0; dir < 3; ++dir) {
-                const auto &blk = blk3all[pos][dir];
-                const int xi = 3 * grp[cs[pos]] + dir; // folded onto the group (atoms)
-                Real *Kx = res.K[0].data() + static_cast<std::size_t>(xi) * N;
-                for (int kl = 0; kl < nl; ++kl) {
-                  const Real dv = blk[(static_cast<std::size_t>(kl) * nn + kn) * nP + kQ];
-                  if (dv == Real(0)) continue;
+            int n3[3];
+            cart_comp(sn.l, kn, n3[0], n3[1], n3[2]);
+            for (int dir = 0; dir < 3; ++dir)
+              for (int kl = 0; kl < nl; ++kl) {
+                int l3[3];
+                cart_comp(sl.l, kl, l3[0], l3[1], l3[2]);
+                Real dv[3];
+                for (int slot = 0; slot < 2; ++slot) {
+                  int sg[2], ci[2];
+                  Real co[2];
+                  const int nt =
+                      slot == 0
+                          ? detail::md_grad_terms(sl.l, l3, sl.alpha, dir, sg, ci, co)
+                          : detail::md_grad_terms(sn.l, n3, sn.alpha, dir, sg, ci, co);
+                  Real v = 0;
+                  for (int t = 0; t < nt; ++t) {
+                    const int ee = ent[slot][sg[t]];
+                    if (ee < 0) continue;
+                    const int sh = (sg[t] == 0) ? 1 : -1;
+                    const int mn2 = (slot == 1) ? ncart(sn.l + sh) : nn;
+                    const int ia = (slot == 0) ? ci[t] : kl;
+                    const int ib = (slot == 1) ? ci[t] : kn;
+                    v += co[t] *
+                         hq[hoff[ee] + (static_cast<std::size_t>(ia) * mn2 + ib) * nP + kQ];
+                  }
+                  dv[slot] = -v; // md_grad_terms is d/dx; the centre derivative is -it
+                }
+                dv[2] = -(dv[0] + dv[1]); // ghost is exponent-free
+                for (int pos = 0; pos < 3; ++pos) {
+                  if (dv[pos] == Real(0)) continue;
+                  const int xi = 3 * grp[cs[pos]] + dir; // folded onto the group
+                  Real *Kx = res.K[0].data() + static_cast<std::size_t>(xi) * N;
                   // the orbital index out of the derivative block is PRIMITIVE
                   // and fans out onto the contracted AOs it feeds; n2 / m2 are
                   // outputs and are already contracted. Trip count 1 for a
                   // primitive basis.
                   for (int cM = 0; cM < fan.nctr[l]; ++cM) {
-                    const Real w = fan.w[fan.coff[l] + cM] * dv;
+                    const Real w = fan.w[fan.coff[l] + cM] * dv[pos];
                     const int I = fan.base[l] + cM * nl + kl;
                     Real *row = Kx + static_cast<std::size_t>(I) * nao_out;
                     for (int n2 = 0; n2 < nao_out; ++n2) row[n2] += w * y1[n2];
@@ -2439,9 +2673,10 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
                   }
                 }
               }
-            }
           }
       }
+  }
+  }
   // term 2, one perturbation at a time
   {
     std::vector<Real> Amat(static_cast<std::size_t>(naux) * slab);
@@ -2517,7 +2752,7 @@ JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis
   const auto grp = detail::perturbation_groups(group, ncen, ngrp);
   return detail::ri_k_deriv_kernel(orb, aux, CL, CR, nvec, Xh, Yh,
                                    static_cast<const detail::ShellFanout<Real> *>(nullptr),
-                                   grp, ngrp, grid);
+                                   grp, ngrp, grid, aux_tile_shells);
 }
 
 /// Same, over generally-contracted bases. CL, CR and the result are in
@@ -2578,7 +2813,7 @@ JKDerivResult<Real> ri_k_deriv_occ(const ContractedBasis<Real> &orb,
     for (int v : grp) ngrp = std::max(ngrp, v + 1);
   }
   return detail::ri_k_deriv_kernel(po, pa, CLp.data(), CRp.data(), nvec, Xh, Yh, &fo, grp,
-                                   ngrp, grid);
+                                   ngrp, grid, aux_tile_shells);
 }
 
 } // namespace intti
