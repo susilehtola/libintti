@@ -944,6 +944,76 @@ TEST(Contracted, RiDerivMatricesVsDecontractRecontract) {
   EXPECT_GT(kscale, 1e-3) << "RI-K derivative matrices trivially zero";
 }
 
+// Auxiliary TILING over contracted bases must not change any answer. Tiling is
+// what keeps the contracted RI path from materialising nao^2 x naux -- 32 GB at
+// nao = 1000, naux = 4000 -- so it has to be exact, and it has to actually
+// engage: the test asserts the tiles are genuinely smaller than the whole.
+TEST(Contracted, RiAuxTilingIsExact) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  intti::ContractedShell<double> a0;
+  a0.center[0] = a0.center[1] = a0.center[2] = 0;
+  a0.l = 0; a0.alpha = {8.0, 2.0}; a0.coeff = {0.7, 0.4};
+  intti::ContractedShell<double> a1;
+  a1.center[0] = 0; a1.center[1] = 0; a1.center[2] = 1.3;
+  a1.l = 1; a1.alpha = {1.6, 0.5}; a1.coeff = {0.8, 0.3};
+  intti::ContractedShell<double> a2;
+  a2.center[0] = 0; a2.center[1] = 0.2; a2.center[2] = 0.5;
+  a2.l = 2; a2.alpha = {1.2}; a2.coeff = {1.0};
+  auto ca = intti::make_contracted_basis<double>({a0, a1, a2});
+  const int nas = static_cast<int>(ca.shells.size());
+  ASSERT_GT(nas, 1) << "need more than one auxiliary shell for tiling to mean anything";
+
+  // the tiled three-centre block, reassembled, is the whole tensor
+  auto whole = intti::coulomb_3c(cb, ca, grid);
+  std::vector<double> glued(whole.size(), 0.0);
+  const int naux = ca.nao;
+  for (int A0 = 0; A0 < nas; ++A0) {
+    const int p0 = ca.ao_off[A0], blk = ca.ao_off[A0 + 1] - p0;
+    auto t = intti::coulomb_3c_auxblock(cb, ca, grid, A0, A0 + 1);
+    ASSERT_LT(blk, naux) << "a single-shell tile must be smaller than the whole";
+    for (int mn = 0; mn < n * n; ++mn)
+      for (int k = 0; k < blk; ++k)
+        glued[static_cast<std::size_t>(mn) * naux + p0 + k] =
+            t[static_cast<std::size_t>(mn) * blk + k];
+  }
+  double worst = 0, scale = 0;
+  for (std::size_t i = 0; i < whole.size(); ++i) {
+    worst = std::max(worst, std::abs(glued[i] - whole[i]));
+    scale = std::max(scale, std::abs(whole[i]));
+  }
+  EXPECT_LT(worst, 1e-13 * std::max(scale, 1.0)) << "tiled 3c != whole 3c";
+  EXPECT_GT(scale, 1e-3) << "3c tensor trivially zero";
+
+  // ...and the RI quantities built on it are unchanged by the tile size
+  auto D = sym_density(n);
+  const int nvec = 2;
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec);
+  for (int i2 = 0; i2 < n; ++i2)
+    for (int k = 0; k < nvec; ++k)
+      CL[i2 * nvec + k] = 0.3 * std::cos(0.7 * i2 + k) / (1.0 + i2);
+  std::vector<intti::JKRequest<double>> req{
+      {D.data(), intti::DensitySymmetry::Symmetric, intti::FockTerms::Coulomb}};
+  auto j_all = intti::ri_j_deriv_build(cb, ca, req, grid, 1e-12, nas);
+  auto j_one = intti::ri_j_deriv_build(cb, ca, req, grid, 1e-12, 1);
+  auto k_all = intti::ri_k_hessian_occ(cb, ca, CL.data(), CL.data(), nvec, grid, 1e-12, nas);
+  auto k_one = intti::ri_k_hessian_occ(cb, ca, CL.data(), CL.data(), nvec, grid, 1e-12, 1);
+  auto cmp = [](const char *what, const std::vector<double> &a,
+                const std::vector<double> &b) {
+    ASSERT_EQ(a.size(), b.size()) << what;
+    double w = 0, sc = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      w = std::max(w, std::abs(a[i] - b[i]));
+      sc = std::max(sc, std::abs(a[i]));
+    }
+    EXPECT_LT(w, 1e-11 * std::max(sc, 1.0)) << what << ": tile size changed the answer";
+    EXPECT_GT(sc, 1e-4) << what << " trivially zero";
+  };
+  cmp("RI-J deriv", j_all.J[0], j_one.J[0]);
+  cmp("RI-K Hessian", k_all, k_one);
+}
+
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum
 // of nctr*ncart(l) over shells.
 TEST(Contracted, SymmetricAndSized) {

@@ -264,11 +264,18 @@ std::vector<Real> coulomb_2c_dev(const ContractedBasis<Real> &aux, const TGrid<R
   return to_host(Md);
 }
 
+/// [sa0, sa1) restricts the AUXILIARY shells, and the output auxiliary index is
+/// LOCAL to that range, so the RI pipeline can stream one auxiliary block at a
+/// time rather than materialising nao^2 x naux. Same role as the primitive
+/// coulomb_3c_auxblock; the tiling has to reach the device path because that is
+/// what actually runs for float and double.
 template <class Real>
 std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
-                                 const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
-  const int nao = orb.nao, naux = aux.nao;
-  const int nso = static_cast<int>(orb.shells.size()), nsa = static_cast<int>(aux.shells.size());
+                                 const ContractedBasis<Real> &aux, const TGrid<Real> &grid,
+                                 int sa0, int sa1) {
+  const int nao = orb.nao;
+  const int nso = static_cast<int>(orb.shells.size());
+  const int p0 = aux.ao_off[sa0], naux = aux.ao_off[sa1] - p0;
   auto ov = to_contracted_dev(orb, "intti::c3cc::oeff");
   auto av = to_contracted_dev(aux, "intti::c3cc::aeff");
   std::vector<ShellPair<Real>> plist;
@@ -276,7 +283,7 @@ std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
   std::vector<int> qM, qN, qA, qpm, qpn, qpa;
   for (int M = 0; M < nso; ++M)
     for (int N = 0; N <= M; ++N)
-      for (int A = 0; A < nsa; ++A)
+      for (int A = sa0; A < sa1; ++A)
         for (int pm = 0; pm < orb.shells[M].nprim(); ++pm)
           for (int pn = 0; pn < orb.shells[N].nprim(); ++pn)
             for (int pa = 0; pa < aux.shells[A].nprim(); ++pa) {
@@ -301,6 +308,7 @@ std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
   auto oeff = ov.eff, oL = ov.L, onp = ov.nprim, onc = ov.nctr, oao = ov.aoff, oeo = ov.eoff;
   auto aeff = av.eff, aL = av.L, anp = av.nprim, anc = av.nctr, aao = av.aoff, aeo = av.eoff;
   Kokkos::View<Real *> Td("intti::c3cc::T", static_cast<std::size_t>(nao) * nao * naux);
+  const std::size_t pbase = static_cast<std::size_t>(p0);
   Kokkos::parallel_for(
       "intti::c3cc::scatter", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int iq) {
         const int M = dM(iq), N = dN(iq), A = dA(iq), pm = dpm(iq), pn = dpn(iq), pa = dpa(iq);
@@ -321,7 +329,9 @@ std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
                   for (int kP = 0; kP < nP; ++kP) {
                     const std::size_t I = oao(M) + static_cast<std::size_t>(cM) * nm + km;
                     const std::size_t Jn = oao(N) + static_cast<std::size_t>(cN) * nn + kn;
-                    const std::size_t P = aao(A) + static_cast<std::size_t>(cA) * nP + kP;
+                    // auxiliary index is LOCAL to the tile
+                    const std::size_t P =
+                        aao(A) - pbase + static_cast<std::size_t>(cA) * nP + kP;
                     const Real v = w * out(base + (km * nn + kn) * nP + kP);
                     Kokkos::atomic_add(&Td((I * nao + Jn) * naux + P), v);
                     if (offdiag) Kokkos::atomic_add(&Td((Jn * nao + I) * naux + P), v);
@@ -515,20 +525,24 @@ std::vector<Real> coulomb_2c(const ContractedBasis<Real> &aux, const TGrid<Real>
 /// Three-center Coulomb (mu nu | P) over generally-contracted orbital and
 /// auxiliary bases: row-major (mu, nu, P) tensor of size nao*nao*naux (PySCF
 /// cart=True normalization).
+/// [sa0, sa1) restricts the AUXILIARY shells; the returned tensor's auxiliary
+/// index is local to that range. Streams one auxiliary block at a time instead
+/// of materialising nao^2 x naux, which at nao = 1000, naux = 4000 is 32 GB.
 template <class Real>
-std::vector<Real> coulomb_3c(const ContractedBasis<Real> &orb,
-                             const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+std::vector<Real> coulomb_3c_auxblock(const ContractedBasis<Real> &orb,
+                                      const ContractedBasis<Real> &aux,
+                                      const TGrid<Real> &grid, int sa0, int sa1) {
   if constexpr (kokkos_scalar_v<Real>)
-    return detail::coulomb_3c_dev(orb, aux, grid);
-  const int nao = orb.nao, naux = aux.nao;
+    return detail::coulomb_3c_dev(orb, aux, grid, sa0, sa1);
+  const int nao = orb.nao;
+  const int pbase = aux.ao_off[sa0], naux = aux.ao_off[sa1] - pbase;
   std::vector<Real> T(static_cast<std::size_t>(nao) * nao * naux, Real(0));
   const int nso = static_cast<int>(orb.shells.size());
-  const int nsa = static_cast<int>(aux.shells.size());
   for (int Mi = 0; Mi < nso; ++Mi)
     for (int Ni = 0; Ni <= Mi; ++Ni) {
       const auto &SM = orb.shells[Mi], &SN = orb.shells[Ni];
       const int nm = ncart(SM.l), nn = ncart(SN.l), nctM = SM.nctr(), nctN = SN.nctr();
-      for (int A = 0; A < nsa; ++A) {
+      for (int A = sa0; A < sa1; ++A) {
         const auto &SA = aux.shells[A];
         const int nP = ncart(SA.l), nctA = SA.nctr();
         // contracted block cblk[(cM*nm+km)][(cN*nn+kn)][(cA*nP+kP)]
@@ -567,7 +581,8 @@ std::vector<Real> coulomb_3c(const ContractedBasis<Real> &orb,
                 const std::size_t Jn = orb.ao_off[Ni] + static_cast<std::size_t>(cN) * nn + kn;
                 for (int cA = 0; cA < nctA; ++cA)
                   for (int kP = 0; kP < nP; ++kP) {
-                    const std::size_t P = aux.ao_off[A] + static_cast<std::size_t>(cA) * nP + kP;
+                    const std::size_t P =
+                        aux.ao_off[A] - pbase + static_cast<std::size_t>(cA) * nP + kP;
                     const Real v = cblk[(((static_cast<std::size_t>(cM) * nm + km) * dN + cN * nn + kn) * dA) +
                                         cA * nP + kP];
                     T[(I * nao + Jn) * naux + P] = v;
@@ -578,6 +593,14 @@ std::vector<Real> coulomb_3c(const ContractedBasis<Real> &orb,
       }
     }
   return T;
+}
+
+/// Whole (mu nu | P) over contracted bases: the auxiliary block spanning every
+/// shell. Kept as the one-liner it is, so there is a single implementation.
+template <class Real>
+std::vector<Real> coulomb_3c(const ContractedBasis<Real> &orb,
+                             const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+  return coulomb_3c_auxblock(orb, aux, grid, 0, static_cast<int>(aux.shells.size()));
 }
 
 } // namespace intti

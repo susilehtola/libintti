@@ -987,13 +987,19 @@ void ri_fit_rhs(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux, const 
 
 template <class Real>
 void ri_fit_rhs(const ContractedBasis<Real> &orb, const ContractedBasis<Real> &aux,
-                const Real *D, const TGrid<Real> &grid, int, std::vector<Real> &d) {
-  const int naux = aux.nao;
+                const Real *D, const TGrid<Real> &grid, int aux_tile_shells,
+                std::vector<Real> &d) {
+  const int naux = aux.nao, nsa = static_cast<int>(aux.shells.size());
   const std::size_t N = static_cast<std::size_t>(orb.nao) * orb.nao;
-  const auto T = coulomb_3c(orb, aux, grid); // (mn, P) row-major
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
   d.assign(naux, Real(0));
-  gemm('T', 'N', naux, 1, static_cast<int>(N), Real(1), T.data(), naux, D, 1, Real(0),
-       d.data(), 1);
+  for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa);
+    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+    gemm('T', 'N', blk, 1, static_cast<int>(N), Real(1), Tblk.data(), blk, D, 1, Real(0),
+         d.data() + p0, 1);
+  }
 }
 
 /// M^{-1} alone (no right-hand side), with the same relative eigenvalue cutoff.
@@ -1175,13 +1181,13 @@ namespace detail {
 /// are accumulated at primitive auxiliary indices and lifted with Ca before the
 /// solve. `fo` null and `Ca` empty is the primitive case, where every one of
 /// those is the identity.
-template <class Real>
+template <class Real, class Tile>
 JKDerivResult<Real> ri_j_deriv_kernel(
     const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
     const std::vector<JKRequest<Real>> &reqs, const TGrid<Real> &grid, int aux_tile_shells,
     const std::vector<int> &group, const ShellFanout<Real> *fo, const std::vector<Real> &Ca,
     int nauxc, const std::vector<Real> &Minv, const std::vector<std::vector<Real>> &gamma_c,
-    const std::vector<Real> *Tc) {
+    int nsa_out, Tile &&tile) {
   const int nao = orb.nao, naux = aux.nao;
   const int nao_out = fo ? fo->nao : nao;
   const std::size_t Nout = static_cast<std::size_t>(nao_out) * nao_out;
@@ -1537,23 +1543,18 @@ JKDerivResult<Real> ri_j_deriv_kernel(
   // orbital indices and the contracted auxiliary index. When a contracted
   // tensor is supplied it is used whole; otherwise the tile loop is outermost
   // so the tensor is built once per tile for ALL requests and perturbations.
-  if (Tc) {
+  // `tile(A0, A1)` yields the three-centre block for auxiliary shells [A0, A1)
+  // in the OUTPUT basis, so this loop is the same whether the caller is
+  // primitive or contracted -- and neither ever holds nao^2 x naux.
+  for (int A0 = 0; A0 < nsa_out; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa_out);
+    int p0 = 0, blk = 0;
+    const auto Tblk = tile(A0, A1, p0, blk);
     for (int r = 0; r < nreq; ++r)
       for (int x = 0; x < npert; ++x)
-        detail::gemm('N', 'N', static_cast<int>(Nout), 1, nauxc, Real(1), Tc->data(),
-                     nauxc, gx.data() + (static_cast<std::size_t>(r) * npert + x) * nauxc,
-                     1, Real(1), res.J[r].data() + static_cast<std::size_t>(x) * Nout, 1);
-  } else {
-    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
-      const int A1 = std::min(A0 + aux_tile_shells, nsa);
-      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
-      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
-      for (int r = 0; r < nreq; ++r)
-        for (int x = 0; x < npert; ++x)
-          detail::gemm('N', 'N', static_cast<int>(Nout), 1, blk, Real(1), Tblk.data(), blk,
-                       gx.data() + (static_cast<std::size_t>(r) * npert + x) * nauxc + p0,
-                       1, Real(1), res.J[r].data() + static_cast<std::size_t>(x) * Nout, 1);
-    }
+        detail::gemm('N', 'N', static_cast<int>(Nout), 1, blk, Real(1), Tblk.data(), blk,
+                     gx.data() + (static_cast<std::size_t>(r) * npert + x) * nauxc + p0, 1,
+                     Real(1), res.J[r].data() + static_cast<std::size_t>(x) * Nout, 1);
   }
   // add the perturbation-independent term
   for (int r = 0; r < nreq; ++r)
@@ -1586,11 +1587,17 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
                  Real(0), gam[r].data(), 1);
   }
   const std::vector<Real> no_lift; // primitive: the two auxiliary spaces coincide
-  // explicit casts: nullptr alone gives the compiler nothing to deduce Real from
+  const int nsa = static_cast<int>(aux.shells.size());
+  auto tile = [&](int A0, int A1, int &p0, int &blk) {
+    p0 = aux.ao_off[A0];
+    blk = aux.ao_off[A1] - p0;
+    return coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+  };
+  // explicit cast: nullptr alone gives the compiler nothing to deduce Real from
   return detail::ri_j_deriv_kernel(
       orb, aux, reqs, grid, aux_tile_shells, group,
       static_cast<const detail::ShellFanout<Real> *>(nullptr), no_lift, aux.nao, Minv, gam,
-      static_cast<const std::vector<Real> *>(nullptr));
+      nsa, tile);
 }
 
 /// Same, over generally-contracted bases. The densities and the result are in
@@ -1606,7 +1613,6 @@ JKDerivResult<Real> ri_j_deriv_build(const ContractedBasis<Real> &orb,
   const int nreq = static_cast<int>(reqs.size());
   const int naoc = orb.nao, nauxc = aux.nao;
   const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
-  const auto Tc = coulomb_3c(orb, aux, grid); // (MN, P), contracted throughout
   std::vector<std::vector<Real>> gam(nreq);
   for (int r = 0; r < nreq; ++r) {
     std::vector<Real> d;
@@ -1641,8 +1647,15 @@ JKDerivResult<Real> ri_j_deriv_build(const ContractedBasis<Real> &orb,
   // the caller's group map is over CONTRACTED centres; compose it with parent
   std::vector<int> grp2(ncen);
   for (int i = 0; i < ncen; ++i) grp2[i] = group.empty() ? parent[i] : group[parent[i]];
+  // tiles in the CONTRACTED basis on every index -- which is the output basis
+  const int nsa_c = static_cast<int>(aux.shells.size());
+  auto tile = [&](int A0, int A1, int &p0, int &blk) {
+    p0 = aux.ao_off[A0];
+    blk = aux.ao_off[A1] - p0;
+    return coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+  };
   return detail::ri_j_deriv_kernel(po, pa, preq, grid, aux_tile_shells, grp2, &fo, Ca,
-                                   nauxc, Minv, gam, &Tc);
+                                   nauxc, Minv, gam, nsa_c, tile);
 }
 
 // The RI exchange derivative matrices, absent for a while, are reinstated below
@@ -2119,16 +2132,22 @@ std::vector<Real> ri_k_build_Y(const ShellBasis<Real> &orb, const ShellBasis<Rea
 template <class Real>
 std::vector<Real> ri_k_build_Y(const ContractedBasis<Real> &orb,
                                const ContractedBasis<Real> &aux, const Real *CR, int nvec,
-                               const TGrid<Real> &grid, int) {
+                               const TGrid<Real> &grid, int aux_tile_shells) {
   const int nao = orb.nao, naux = aux.nao;
+  const int nsa = static_cast<int>(aux.shells.size());
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
   const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
-  const auto T = coulomb_3c(orb, aux, grid); // (m n, Q) row-major
   std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0)), Tq(N);
-  for (int Q = 0; Q < naux; ++Q) {
-    for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = T[mn * naux + Q];
-    gemm('T', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
-         Y.data() + static_cast<std::size_t>(Q) * slab, nvec);
+  for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa);
+    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+    for (int Q = 0; Q < blk; ++Q) {
+      for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = Tblk[mn * blk + Q];
+      gemm('T', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
+           Y.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
+    }
   }
   return Y;
 }
