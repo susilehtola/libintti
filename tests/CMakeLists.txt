@@ -30,6 +30,7 @@ add_executable(intti_tests
   test_contracted.cpp
   test_harmonics.cpp
   test_ngrid.cpp
+  test_space.cpp
   test_nuclear.cpp
   test_ncenter.cpp
   test_localhybrid.cpp

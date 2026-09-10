@@ -39,6 +39,7 @@
 
 #include "batch.hpp"
 #include "contracted.hpp"
+#include "space.hpp"
 #include "device.hpp"
 #include "erigrad.hpp" // detail::md_grad_terms, comp_index
 #include "fock.hpp"
@@ -68,6 +69,15 @@ template <class Real> struct JKResult {
   std::vector<std::vector<Real>> J, K;
 };
 
+/// J and K left where they were computed: device views of nreq x nao^2 each.
+/// The entry point for a caller that keeps its matrices on the device -- see
+/// space.hpp for why the API is space-flexible at all.
+template <class Real> struct JKDeviceResult {
+  Kokkos::View<Real *> J, K;
+  std::vector<int> wantJ, wantK;
+  int nreq{0}, n2{0};
+};
+
 namespace detail {
 
 /// General path: every ordered shell quartet, no assumption about the density.
@@ -77,8 +87,8 @@ namespace detail {
 /// available for real integrals but interact with the general-D exchange
 /// accumulation, so they are left to the fused symmetric path.
 template <class Real>
-JKResult<Real> jk_build_general(const ShellBasis<Real> &basis,
-                                const std::vector<JKRequest<Real>> &reqs,
+JKDeviceResult<Real> jk_build_general(const ShellBasis<Real> &basis,
+                                      const std::vector<JKRequest<Real>> &reqs,
                                 const TGrid<Real> &grid, Real tau) {
   const int ns = static_cast<int>(basis.shells.size());
   const int nao = basis.nao;
@@ -162,15 +172,7 @@ JKResult<Real> jk_build_general(const ShellBasis<Real> &basis,
               }
       });
   Kokkos::fence();
-  auto hJ = to_host(Jd), hK = to_host(Kd);
-  JKResult<Real> res;
-  res.J.resize(nreq);
-  res.K.resize(nreq);
-  for (int r = 0; r < nreq; ++r) {
-    if (hwantJ[r]) res.J[r].assign(hJ.begin() + r * n2, hJ.begin() + (r + 1) * n2);
-    if (hwantK[r]) res.K[r].assign(hK.begin() + r * n2, hK.begin() + (r + 1) * n2);
-  }
-  return res;
+  return JKDeviceResult<Real>{Jd, Kd, hwantJ, hwantK, nreq, static_cast<int>(n2)};
 }
 
 } // namespace detail
@@ -190,7 +192,24 @@ JKResult<Real> jk_build(const ShellBasis<Real> &basis,
   bool all_symmetric = true;
   for (const auto &r : reqs)
     if (r.sym != DensitySymmetry::Symmetric) all_symmetric = false;
-  if (!all_symmetric) return detail::jk_build_general(basis, reqs, grid, tau);
+  if (!all_symmetric) {
+    // general path: computed on the device, brought down for this host-facing
+    // entry point. jk_build_device returns it without the copy.
+    const auto dev = detail::jk_build_general(basis, reqs, grid, tau);
+    const auto hJ = detail::to_host(dev.J), hK = detail::to_host(dev.K);
+    JKResult<Real> out;
+    out.J.resize(nreq);
+    out.K.resize(nreq);
+    for (int r = 0; r < nreq; ++r) {
+      if (dev.wantJ[r])
+        out.J[r].assign(hJ.begin() + static_cast<std::ptrdiff_t>(r) * dev.n2,
+                        hJ.begin() + static_cast<std::ptrdiff_t>(r + 1) * dev.n2);
+      if (dev.wantK[r])
+        out.K[r].assign(hK.begin() + static_cast<std::ptrdiff_t>(r) * dev.n2,
+                        hK.begin() + static_cast<std::ptrdiff_t>(r + 1) * dev.n2);
+    }
+    return out;
+  }
 
   JKResult<Real> res;
   res.J.resize(nreq);
@@ -428,6 +447,50 @@ JKDerivResult<Real> jk_deriv_build(const ShellBasis<Real> &basis,
                                    const std::vector<JKRequest<Real>> &reqs,
                                    const TGrid<Real> &grid, Real tau = Real(0)) {
   return detail::jk_deriv_general(basis, reqs, grid, tau);
+}
+
+/// Space-flexible J/K: the densities and the results may each live on the host
+/// or on the device, in any of the four combinations, and nothing is copied that
+/// is already where it needs to be.
+///
+///   host in, host out      jk_build (above) -- unchanged, and still the right
+///                          call for a host-only code
+///   device in, device out  this, with device views: zero copies
+///   mixed                  this, with one side host: exactly one copy, the
+///                          unavoidable one
+///
+/// `D` is one view per request, in ANY memory space; `J` and `K` likewise, and
+/// either may be empty to skip that term. Views are nao^2 per request.
+template <class Real, class DView, class OutView>
+void jk_build_into(const ShellBasis<Real> &basis, const std::vector<DView> &D,
+                   const std::vector<DensitySymmetry> &sym,
+                   const std::vector<FockTerms> &terms, const TGrid<Real> &grid,
+                   std::vector<OutView> &J, std::vector<OutView> &K,
+                   Real tau = Real(0)) {
+  const int nreq = static_cast<int>(D.size());
+  const std::size_t n2 = static_cast<std::size_t>(basis.nao) * basis.nao;
+  // Stage the densities where the kernel needs them. device_in is a no-op for
+  // a caller who is already there.
+  std::vector<std::vector<Real>> staged(nreq);
+  std::vector<JKRequest<Real>> reqs(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, D[r]);
+    staged[r].assign(h.data(), h.data() + n2);
+    reqs[r] = JKRequest<Real>{staged[r].data(), sym[r], terms[r]};
+  }
+  const auto dev = detail::jk_build_general(basis, reqs, grid, tau);
+  auto publish = [&](std::vector<OutView> &dst, const Kokkos::View<Real *> &src,
+                     const std::vector<int> &want) {
+    for (int r = 0; r < static_cast<int>(dst.size()); ++r) {
+      if (!want[r] || dst[r].extent(0) == 0) continue;
+      auto sub = Kokkos::subview(
+          src, Kokkos::make_pair(static_cast<std::size_t>(r) * n2,
+                                 static_cast<std::size_t>(r + 1) * n2));
+      Kokkos::deep_copy(dst[r], sub); // no-op cost when dst is already device-side
+    }
+  };
+  publish(J, dev.J, dev.wantJ);
+  publish(K, dev.K, dev.wantK);
 }
 
 /// Derivative J/K in the BRA-GRADIENT convention: the derivative acts only on
