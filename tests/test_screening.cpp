@@ -171,3 +171,58 @@ TEST(Screening, TResolvedTruncationIsAngularMomentumBlind) {
   EXPECT_LE(hi - lo, 4) << "truncation has become angular-momentum dependent, i.e. it has "
                            "degraded towards monopole (MBIE-1) behaviour";
 }
+
+// Screening wired into the BATCHED engine: a screened batch must reproduce an
+// unscreened one, and must actually evaluate fewer nodes. This is the property
+// that matters in production -- the earlier tests check the estimate in
+// isolation, this one checks the plumbing that acts on it.
+TEST(Screening, ScreenedBatchMatchesUnscreened) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nt = grid.n();
+  // two well-separated clusters, so a good fraction of the quartets are distant
+  std::vector<Shell> sh;
+  for (double z : {0.0, 0.9}) {
+    sh.push_back(Shell{1.3, {0, 0, z}, 0});
+    sh.push_back(Shell{0.6, {0.3, 0, z}, 1});
+  }
+  for (double z : {24.0, 24.9}) {
+    sh.push_back(Shell{1.1, {0, 0, z}, 0});
+    sh.push_back(Shell{0.5, {0.2, 0, z}, 1});
+  }
+  std::vector<intti::ShellPair<double>> plist;
+  for (std::size_t i = 0; i < sh.size(); ++i)
+    for (std::size_t j = 0; j < sh.size(); ++j)
+      plist.push_back(intti::make_pair(sh[i], sh[j]));
+  auto tab = intti::make_pair_table(plist);
+  const int npair = static_cast<int>(plist.size());
+  std::vector<std::pair<int, int>> quartets;
+  for (int a = 0; a < npair; ++a)
+    for (int b = a; b < npair; ++b) quartets.push_back({a, b});
+
+  intti::QuartetWorkspace<double> ws;
+  auto full = intti::make_batch(tab, quartets);
+  Kokkos::View<double *> ref("ref", full.nout_total);
+  intti::eri_quartets(tab, full, grid, ref, ws);
+
+  auto cut = intti::make_batch(tab, quartets);
+  const double eps = 1e-11;
+  intti::t_screen_batch(cut, plist, grid, eps);
+  Kokkos::View<double *> got("got", cut.nout_total);
+  intti::eri_quartets(tab, cut, grid, got, ws);
+
+  const auto [before, after] = intti::t_screen_nodes(cut, nt);
+  EXPECT_LT(after, before * 9 / 10) << "screening removed almost nothing on a "
+                                       "two-cluster system: " << after << "/" << before;
+
+  auto hr = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, ref);
+  auto hg = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, got);
+  double worst = 0, scale = 0;
+  for (std::size_t i = 0; i < ref.extent(0); ++i) {
+    worst = std::max(worst, std::abs(hg(i) - hr(i)));
+    scale = std::max(scale, std::abs(hr(i)));
+  }
+  EXPECT_GT(scale, 1e-3) << "integrals trivially zero";
+  EXPECT_LT(worst, eps * 100) << "screened batch differs from unscreened by more than eps";
+  printf("t-screening: %zu of %zu nodes evaluated (%.1f%%), max deviation %.2e\n", after,
+         before, 100.0 * after / before, worst);
+}

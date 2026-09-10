@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <limits>
 #include <vector>
 
 #include "gto.hpp"
@@ -97,6 +98,15 @@ PairTable<Real> make_pair_table(const std::vector<ShellPair<Real>> &pairs) {
 /// A batch of quartets, as (bra pair, ket pair) index lists into a PairTable.
 template <class Real> struct QuartetBatch {
   Kokkos::View<int *[2], Kokkos::LayoutLeft> quartets;
+  /// Per-quartet count of LEADING quadrature nodes to evaluate. Filled with the
+  /// full node count by make_batch; t_screen_batch (screening.hpp) narrows it
+  /// per quartet. theta(t) is monotone, so a prefix is the right shape -- the
+  /// small-t nodes carry the 1/R tail and are never dropped.
+  ///
+  /// A quartet with keep < nt must ALSO skip the tail correction: tail_coeff
+  /// represents the integral beyond the grid's truncation point, which is the
+  /// very large-t region being screened, so carrying it would double count.
+  Kokkos::View<int *> keep;
   /// Exclusive scan of per-quartet ncart products. 64-bit: a large batch can
   /// exceed 2^31 materialised integrals, and an int scan would wrap silently.
   Kokkos::View<std::int64_t *> out_offset;
@@ -105,6 +115,7 @@ template <class Real> struct QuartetBatch {
   // host planning data
   std::vector<std::pair<int, int>> h_quartets;
   std::vector<std::size_t> h_offset;
+  int nt_full{0}; ///< the untruncated node count, so a kernel can spot a prefix
 };
 
 template <class Real>
@@ -135,6 +146,12 @@ QuartetBatch<Real> make_batch(const PairTable<Real> &pairs,
   ho(b.nq) = b.h_offset[b.nq];
   Kokkos::deep_copy(b.quartets, hq);
   Kokkos::deep_copy(b.out_offset, ho);
+    // No screening by default. make_batch does not see the grid, so the "keep
+  // everything" state is a sentinel above any real node count, clamped to nt in
+  // the kernel.
+  b.nt_full = 0;
+  b.keep = Kokkos::View<int *>("intti::batch::keep", b.nq);
+  Kokkos::deep_copy(b.keep, std::numeric_limits<int>::max());
   return b;
 }
 
@@ -198,6 +215,7 @@ void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &b
   auto tv = grid.t_dev;
   auto wv = grid.w_dev;
   auto qv = batch.quartets;
+  auto keepv = batch.keep;
   auto offv = batch.out_offset;
   auto pv = pairs.p;
   auto Pv = pairs.P;
@@ -279,6 +297,9 @@ void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &b
         "intti::batch::g",
         Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {nq, nt}),
         KOKKOS_LAMBDA(int jq, int i) {
+          // keep is clamped to nt here rather than at construction: make_batch
+          // does not see the grid, so "no screening" is stored as a sentinel.
+          if (i >= keepv(q0 + jq)) return; // screened-off node: no hermite_b at all
           const int ib = qv(q0 + jq, 0), ik = qv(q0 + jq, 1);
           const int la = lav(ib), lb = lbv(ib), lc = lav(ik), ld = lbv(ik);
           const int nf = la + lb + lc + ld + 1;
@@ -323,10 +344,13 @@ void eri_quartets_impl(const PairTable<Real> &pairs, const QuartetBatch<Real> &b
             int cmb[3];
             for (int d = 0; d < 3; ++d)
               cmb[d] = ((a3[d] * (lb + 1) + b3[d]) * (lc + 1) + c3[d]) * (ld + 1) + d3[d];
-            for (int i = 0; i < nt; ++i)
+            const int nk = keepv(q0 + jq) < nt ? keepv(q0 + jq) : nt;
+            for (int i = 0; i < nk; ++i)
               val += wv(i) * g(i, cmb[0], 3 * jq) * g(i, cmb[1], 3 * jq + 1) *
                      g(i, cmb[2], 3 * jq + 2);
-            if (tail_coeff != R(0)) {
+            // the tail term IS the screened large-t region; carrying it on a
+            // truncated quartet would double count exactly what was dropped
+            if (tail_coeff != R(0) && nk == nt) {
               // tail = sum_{a+b+c<=K} b_{a+b+c}/(a!b!c!) D^{2a}_x D^{2b}_y D^{2c}_z,
               // b_k = pi/(4^k (k+1) t_c^{2k+2}); b_0/D^0^3 is the leading delta term
               R bcoef[TAIL_KMAX + 1], invf[TAIL_KMAX + 1];

@@ -20,6 +20,7 @@
 #include "gto.hpp"
 #include "hermite1d.hpp"
 #include "math.hpp"
+#include "batch.hpp"
 #include "tgrid.hpp"
 
 namespace intti {
@@ -223,6 +224,41 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
     tail += b;
   }
   return 0;
+}
+
+
+/// Fill a batch's per-quartet node counts from t_screen_keep, so the engine
+/// evaluates each quartet on only the prefix of the grid it needs.
+///
+/// Screening is OPT-IN: make_batch leaves every quartet at the full grid, and
+/// this narrows it. eps is an absolute bound on the discarded contribution per
+/// quartet, so it should be set against the tolerance the caller already uses
+/// for Schwarz rather than independently.
+template <class Real>
+void t_screen_batch(QuartetBatch<Real> &batch,
+                    const std::vector<ShellPair<Real>> &pair_list,
+                    const TGrid<Real> &grid, Real eps) {
+  const int nt = grid.n();
+  std::vector<int> keep(batch.nq, nt);
+  for (int q = 0; q < batch.nq; ++q) {
+    const auto [ib, ik] = batch.h_quartets[q];
+    keep[q] = t_screen_keep(pair_list[ib], pair_list[ik], grid, eps);
+  }
+  auto h = Kokkos::create_mirror_view(batch.keep);
+  for (int q = 0; q < batch.nq; ++q) h(q) = keep[q];
+  Kokkos::deep_copy(batch.keep, h);
+  batch.nt_full = nt;
+}
+
+/// Total nodes that would be evaluated, before and after screening -- for
+/// callers that want to report or tune the saving.
+template <class Real>
+std::pair<std::size_t, std::size_t> t_screen_nodes(const QuartetBatch<Real> &batch,
+                                                   int nt) {
+  auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, batch.keep);
+  std::size_t kept = 0;
+  for (int q = 0; q < batch.nq; ++q) kept += std::min(h(q), nt);
+  return {static_cast<std::size_t>(batch.nq) * nt, kept};
 }
 
 } // namespace intti
