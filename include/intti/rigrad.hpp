@@ -380,6 +380,32 @@ std::vector<Real> quartet_pos_deriv_block(const PrimitiveShell<Real> &s0,
   return out;
 }
 
+/// The three positions of a (bra1 bra2 | aux ghost) derivative, with the AUX
+/// position obtained from translational invariance rather than evaluated.
+///
+/// The ghost has zero exponent, so it is a constant and carries no centre
+/// dependence: d/dbra1 + d/dbra2 + d/daux = 0 exactly. That makes the third
+/// position free, cutting the eri_block4 evaluations -- which are what these
+/// kernels actually spend their time on -- by a third. ri_j_deriv_kernel has
+/// always done this; the exchange and Hessian passes were evaluating all three.
+///
+/// blk[pos][dir], each in the base component shape of (s0 s1 | s2 ghost).
+template <class Real>
+std::array<std::array<std::vector<Real>, 3>, 3>
+ghost_quartet_deriv(const PrimitiveShell<Real> &s0, const PrimitiveShell<Real> &s1,
+                    const PrimitiveShell<Real> &s2, const PrimitiveShell<Real> &gh,
+                    const TGrid<Real> &grid) {
+  std::array<std::array<std::vector<Real>, 3>, 3> blk;
+  blk[0] = quartet_pos_deriv_blocks3(s0, s1, s2, gh, 0, grid);
+  blk[1] = quartet_pos_deriv_blocks3(s0, s1, s2, gh, 1, grid);
+  for (int dir = 0; dir < 3; ++dir) {
+    blk[2][dir].assign(blk[0][dir].size(), Real(0));
+    for (std::size_t i = 0; i < blk[0][dir].size(); ++i)
+      blk[2][dir][i] = -(blk[0][dir][i] + blk[1][dir][i]);
+  }
+  return blk;
+}
+
 /// Device jobs for the RI Hessians: one job per ghost-shell quartet, carrying
 /// the batch entry for each per-position l-offset pattern the second-derivative
 /// digestion asks for. Same construction as the 2e Hessian (erihess): patterns
@@ -902,11 +928,10 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
         const int om = orb.ao_off[m], on = orb.ao_off[n], oP = aux.ao_off[a];
         const int nm = ncart(sm.l), nn = ncart(sn.l), nP = ncart(sP.l);
         const int cs[3] = {cshell(false, m), cshell(false, n), cshell(true, a)};
+        const auto blkall = detail::ghost_quartet_deriv(sm, sn, sP, gh, grid);
         for (int pos = 0; pos < 3; ++pos) {
-          // all three directions share the two promoted blocks
-          auto blk3 = detail::quartet_pos_deriv_blocks3(sm, sn, sP, gh, pos, grid);
           for (int dir = 0; dir < 3; ++dir) {
-            const auto &blk = blk3[dir];
+            const auto &blk = blkall[pos][dir];
             for (int km = 0; km < nm; ++km)
               for (int kn = 0; kn < nn; ++kn) {
                 const Real dmn = Dm(om + km, on + kn);
@@ -2087,10 +2112,10 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
           const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
           const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
           const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
+          const auto blkall = detail::ghost_quartet_deriv(sl, sn, sc, gh, grid);
           for (int pos = 0; pos < 3; ++pos) {
-            auto blk3 = detail::quartet_pos_deriv_blocks3(sl, sn, sc, gh, pos, grid);
             for (int dir = 0; dir < 3; ++dir) {
-              const auto &blk = blk3[dir];
+              const auto &blk = blkall[pos][dir];
               const int xi = 3 * cs[pos] + dir;
               for (int kl = 0; kl < nl; ++kl)
                 for (int kn = 0; kn < nn; ++kn)
@@ -2379,11 +2404,7 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
         //
         // The nine derivative blocks are therefore evaluated up front, and the
         // loop order becomes (kn, kQ) outside (pos, dir, kl).
-        std::vector<Real> blocks[9];
-        for (int pos = 0; pos < 3; ++pos) {
-          auto three = detail::quartet_pos_deriv_blocks3(sl, sn, sc, gh, pos, grid);
-          for (int dir = 0; dir < 3; ++dir) blocks[pos * 3 + dir] = std::move(three[dir]);
-        }
+        const auto blk3all = detail::ghost_quartet_deriv(sl, sn, sc, gh, grid);
         std::vector<Real> y1(nao_out), y3(nao_out);
         for (int kn = 0; kn < nn; ++kn)
           for (int kQ = 0; kQ < nP; ++kQ) {
@@ -2397,7 +2418,7 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
                          CR + static_cast<std::size_t>(B) * nvec, 1, Real(0), y3.data(), 1);
             for (int pos = 0; pos < 3; ++pos) {
               for (int dir = 0; dir < 3; ++dir) {
-                const auto &blk = blocks[pos * 3 + dir];
+                const auto &blk = blk3all[pos][dir];
                 const int xi = 3 * grp[cs[pos]] + dir; // folded onto the group (atoms)
                 Real *Kx = res.K[0].data() + static_cast<std::size_t>(xi) * N;
                 for (int kl = 0; kl < nl; ++kl) {
