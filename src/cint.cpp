@@ -473,6 +473,38 @@ extern "C" int intti_ri_deriv_jk(double *vj, double *vk, const double *dm,
     out = intti::make_basis(shells);
     return 0;
   };
+  if (!group || ngrp < 1) return -7;
+  std::vector<int> grp(group, group + (nbas + anbas));
+  for (int g : grp)
+    if (g < 0 || g >= ngrp) return -8;
+  auto has_contraction = [](const int *b, int nb) {
+    for (int ish = 0; ish < nb; ++ish) {
+      const int *r = b + static_cast<std::size_t>(ish) * 8;
+      if (r[NPRIM_OF] != 1 || r[NCTR_OF] != 1) return true;
+    }
+    return false;
+  };
+  if (has_contraction(bas, nbas) || has_contraction(abas, anbas)) {
+    const auto co = contracted_basis_from(atm, bas, nbas, env);
+    const auto ca = contracted_basis_from(aatm, abas, anbas, aenv);
+    const std::size_t cN = static_cast<std::size_t>(co.nao) * co.nao;
+    if (vj) {
+      if (!dm) return -7;
+      std::vector<intti::JKRequest<double>> creq(1);
+      creq[0].D = dm;
+      creq[0].sym = intti::DensitySymmetry::Symmetric;
+      creq[0].terms = intti::FockTerms::Coulomb;
+      const auto r = intti::ri_j_deriv_build(co, ca, creq, default_grid(), tau_lin, 0, grp);
+      for (std::size_t o = 0; o < 3 * ngrp * cN; ++o) vj[o] = r.J[0][o];
+    }
+    if (vk) {
+      if (!cocc || nvec < 1) return -7;
+      const auto r = intti::ri_k_deriv_occ(co, ca, cocc, cocc, nvec, default_grid(),
+                                           tau_lin, 0, grp);
+      for (std::size_t o = 0; o < 3 * ngrp * cN; ++o) vk[o] = r.K[0][o];
+    }
+    return 0;
+  }
   std::vector<double> oscale, ascale;
   intti::ShellBasis<double> orb, aux;
   if (build(atm, bas, nbas, env, oscale, orb) != 0) return -1;
@@ -480,10 +512,6 @@ extern "C" int intti_ri_deriv_jk(double *vj, double *vk, const double *dm,
   const int nao = orb.nao;
   if (static_cast<int>(oscale.size()) != nao) return -2;
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
-  if (!group || ngrp < 1) return -7;
-  std::vector<int> grp(group, group + (nbas + anbas));
-  for (int g : grp)
-    if (g < 0 || g >= ngrp) return -8;
   const auto &grid = default_grid();
 
   if (vj) {

@@ -845,7 +845,7 @@ TEST(Contracted, RiHessiansVsDecontractRecontract) {
 // out onto contracted AOs in the digest. Reference: the same builder with only
 // the ORBITAL basis decontracted (the auxiliary one must not be, or the fitting
 // span changes), folded from primitive shells onto their parents.
-TEST(Contracted, RiJDerivVsDecontractRecontract) {
+TEST(Contracted, RiDerivMatricesVsDecontractRecontract) {
   auto cb = test_basis();
   const int n = cb.nao;
   auto grid = intti::make_tgrid(intti::coulomb<double>());
@@ -910,6 +910,38 @@ TEST(Contracted, RiJDerivVsDecontractRecontract) {
   }
   EXPECT_LT(worst, 1e-9 * std::max(scale, 1.0)) << "contracted RI-J deriv != decontracted";
   EXPECT_GT(scale, 1e-3) << "RI-J derivative matrices trivially zero";
+
+  // ---- and the exchange derivative matrices, same reference construction ----
+  const int nvec = 2;
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec);
+  for (int i2 = 0; i2 < n; ++i2)
+    for (int k = 0; k < nvec; ++k)
+      CL[i2 * nvec + k] = 0.3 * std::cos(0.7 * i2 + k) / (1.0 + i2);
+  std::vector<double> CLp(static_cast<std::size_t>(npao) * nvec, 0.0);
+  for (int I = 0; I < n; ++I)
+    for (int j = 0; j < npao; ++j) {
+      const double c = C[static_cast<std::size_t>(I) * npao + j];
+      if (c == 0) continue;
+      for (int k = 0; k < nvec; ++k) CLp[j * nvec + k] += c * CL[I * nvec + k];
+    }
+  auto gotK = intti::ri_k_deriv_occ(cb, ca, CL.data(), CL.data(), nvec, grid, 1e-12);
+  auto refK = intti::ri_k_deriv_occ(pbc, ca, CLp.data(), CLp.data(), nvec, grid, 1e-12);
+  ASSERT_EQ(gotK.nshell, ncs + nas);
+  ASSERT_EQ(refK.nshell, nps + nas);
+  std::vector<double> refKc(static_cast<std::size_t>(3 * (ncs + nas)) * n2, 0.0);
+  for (int x = 0; x < 3 * (nps + nas); ++x) {
+    std::vector<double> slice(refK.K[0].begin() + x * p2, refK.K[0].begin() + (x + 1) * p2);
+    auto rc = conjugate(C, n, npao, slice);
+    const int tgt = 3 * parent[x / 3] + (x % 3);
+    for (std::size_t i = 0; i < n2; ++i) refKc[tgt * n2 + i] += rc[i];
+  }
+  double kworst = 0, kscale = 0;
+  for (std::size_t i = 0; i < refKc.size(); ++i) {
+    kworst = std::max(kworst, std::abs(gotK.K[0][i] - refKc[i]));
+    kscale = std::max(kscale, std::abs(refKc[i]));
+  }
+  EXPECT_LT(kworst, 1e-9 * std::max(kscale, 1.0)) << "contracted RI-K deriv != decontracted";
+  EXPECT_GT(kscale, 1e-3) << "RI-K derivative matrices trivially zero";
 }
 
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum

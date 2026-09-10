@@ -968,6 +968,12 @@ def main():
         {"O": uncontracted((0, [6.0, 1.8, 0.6]), (1, [2.0, 0.7])),
          "H": uncontracted((0, [2.4, 0.7]))},
         "H2O RI freqs") and ok
+    # ...and the same on a CONTRACTED orbital basis, now that every RI
+    # derivative kernel takes one: SCF, both Hessians, the CPHF right-hand side
+    # and the response, all on intti integrals.
+    ok = df_full_hessian_check(
+        fn_rih, fn_rid, fn_ri, ATOM, "cc-pvdz", MILD_D_AUX,
+        "cc-pvdz RI freqs") and ok
     # per-builder oracle for the RI n-centre tensors, up to g in the auxiliary
     print("2c/3c Coulomb tensors vs libcint:")
     ok = ncentre_check(

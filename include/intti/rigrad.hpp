@@ -2222,69 +2222,48 @@ std::vector<Real> ri_k_hessian_occ(const ContractedBasis<Real> &orb,
 /// roles, so one pass serves both. The persistent working set is Xhat and Yhat
 /// (2 x naux x nao x nvec, built once); the total is dominated by the requested
 /// OUTPUT, npert x nao^2.
+namespace detail {
+
+/// ri_k_deriv_occ's kernel, over PRIMITIVE shells. Like the Coulomb derivative
+/// matrices the output is AO-indexed per perturbation, so the orbital index that
+/// comes from a derivative block is fanned out onto contracted AOs here.
+///
+/// Xh and Yh arrive at PRIMITIVE auxiliary indices (they meet derivative blocks
+/// on that index, in all three terms) but CONTRACTED orbital indices (that index
+/// is an output). CL and CR arrive pushed down to the primitive orbital space.
+/// Term 2 therefore needs no fan-out at all: both of its orbital indices come
+/// from Xh and Yh and are already contracted.
 template <class Real>
-JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
-                                   const Real *CL, const Real *CR, int nvec,
-                                   const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
-                                   int aux_tile_shells = 0,
-                                   const std::vector<int> &group = {}) {
-  const int nao = orb.nao, naux = aux.nao;
+JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
+                                      const ShellBasis<Real> &aux, const Real *CL,
+                                      const Real *CR, int nvec,
+                                      const std::vector<Real> &Xh,
+                                      const std::vector<Real> &Yh,
+                                      const ShellFanout<Real> *fo,
+                                      const std::vector<int> &grp, int ngrp,
+                                      const TGrid<Real> &grid) {
+  const int naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
-  const int ncen = nso + nsa;
-  int ngrp = 0;
-  const auto grp = detail::perturbation_groups(group, ncen, ngrp);
   const int npert = 3 * ngrp;
-  if (aux_tile_shells < 1) aux_tile_shells = nsa;
-  const std::size_t N = static_cast<std::size_t>(nao) * nao;
-  const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
+  ShellFanout<Real> idf;
+  if (!fo) idf = identity_fanout(orb);
+  const ShellFanout<Real> &fan = fo ? *fo : idf;
+  const int nao_out = fan.nao;
+  const std::size_t N = static_cast<std::size_t>(nao_out) * nao_out;
+  const std::size_t slab = static_cast<std::size_t>(nao_out) * nvec;
   auto cshell = [&](bool isaux, int i) { return isaux ? nso + i : i; };
   const auto ghost = [&](const PrimitiveShell<Real> &sx) { return detail::ghost_shell(sx); };
 
-  auto M = coulomb_2c(aux, grid);
-  std::vector<Real> V = M, eval(naux);
-  detail::syevd(naux, V.data(), eval.data());
-  Real emax = 0;
-  for (Real e : eval) emax = std::max(emax, e);
-  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
-  for (int k = 0; k < naux; ++k) {
-    if (eval[k] <= tau_lin * emax) continue;
-    const Real sc = Real(1) / eval[k];
-    for (int R = 0; R < naux; ++R)
-      for (int Q = 0; Q < naux; ++Q)
-        Minv[R * naux + Q] += sc * V[k * naux + R] * V[k * naux + Q];
-  }
-  std::vector<Real> X(static_cast<std::size_t>(naux) * slab, Real(0));
-  std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0));
-  {
-    std::vector<Real> Tq(N);
-    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
-      const int A1 = std::min(A0 + aux_tile_shells, nsa);
-      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
-      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
-      for (int Q = 0; Q < blk; ++Q) {
-        for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = Tblk[mn * blk + Q];
-        detail::gemm('N', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CL, nvec, Real(0),
-                     X.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
-        detail::gemm('N', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
-                     Y.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
-      }
-    }
-  }
-  std::vector<Real> Xh(X.size(), Real(0)), Yh(Y.size(), Real(0));
-  detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), Minv.data(), naux,
-               X.data(), static_cast<int>(slab), Real(0), Xh.data(), static_cast<int>(slab));
-  detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), Minv.data(), naux,
-               Y.data(), static_cast<int>(slab), Real(0), Yh.data(), static_cast<int>(slab));
-
   JKDerivResult<Real> res;
   res.nshell = ngrp;
-  res.nao = nao;
+  res.nao = nao_out;
   res.J.resize(1);
   res.K.resize(1);
   res.K[0].assign(static_cast<std::size_t>(npert) * N, Real(0));
   auto Kadd = [&](int x, int m, int n, Real v) {
-    res.K[0][static_cast<std::size_t>(x) * N + static_cast<std::size_t>(m) * nao + n] += v;
+    res.K[0][static_cast<std::size_t>(x) * N + static_cast<std::size_t>(m) * nao_out + n] +=
+        v;
   };
   for (int l = 0; l < nso; ++l)
     for (int n = 0; n < nso; ++n)
@@ -2304,21 +2283,31 @@ JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis
                   const Real dv = blk[(static_cast<std::size_t>(kl) * nn + kn) * nP + kQ];
                   if (dv == Real(0)) continue;
                   const int A = ol + kl, B = on + kn, P = oc + kQ;
+                  // A comes from the derivative block, so it is a PRIMITIVE
+                  // orbital index and is fanned out onto the contracted AOs it
+                  // feeds; n2 / m2 are output indices and are already
+                  // contracted. All trip counts are 1 for a primitive basis.
                   // term 1: quartet read as (m l|P), m = A, l = B
-                  for (int n2 = 0; n2 < nao; ++n2) {
+                  for (int n2 = 0; n2 < nao_out; ++n2) {
                     Real acc = 0;
                     for (int i = 0; i < nvec; ++i)
                       acc += CL[static_cast<std::size_t>(B) * nvec + i] *
                              Yh[static_cast<std::size_t>(P) * slab + n2 * nvec + i];
-                    if (acc != Real(0)) Kadd(xi, A, n2, acc * dv);
+                    if (acc == Real(0)) continue;
+                    for (int cM = 0; cM < fan.nctr[l]; ++cM)
+                      Kadd(xi, fan.base[l] + cM * nl + kl, n2,
+                           fan.w[fan.coff[l] + cM] * acc * dv);
                   }
                   // term 3: the same quartet read as (n s|Q), n = A, s = B
-                  for (int m2 = 0; m2 < nao; ++m2) {
+                  for (int m2 = 0; m2 < nao_out; ++m2) {
                     Real acc = 0;
                     for (int i = 0; i < nvec; ++i)
                       acc += Xh[static_cast<std::size_t>(P) * slab + m2 * nvec + i] *
                              CR[static_cast<std::size_t>(B) * nvec + i];
-                    if (acc != Real(0)) Kadd(xi, m2, A, acc * dv);
+                    if (acc == Real(0)) continue;
+                    for (int cM = 0; cM < fan.nctr[l]; ++cM)
+                      Kadd(xi, m2, fan.base[l] + cM * nl + kl,
+                           fan.w[fan.coff[l] + cM] * acc * dv);
                   }
                 }
           }
@@ -2358,13 +2347,105 @@ JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis
                    Xh.data(), static_cast<int>(slab), Real(0), Amat.data(),
                    static_cast<int>(slab));
       for (int P = 0; P < naux; ++P)
-        detail::gemm('N', 'T', nao, nao, nvec, Real(-1),
+        // both orbital indices here come from Xh and Yh, which are already in
+        // the OUTPUT basis -- so nao_out, not the primitive nao
+        detail::gemm('N', 'T', nao_out, nao_out, nvec, Real(-1),
                      Amat.data() + static_cast<std::size_t>(P) * slab, nvec,
                      Yh.data() + static_cast<std::size_t>(P) * slab, nvec, Real(1),
-                     res.K[0].data() + static_cast<std::size_t>(x) * N, nao);
+                     res.K[0].data() + static_cast<std::size_t>(x) * N, nao_out);
     }
   }
   return res;
+}
+
+} // namespace detail
+
+/// Derivative RI exchange matrices for a factorised density, over primitive
+/// shells.
+template <class Real>
+JKDerivResult<Real> ri_k_deriv_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                                   const Real *CL, const Real *CR, int nvec,
+                                   const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
+                                   int aux_tile_shells = 0,
+                                   const std::vector<int> &group = {}) {
+  const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
+  const auto X = detail::ri_k_build_Y(orb, aux, CL, nvec, grid, aux_tile_shells);
+  const auto Y = detail::ri_k_build_Y(orb, aux, CR, nvec, grid, aux_tile_shells);
+  const int naux = aux.nao;
+  const int sl = orb.nao * nvec;
+  std::vector<Real> Xh(X.size(), Real(0)), Yh(Y.size(), Real(0));
+  detail::gemm('N', 'N', naux, sl, naux, Real(1), Minv.data(), naux, X.data(), sl, Real(0),
+               Xh.data(), sl);
+  detail::gemm('N', 'N', naux, sl, naux, Real(1), Minv.data(), naux, Y.data(), sl, Real(0),
+               Yh.data(), sl);
+  const int ncen =
+      static_cast<int>(orb.shells.size()) + static_cast<int>(aux.shells.size());
+  int ngrp = 0;
+  const auto grp = detail::perturbation_groups(group, ncen, ngrp);
+  return detail::ri_k_deriv_kernel(orb, aux, CL, CR, nvec, Xh, Yh,
+                                   static_cast<const detail::ShellFanout<Real> *>(nullptr),
+                                   grp, ngrp, grid);
+}
+
+/// Same, over generally-contracted bases. CL, CR and the result are in
+/// CONTRACTED AOs.
+template <class Real>
+JKDerivResult<Real> ri_k_deriv_occ(const ContractedBasis<Real> &orb,
+                                   const ContractedBasis<Real> &aux, const Real *CL,
+                                   const Real *CR, int nvec, const TGrid<Real> &grid,
+                                   Real tau_lin = Real(1e-10), int aux_tile_shells = 0,
+                                   const std::vector<int> &group = {}) {
+  const int naoc = orb.nao, nauxc = aux.nao;
+  const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
+  // X and Y with CONTRACTED indices throughout: their orbital index is an
+  // output, and their auxiliary index meets M^{-1}.
+  const auto X = detail::ri_k_build_Y(orb, aux, CL, nvec, grid, aux_tile_shells);
+  const auto Y = detail::ri_k_build_Y(orb, aux, CR, nvec, grid, aux_tile_shells);
+  const int sl = naoc * nvec;
+  std::vector<Real> Xhc(X.size(), Real(0)), Yhc(Y.size(), Real(0));
+  detail::gemm('N', 'N', nauxc, sl, nauxc, Real(1), Minv.data(), nauxc, X.data(), sl,
+               Real(0), Xhc.data(), sl);
+  detail::gemm('N', 'N', nauxc, sl, nauxc, Real(1), Minv.data(), nauxc, Y.data(), sl,
+               Real(0), Yhc.data(), sl);
+
+  ShellBasis<Real> po, pa;
+  const auto fo = detail::expand_contracted(orb, po);
+  const auto fa = detail::expand_contracted(aux, pa);
+  const auto Co = detail::fanout_matrix(fo, po);
+  const auto Ca = detail::fanout_matrix(fa, pa);
+  const int naop = po.nao, nauxp = pa.nao;
+  // ...then LIFT the auxiliary index to primitive, which is where every
+  // derivative block meets it.
+  auto lift = [&](const std::vector<Real> &A) {
+    std::vector<Real> out(static_cast<std::size_t>(nauxp) * sl, Real(0));
+    detail::gemm('T', 'N', nauxp, sl, nauxc, Real(1), Ca.data(), nauxp, A.data(), sl,
+                 Real(0), out.data(), sl);
+    return out;
+  };
+  const auto Xh = lift(Xhc), Yh = lift(Yhc);
+  // orbital factors push DOWN
+  auto pushdown = [&](const Real *Z) {
+    std::vector<Real> Zp(static_cast<std::size_t>(naop) * nvec, Real(0));
+    detail::gemm('T', 'N', naop, nvec, naoc, Real(1), Co.data(), naop, Z, nvec, Real(0),
+                 Zp.data(), nvec);
+    return Zp;
+  };
+  const auto CLp = pushdown(CL), CRp = pushdown(CR);
+
+  const int ncen = static_cast<int>(po.shells.size()) + static_cast<int>(pa.shells.size());
+  std::vector<int> parent(ncen);
+  for (int i = 0; i < static_cast<int>(po.shells.size()); ++i) parent[i] = fo.parent[i];
+  for (int i = 0; i < static_cast<int>(pa.shells.size()); ++i)
+    parent[static_cast<int>(po.shells.size()) + i] = fo.nsh + fa.parent[i];
+  std::vector<int> grp(ncen);
+  int ngrp = fo.nsh + fa.nsh;
+  for (int i = 0; i < ncen; ++i) grp[i] = group.empty() ? parent[i] : group[parent[i]];
+  if (!group.empty()) {
+    ngrp = 0;
+    for (int v : grp) ngrp = std::max(ngrp, v + 1);
+  }
+  return detail::ri_k_deriv_kernel(po, pa, CLp.data(), CRp.data(), nvec, Xh, Yh, &fo, grp,
+                                   ngrp, grid);
 }
 
 } // namespace intti
