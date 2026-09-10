@@ -194,13 +194,13 @@ template <class Real> Real cramer_factor(Real theta, int L) {
 ///
 /// theta is monotone in t, so this is a one-sided prefix -- the small-t nodes
 /// are never discarded.
+namespace detail {
+
+/// t_screen_keep with the per-pair E factors already computed.
 template <class Real>
-int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
-                  const TGrid<Real> &grid, Real eps) {
+int t_screen_keep_pre(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
+                      const Real *Ea, const Real *Eb, const TGrid<Real> &grid, Real eps) {
   const int nt = grid.n();
-  Real Ea[3], Eb[3];
-  detail::pair_e_absmax(bra, Ea);
-  detail::pair_e_absmax(ket, Eb);
   Real Epref = 1;
   for (int d = 0; d < 3; ++d) Epref *= Ea[d] * Eb[d];
   if (!(Epref > Real(0))) return 0;
@@ -226,6 +226,19 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
   return 0;
 }
 
+} // namespace detail
+
+/// Convenience form that computes the pair factors itself. Prefer
+/// t_screen_batch for a whole batch, which hoists them.
+template <class Real>
+int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
+                  const TGrid<Real> &grid, Real eps) {
+  Real Ea[3], Eb[3];
+  detail::pair_e_absmax(bra, Ea);
+  detail::pair_e_absmax(ket, Eb);
+  return detail::t_screen_keep_pre(bra, ket, Ea, Eb, grid, eps);
+}
+
 
 /// Fill a batch's per-quartet node counts from t_screen_keep, so the engine
 /// evaluates each quartet on only the prefix of the grid it needs.
@@ -239,10 +252,17 @@ void t_screen_batch(QuartetBatch<Real> &batch,
                     const std::vector<ShellPair<Real>> &pair_list,
                     const TGrid<Real> &grid, Real eps) {
   const int nt = grid.n();
+  // The E-coefficient factors depend on the PAIR, not the quartet, so they are
+  // built once per pair rather than twice per quartet. Without this the
+  // screening pass calls e_coeffs O(nq) times and can cost more than it saves.
+  const int npair = static_cast<int>(pair_list.size());
+  std::vector<Real> Eabs(static_cast<std::size_t>(npair) * 3);
+  for (int i = 0; i < npair; ++i) detail::pair_e_absmax(pair_list[i], &Eabs[3 * i]);
   std::vector<int> keep(batch.nq, nt);
   for (int q = 0; q < batch.nq; ++q) {
     const auto [ib, ik] = batch.h_quartets[q];
-    keep[q] = t_screen_keep(pair_list[ib], pair_list[ik], grid, eps);
+    keep[q] = detail::t_screen_keep_pre(pair_list[ib], pair_list[ik], &Eabs[3 * ib],
+                                        &Eabs[3 * ik], grid, eps);
   }
   auto h = Kokkos::create_mirror_view(batch.keep);
   for (int q = 0; q < batch.nq; ++q) h(q) = keep[q];

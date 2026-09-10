@@ -28,6 +28,7 @@
 #include "jk.hpp"      // JKRequest, JKDerivResult
 #include "ncenter.hpp" // detail::ghost_pair pattern (ghost shell)
 #include "ri.hpp"      // detail::syevd
+#include "screening.hpp"
 #include "tgrid.hpp"
 
 namespace intti {
@@ -905,7 +906,7 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
                                       const std::vector<Real> &Minv,
                                       const std::vector<Real> &gamma,
                                       const std::vector<int> &parent, int ngrp,
-                                      const TGrid<Real> &grid) {
+                                      const TGrid<Real> &grid, Real tau_screen) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
@@ -967,6 +968,7 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
         }
     auto tab = make_pair_table(plist);
     auto batch = make_batch(tab, quartets);
+    if (tau_screen > Real(0)) t_screen_batch(batch, plist, grid, tau_screen);
     QuartetWorkspace<Real> ws;
     Kokkos::View<Real *> qout("intti::rijh::out", batch.nout_total);
     eri_quartets(tab, batch, grid, qout, ws);
@@ -1275,7 +1277,8 @@ void ri_solve_fit(const OrbBasis &orb, const AuxBasis &aux, const Real *D,
 template <class Real>
 std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                                const Real *D, const TGrid<Real> &grid,
-                               Real tau_lin = Real(1e-10), int aux_tile_shells = 0) {
+                               Real tau_lin = Real(1e-10), int aux_tile_shells = 0,
+                               Real tau_screen = Real(0)) {
   std::vector<Real> Minv, gamma;
   detail::ri_solve_fit(orb, aux, D, grid, tau_lin, aux_tile_shells, Minv, gamma);
   const int ncen =
@@ -1283,7 +1286,7 @@ std::vector<Real> ri_j_hessian(const ShellBasis<Real> &orb, const ShellBasis<Rea
   std::vector<int> parent(ncen);
   for (int i = 0; i < ncen; ++i) parent[i] = i;
   return detail::ri_j_hessian_kernel(orb, aux, D, {}, aux.nao, Minv, gamma, parent, ncen,
-                                     grid);
+                                     grid, tau_screen);
 }
 
 /// Same, over generally-contracted orbital and auxiliary bases. The fit is
@@ -1296,7 +1299,7 @@ template <class Real>
 std::vector<Real> ri_j_hessian(const ContractedBasis<Real> &orb,
                                const ContractedBasis<Real> &aux, const Real *D,
                                const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
-                               int aux_tile_shells = 0) {
+                               int aux_tile_shells = 0, Real tau_screen = Real(0)) {
   std::vector<Real> Minv, gamma;
   detail::ri_solve_fit(orb, aux, D, grid, tau_lin, aux_tile_shells, Minv, gamma);
   ShellBasis<Real> po, pa;
@@ -1325,7 +1328,7 @@ std::vector<Real> ri_j_hessian(const ContractedBasis<Real> &orb,
   for (int i = 0; i < static_cast<int>(pa.shells.size()); ++i)
     parent[static_cast<int>(po.shells.size()) + i] = fo.nsh + fa.parent[i];
   return detail::ri_j_hessian_kernel(po, pa, Dp.data(), Ca, nauxc, Minv, gp, parent, ngrp,
-                                     grid);
+                                     grid, tau_screen);
 }
 
 
@@ -2096,7 +2099,8 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
                                       const std::vector<Real> &Minv,
                                       const std::vector<Real> &Ca, int nauxc,
                                       const std::vector<int> &parent, int ngrp,
-                                      const TGrid<Real> &grid, int vec_block) {
+                                      const TGrid<Real> &grid, int vec_block,
+                                      Real tau_screen) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
@@ -2243,6 +2247,7 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
         }
     auto tab = make_pair_table(plist);
     auto batch = make_batch(tab, quartets);
+    if (tau_screen > Real(0)) t_screen_batch(batch, plist, grid, tau_screen);
     QuartetWorkspace<Real> ws;
     Kokkos::View<Real *> qout("intti::rikh::out", batch.nout_total);
     eri_quartets(tab, batch, grid, qout, ws);
@@ -2487,7 +2492,8 @@ template <class Real>
 std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
                                    const Real *CL, const Real *CR, int nvec,
                                    const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
-                                   int aux_tile_shells = 0, int vec_block = 0) {
+                                   int aux_tile_shells = 0, int vec_block = 0,
+                                   Real tau_screen = Real(0)) {
   const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
   const auto Y = detail::ri_k_build_Y(orb, aux, CR, nvec, grid, aux_tile_shells);
   const int ncen =
@@ -2495,7 +2501,7 @@ std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis
   std::vector<int> parent(ncen);
   for (int i = 0; i < ncen; ++i) parent[i] = i;
   return detail::ri_k_hessian_kernel(orb, aux, CL, CR, nvec, Y, Minv, {}, aux.nao, parent,
-                                     ncen, grid, vec_block);
+                                     ncen, grid, vec_block, tau_screen);
 }
 
 /// Same, over generally-contracted orbital and auxiliary bases. CL and CR are
@@ -2505,7 +2511,7 @@ std::vector<Real> ri_k_hessian_occ(const ContractedBasis<Real> &orb,
                                    const ContractedBasis<Real> &aux, const Real *CL,
                                    const Real *CR, int nvec, const TGrid<Real> &grid,
                                    Real tau_lin = Real(1e-10), int aux_tile_shells = 0,
-                                   int vec_block = 0) {
+                                   int vec_block = 0, Real tau_screen = Real(0)) {
   const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
   ShellBasis<Real> po, pa;
   const auto fo = detail::expand_contracted(orb, po);
@@ -2544,7 +2550,7 @@ std::vector<Real> ri_k_hessian_occ(const ContractedBasis<Real> &orb,
   for (int i = 0; i < static_cast<int>(pa.shells.size()); ++i)
     parent[static_cast<int>(po.shells.size()) + i] = fo.nsh + fa.parent[i];
   return detail::ri_k_hessian_kernel(po, pa, CLp.data(), CRp.data(), nvec, Y, Minv, Ca,
-                                     aux.nao, parent, ngrp, grid, vec_block);
+                                     aux.nao, parent, ngrp, grid, vec_block, tau_screen);
 }
 
 /// Derivative RI EXCHANGE matrices for a factorised density, D = C_L C_R^T.

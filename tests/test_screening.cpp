@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -225,4 +226,55 @@ TEST(Screening, ScreenedBatchMatchesUnscreened) {
   EXPECT_LT(worst, eps * 100) << "screened batch differs from unscreened by more than eps";
   printf("t-screening: %zu of %zu nodes evaluated (%.1f%%), max deviation %.2e\n", after,
          before, 100.0 * after / before, worst);
+}
+// WHERE t-screening actually pays. This is an extended-system optimisation,
+// not a general one, and the numbers are lopsided enough that shipping it on by
+// default would be wrong:
+//
+//     compact 9-atom (ethanol-like)   94.6% of nodes kept   1.06x
+//     two clusters, 30 bohr apart     15.1%                 6.6x
+//     linear chain, 5.5 bohr spacing   4.1%                24x
+//
+// The reason is structural, not a tuning failure: theta(t) R^2 only becomes
+// large when R exceeds the pair extents, so a molecule whose diameter is
+// comparable to its basis extent has no distant quartets to truncate. The
+// chain is the regime distance-including screening exists for.
+//
+// Asserted as a PATTERN rather than exact fractions, which depend on the basis.
+TEST(Screening, PaysOnExtendedSystemsNotCompactOnes) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nt = grid.n();
+  auto fraction = [&](const std::vector<std::array<double, 3>> &at, double tau) {
+    std::vector<Shell> sh;
+    for (const auto &c : at) {
+      sh.push_back(Shell{1.3, {c[0], c[1], c[2]}, 0});
+      sh.push_back(Shell{0.35, {c[0], c[1], c[2]}, 0});
+      sh.push_back(Shell{0.6, {c[0], c[1], c[2]}, 1});
+    }
+    std::vector<intti::ShellPair<double>> plist;
+    for (std::size_t i = 0; i < sh.size(); ++i)
+      for (std::size_t j = 0; j < sh.size(); ++j)
+        plist.push_back(intti::make_pair(sh[i], sh[j]));
+    auto tab = intti::make_pair_table(plist);
+    const int npair = static_cast<int>(plist.size());
+    std::vector<std::pair<int, int>> qs;
+    for (int a = 0; a < npair; ++a)
+      for (int b = a; b < npair; ++b) qs.push_back({a, b});
+    auto batch = intti::make_batch(tab, qs);
+    intti::t_screen_batch(batch, plist, grid, tau);
+    const auto [before, after] = intti::t_screen_nodes(batch, nt);
+    return double(after) / double(before);
+  };
+  const std::vector<std::array<double, 3>> compact = {
+      {0, 0, 0},      {2.9, 0, 0},       {3.8, 2.3, 0},     {-0.7, 1.9, 0},
+      {-0.7, -1, 1.6}, {-0.7, -1, -1.6}, {3.6, -1, 1.6},    {3.6, -1, -1.6},
+      {5.6, 2.2, 0}};
+  std::vector<std::array<double, 3>> chain;
+  for (int i = 0; i < 9; ++i) chain.push_back({i * 5.5, 0, 0});
+
+  const double fc = fraction(compact, 1e-10), fe = fraction(chain, 1e-10);
+  EXPECT_GT(fc, 0.8) << "a compact molecule suddenly screens well -- verify the bound is "
+                        "still an upper bound before believing it";
+  EXPECT_LT(fe, 0.2) << "the extended case no longer screens: the estimate has regressed";
+  EXPECT_LT(fe, fc / 3) << "screening no longer discriminates by system extent";
 }

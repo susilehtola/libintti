@@ -39,6 +39,7 @@
 
 #include "batch.hpp"
 #include "contracted.hpp"
+#include "screening.hpp"
 #include "space.hpp"
 #include "device.hpp"
 #include "erigrad.hpp" // detail::md_grad_terms, comp_index
@@ -115,6 +116,9 @@ JKDeviceResult<Real> jk_build_general(const ShellBasis<Real> &basis,
       quartets.push_back({ib, ik});
     }
   auto batch = make_batch(tab, quartets);
+  // Same tolerance as the Schwarz screen above: both bound the discarded
+  // contribution to a quartet in absolute terms, so one knob rather than two.
+  if (tau > Real(0)) t_screen_batch(batch, plist, grid, tau);
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::jk::out", batch.nout_total);
   eri_quartets(tab, batch, grid, out, ws);
