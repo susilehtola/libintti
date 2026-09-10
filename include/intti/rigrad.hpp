@@ -970,52 +970,84 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
     QuartetWorkspace<Real> ws;
     Kokkos::View<Real *> qout("intti::rijh::out", batch.nout_total);
     eri_quartets(tab, batch, grid, qout, ws);
-    const auto hq = detail::to_host(qout);
-    const auto hoff = detail::to_host(batch.out_offset);
-    for (std::size_t j = 0; j < jm.size(); ++j) {
-      const int m = jm[j], n = jn[j], a = ja[j];
-      const auto &sm = orb.shells[m], &sn = orb.shells[n], &sP = aux.shells[a];
-      const int om = orb.ao_off[m], on = orb.ao_off[n], oP = aux.ao_off[a];
-      const int nm = ncart(sm.l), nn = ncart(sn.l), nP = ncart(sP.l);
-      const int cs[3] = {cshell(false, m), cshell(false, n), cshell(true, a)};
-      const int ent[2][2] = {{emp[j], emm[j]}, {enp[j], enm[j]}};
-      for (int km = 0; km < nm; ++km) {
-        int m3[3];
-        cart_comp(sm.l, km, m3[0], m3[1], m3[2]);
-        for (int kn = 0; kn < nn; ++kn) {
-          const Real dmn = Dm(om + km, on + kn);
-          if (dmn == Real(0)) continue;
-          int n3[3];
-          cart_comp(sn.l, kn, n3[0], n3[1], n3[2]);
-          for (int kP = 0; kP < nP; ++kP)
-            for (int dir = 0; dir < 3; ++dir) {
-              Real dv[3];
-              for (int slot = 0; slot < 2; ++slot) {
-                int sg[2], ci[2];
-                Real co[2];
-                const int nt =
-                    slot == 0 ? detail::md_grad_terms(sm.l, m3, sm.alpha, dir, sg, ci, co)
-                              : detail::md_grad_terms(sn.l, n3, sn.alpha, dir, sg, ci, co);
-                Real v = 0;
-                for (int t = 0; t < nt; ++t) {
-                  const int ee = ent[slot][sg[t]];
-                  if (ee < 0) continue;
-                  const int sh = (sg[t] == 0) ? 1 : -1;
-                  const int mn2 = (slot == 1) ? ncart(sn.l + sh) : nn;
-                  const int ia = (slot == 0) ? ci[t] : km;
-                  const int ib = (slot == 1) ? ci[t] : kn;
-                  v += co[t] *
-                       hq[hoff[ee] + (static_cast<std::size_t>(ia) * mn2 + ib) * nP + kP];
-                }
-                dv[slot] = -v;
-              }
-              dv[2] = -(dv[0] + dv[1]);
-              for (int pos = 0; pos < 3; ++pos)
-                if (dv[pos] != Real(0)) radd(cs[pos], dir, oP + kP, dmn * dv[pos]);
-            }
-        }
-      }
+    // digest ON DEVICE: the quartet buffer is the largest object, so it stays
+    // where it was produced. Parallel over jobs; r is dim x naux, small enough
+    // that atomics into it are cheap and no per-thread storage is needed.
+    std::vector<int> hoL(nso), hoO(nso), haL(nsa), haO(nsa);
+    std::vector<Real> hoA(nso);
+    for (int i2 = 0; i2 < nso; ++i2) {
+      hoL[i2] = orb.shells[i2].l;
+      hoO[i2] = orb.ao_off[i2];
+      hoA[i2] = orb.shells[i2].alpha;
     }
+    for (int i2 = 0; i2 < nsa; ++i2) {
+      haL[i2] = aux.shells[i2].l;
+      haO[i2] = aux.ao_off[i2];
+    }
+    auto doL = detail::to_device(hoL, "rijh::oL"), doO = detail::to_device(hoO, "rijh::oO");
+    auto doA = detail::to_device(hoA, "rijh::oA");
+    auto daL = detail::to_device(haL, "rijh::aL"), daO = detail::to_device(haO, "rijh::aO");
+    auto djm = detail::to_device(jm, "rijh::jm"), djn = detail::to_device(jn, "rijh::jn");
+    auto dja = detail::to_device(ja, "rijh::ja");
+    auto demp = detail::to_device(emp, "rijh::emp"), demm = detail::to_device(emm, "rijh::emm");
+    auto denp = detail::to_device(enp, "rijh::enp"), denm = detail::to_device(enm, "rijh::enm");
+    auto dpar = detail::to_device(parent, "rijh::parent");
+    auto dD = detail::to_device(D, static_cast<std::size_t>(nao) * nao, "rijh::D");
+    auto offv = batch.out_offset;
+    Kokkos::View<Real *> rd("rijh::r", static_cast<std::size_t>(dim) * naux);
+    const int njob = static_cast<int>(jm.size()), nsoK = nso, naoK = nao, nauxK = naux;
+    Kokkos::parallel_for(
+        "intti::rijh::rpass", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+          const int m = djm(j), n = djn(j), a = dja(j);
+          const int lm = doL(m), ln = doL(n), lp = daL(a);
+          const int nm = ncart(lm), nn = ncart(ln), nP = ncart(lp);
+          const int om = doO(m), on = doO(n), oP = daO(a);
+          const int cs[3] = {dpar(m), dpar(n), dpar(nsoK + a)};
+          const int ent[2][2] = {{demp(j), demm(j)}, {denp(j), denm(j)}};
+          for (int km = 0; km < nm; ++km) {
+            int m3[3];
+            cart_comp(lm, km, m3[0], m3[1], m3[2]);
+            for (int kn = 0; kn < nn; ++kn) {
+              const Real dmn = dD(static_cast<std::size_t>(om + km) * naoK + on + kn);
+              if (dmn == Real(0)) continue;
+              int n3[3];
+              cart_comp(ln, kn, n3[0], n3[1], n3[2]);
+              for (int kP = 0; kP < nP; ++kP)
+                for (int dir = 0; dir < 3; ++dir) {
+                  Real dv[3];
+                  for (int slot = 0; slot < 2; ++slot) {
+                    int sg[2], ci[2];
+                    Real co[2];
+                    const int nt =
+                        slot == 0
+                            ? detail::md_grad_terms(lm, m3, doA(m), dir, sg, ci, co)
+                            : detail::md_grad_terms(ln, n3, doA(n), dir, sg, ci, co);
+                    Real v = 0;
+                    for (int t = 0; t < nt; ++t) {
+                      const int ee = ent[slot][sg[t]];
+                      if (ee < 0) continue;
+                      const int sh = (sg[t] == 0) ? 1 : -1;
+                      const int mn2 = (slot == 1) ? ncart(ln + sh) : nn;
+                      const int ia = (slot == 0) ? ci[t] : km;
+                      const int ib = (slot == 1) ? ci[t] : kn;
+                      v += co[t] * qout(offv(ee) +
+                                        (static_cast<std::size_t>(ia) * mn2 + ib) * nP + kP);
+                    }
+                    dv[slot] = -v;
+                  }
+                  dv[2] = -(dv[0] + dv[1]); // ghost is exponent-free
+                  for (int pos = 0; pos < 3; ++pos)
+                    if (dv[pos] != Real(0))
+                      Kokkos::atomic_add(
+                          &rd(static_cast<std::size_t>(3 * cs[pos] + dir) * nauxK + oP + kP),
+                          dmn * dv[pos]);
+                }
+            }
+          }
+        });
+    Kokkos::fence();
+    const auto hr = detail::to_host(rd);
+    for (std::size_t i2 = 0; i2 < r.size(); ++i2) r[i2] += hr[i2];
   }
   // -(M_x gamma): 2-centre (a ghost | b ghost), free aux index = a
   for (int a = 0; a < nsa; ++a)
@@ -2164,22 +2196,11 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
   }
 
   // ---- response term, blocked over the vector index -----------------------
-  for (int i0 = 0; i0 < nvec; i0 += vec_block) {
-    const int i1 = std::min(i0 + vec_block, nvec);
-    const int ib = i1 - i0;
-    // Pa[x][Q][ii][j] : first vector index in the block
-    // Pb[y][R][ii][j] = P[y][R][j][i0+ii] : SECOND vector index in the block,
-    // stored with the block index outermost so the metric solve is one GEMM
-    const std::size_t pstride = static_cast<std::size_t>(naux) * ib * nvec;
-    std::vector<Real> Pa(static_cast<std::size_t>(dim) * pstride, Real(0));
-    std::vector<Real> Pb(static_cast<std::size_t>(dim) * pstride, Real(0));
-    auto Pidx = [&](int x, int Q, int ii, int j) {
-      return static_cast<std::size_t>(x) * pstride +
-             (static_cast<std::size_t>(Q) * ib + ii) * nvec + j;
-    };
-    // three-centre: P_x^Q[i,j] += C_R[l,i] C_L[a,j] d(l a|Q)/dx, BATCHED
-    {
-    std::vector<ShellPair<Real>> plist;
+  // The derivative quartets do NOT depend on the vector block, so they are
+  // built and evaluated ONCE, above the loop. Leaving them inside meant a
+  // caller who blocked the vector index -- the whole point of that blocking,
+  // which exists to bound memory -- paid for the integrals again per block.
+  std::vector<ShellPair<Real>> plist;
     std::vector<int> pid(static_cast<std::size_t>(nso) * 3 * nso * 3, -1);
     auto orb_pair = [&](int si, int di, int sj, int dj) {
       if (orb.shells[si].l + di < 0 || orb.shells[sj].l + dj < 0) return -1;
@@ -2225,67 +2246,125 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
     QuartetWorkspace<Real> ws;
     Kokkos::View<Real *> qout("intti::rikh::out", batch.nout_total);
     eri_quartets(tab, batch, grid, qout, ws);
-    const auto hq = detail::to_host(qout);
-    const auto hoff = detail::to_host(batch.out_offset);
-    for (std::size_t j = 0; j < jl.size(); ++j) {
-          const int l = jl[j], n = jn2[j], c = jc[j];
-          const auto &sl = orb.shells[l], &sn = orb.shells[n], &sc = aux.shells[c];
-          const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
-          const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
-          const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
-          const int ent[2][2] = {{elp[j], elm[j]}, {enp2[j], enm2[j]}};
-          for (int kl = 0; kl < nl; ++kl) {
-            int l3[3];
-            cart_comp(sl.l, kl, l3[0], l3[1], l3[2]);
-            for (int kn = 0; kn < nn; ++kn) {
-              int n3[3];
-              cart_comp(sn.l, kn, n3[0], n3[1], n3[2]);
-              for (int kQ = 0; kQ < nP; ++kQ)
-                for (int dir = 0; dir < 3; ++dir) {
-                  Real dvv[3];
-                  for (int slot = 0; slot < 2; ++slot) {
-                    int sg[2], ci[2];
-                    Real co[2];
-                    const int nt =
-                        slot == 0
-                            ? detail::md_grad_terms(sl.l, l3, sl.alpha, dir, sg, ci, co)
-                            : detail::md_grad_terms(sn.l, n3, sn.alpha, dir, sg, ci, co);
-                    Real v = 0;
-                    for (int t = 0; t < nt; ++t) {
-                      const int ee = ent[slot][sg[t]];
-                      if (ee < 0) continue;
-                      const int sh = (sg[t] == 0) ? 1 : -1;
-                      const int mn2 = (slot == 1) ? ncart(sn.l + sh) : nn;
-                      const int ia = (slot == 0) ? ci[t] : kl;
-                      const int ib = (slot == 1) ? ci[t] : kn;
-                      v += co[t] * hq[hoff[ee] +
-                                      (static_cast<std::size_t>(ia) * mn2 + ib) * nP + kQ];
+  std::vector<int> hoL(nso), hoO(nso), haL(nsa), haO(nsa);
+  std::vector<Real> hoA(nso);
+  for (int i2 = 0; i2 < nso; ++i2) {
+    hoL[i2] = orb.shells[i2].l;
+    hoO[i2] = orb.ao_off[i2];
+    hoA[i2] = orb.shells[i2].alpha;
+  }
+  for (int i2 = 0; i2 < nsa; ++i2) {
+    haL[i2] = aux.shells[i2].l;
+    haO[i2] = aux.ao_off[i2];
+  }
+  auto doL = detail::to_device(hoL, "rikh::oL"), doO = detail::to_device(hoO, "rikh::oO");
+  auto doA = detail::to_device(hoA, "rikh::oA");
+  auto daL = detail::to_device(haL, "rikh::aL"), daO = detail::to_device(haO, "rikh::aO");
+  auto djl = detail::to_device(jl, "rikh::jl"), djn2 = detail::to_device(jn2, "rikh::jn");
+  auto djc = detail::to_device(jc, "rikh::jc");
+  auto delp = detail::to_device(elp, "rikh::elp"), delm = detail::to_device(elm, "rikh::elm");
+  auto denp2 = detail::to_device(enp2, "rikh::enp"), denm2 = detail::to_device(enm2, "rikh::enm");
+  auto dpar = detail::to_device(parent, "rikh::parent");
+  auto dCL = detail::to_device(CL, static_cast<std::size_t>(orb.nao) * nvec, "rikh::cl");
+  auto dCR = detail::to_device(CR, static_cast<std::size_t>(orb.nao) * nvec, "rikh::cr");
+  auto offv = batch.out_offset;
+
+  for (int i0 = 0; i0 < nvec; i0 += vec_block) {
+    const int i1 = std::min(i0 + vec_block, nvec);
+    const int ib = i1 - i0;
+    // Pa[x][Q][ii][j] : first vector index in the block
+    // Pb[y][R][ii][j] = P[y][R][j][i0+ii] : SECOND vector index in the block,
+    // stored with the block index outermost so the metric solve is one GEMM
+    const std::size_t pstride = static_cast<std::size_t>(naux) * ib * nvec;
+    std::vector<Real> Pa(static_cast<std::size_t>(dim) * pstride, Real(0));
+    std::vector<Real> Pb(static_cast<std::size_t>(dim) * pstride, Real(0));
+    auto Pidx = [&](int x, int Q, int ii, int j) {
+      return static_cast<std::size_t>(x) * pstride +
+             (static_cast<std::size_t>(Q) * ib + ii) * nvec + j;
+    };
+    // three-centre: P_x^Q[i,j] += C_R[l,i] C_L[a,j] d(l a|Q)/dx, digested ON
+    // DEVICE from the quartet buffer built above -- the buffer is the largest
+    // object here and does not travel. Pa/Pb are dim x naux x ib x nvec, far
+    // smaller, and come back for the host metric solve below.
+    {
+      Kokkos::View<Real *> Pad("rikh::Pa", static_cast<std::size_t>(dim) * pstride);
+      Kokkos::View<Real *> Pbd("rikh::Pb", static_cast<std::size_t>(dim) * pstride);
+      const int njob = static_cast<int>(jl.size()), nsoK = nso;
+      const int nvecK = nvec, ibK = ib, i0K = i0, nauxK = naux;
+      const std::size_t pstr = pstride;
+      Kokkos::parallel_for(
+          "intti::rikh::pxpass", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
+            const int l = djl(j), n = djn2(j), c = djc(j);
+            const int ll = doL(l), ln = doL(n), lp = daL(c);
+            const int nl = ncart(ll), nn = ncart(ln), nP = ncart(lp);
+            const int ol = doO(l), on = doO(n), oc = daO(c);
+            const int cs[3] = {dpar(l), dpar(n), dpar(nsoK + c)};
+            const int ent[2][2] = {{delp(j), delm(j)}, {denp2(j), denm2(j)}};
+            for (int kl = 0; kl < nl; ++kl) {
+              int l3[3];
+              cart_comp(ll, kl, l3[0], l3[1], l3[2]);
+              for (int kn = 0; kn < nn; ++kn) {
+                int n3[3];
+                cart_comp(ln, kn, n3[0], n3[1], n3[2]);
+                for (int kQ = 0; kQ < nP; ++kQ)
+                  for (int dir = 0; dir < 3; ++dir) {
+                    Real dvv[3];
+                    for (int slot = 0; slot < 2; ++slot) {
+                      int sg[2], ci[2];
+                      Real co[2];
+                      const int nt =
+                          slot == 0
+                              ? detail::md_grad_terms(ll, l3, doA(l), dir, sg, ci, co)
+                              : detail::md_grad_terms(ln, n3, doA(n), dir, sg, ci, co);
+                      Real v = 0;
+                      for (int t = 0; t < nt; ++t) {
+                        const int ee = ent[slot][sg[t]];
+                        if (ee < 0) continue;
+                        const int sh = (sg[t] == 0) ? 1 : -1;
+                        const int mn2 = (slot == 1) ? ncart(ln + sh) : nn;
+                        const int ia = (slot == 0) ? ci[t] : kl;
+                        const int ib2 = (slot == 1) ? ci[t] : kn;
+                        v += co[t] *
+                             qout(offv(ee) +
+                                  (static_cast<std::size_t>(ia) * mn2 + ib2) * nP + kQ);
+                      }
+                      dvv[slot] = -v;
                     }
-                    dvv[slot] = -v;
-                  }
-                  dvv[2] = -(dvv[0] + dvv[1]);
-                  for (int pos = 0; pos < 3; ++pos) {
-                    const Real dv = dvv[pos];
-                    if (dv == Real(0)) continue;
-                    const int xi = 3 * cs[pos] + dir;
-                    const int lam = ol + kl, aa = on + kn, QQ = oc + kQ;
-                    for (int ii = 0; ii < ib; ++ii) {
-                      const Real cri = CR[static_cast<std::size_t>(lam) * nvec + i0 + ii];
-                      const Real clj = CL[static_cast<std::size_t>(aa) * nvec + i0 + ii];
-                      for (int jj = 0; jj < nvec; ++jj) {
-                        // Pa: block index is i (from C_R), free index j (from C_L)
-                        Pa[Pidx(xi, QQ, ii, jj)] +=
-                            dv * cri * CL[static_cast<std::size_t>(aa) * nvec + jj];
-                        // Pb: block index is j (from C_L), free index i (from C_R)
-                        Pb[Pidx(xi, QQ, ii, jj)] +=
-                            dv * clj * CR[static_cast<std::size_t>(lam) * nvec + jj];
+                    dvv[2] = -(dvv[0] + dvv[1]); // ghost is exponent-free
+                    for (int pos = 0; pos < 3; ++pos) {
+                      const Real dv = dvv[pos];
+                      if (dv == Real(0)) continue;
+                      const int xi = 3 * cs[pos] + dir;
+                      const int lam = ol + kl, aa = on + kn, QQ = oc + kQ;
+                      for (int ii = 0; ii < ibK; ++ii) {
+                        const Real cri =
+                            dCR(static_cast<std::size_t>(lam) * nvecK + i0K + ii);
+                        const Real clj =
+                            dCL(static_cast<std::size_t>(aa) * nvecK + i0K + ii);
+                        for (int jj = 0; jj < nvecK; ++jj) {
+                          const std::size_t o =
+                              static_cast<std::size_t>(xi) * pstr +
+                              (static_cast<std::size_t>(QQ) * ibK + ii) * nvecK + jj;
+                          Kokkos::atomic_add(
+                              &Pad(o),
+                              dv * cri * dCL(static_cast<std::size_t>(aa) * nvecK + jj));
+                          Kokkos::atomic_add(
+                              &Pbd(o),
+                              dv * clj * dCR(static_cast<std::size_t>(lam) * nvecK + jj));
+                        }
                       }
                     }
                   }
-                }
+              }
             }
-          }
-    }
+            (void)nauxK;
+          });
+      Kokkos::fence();
+      const auto hPa = detail::to_host(Pad), hPb = detail::to_host(Pbd);
+      for (std::size_t z = 0; z < Pa.size(); ++z) {
+        Pa[z] += hPa[z];
+        Pb[z] += hPb[z];
+      }
     }
     // two-centre: P_x^Q[i,j] -= dM_QR/dx V^R[i,j]
     for (int c = 0; c < nsa; ++c)
@@ -2594,87 +2673,120 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> qout("intti::rikd::out", batch.nout_total);
   eri_quartets(tab, batch, grid, qout, ws);
-  const auto hq = detail::to_host(qout);
-  const auto hoff = detail::to_host(batch.out_offset);
 
-  for (int j = 0; j < njob; ++j) {
-      const int l = jl[j], n = jn[j], c = jc[j];
-      {
-        const auto &sl = orb.shells[l], &sn = orb.shells[n], &sc = aux.shells[c];
-        const int on = orb.ao_off[n], oc = aux.ao_off[c];
-        const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
-        const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
-        const int ent[2][2] = {{elp[j], elm[j]}, {enp[j], enm[j]}};
-        // The two contractions y1 and y3 below depend only on (B, P) -- NOT on
-        // kl, pos or dir. Leaving them inside those loops recomputed each one
-        // 9 * nl times, and they are the whole cost of this kernel: with the
-        // same number of derivative blocks as ri_j_deriv_kernel, this one
-        // measured 68 s against 1 s, so the integrals are ~1.5% and the digest
-        // is the rest. Hoisting them turns the innermost work from a
-        // length-nvec dot per output element into a plain axpy.
-        //
-        // The nine derivative blocks are therefore evaluated up front, and the
-        // loop order becomes (kn, kQ) outside (pos, dir, kl).
-        std::vector<Real> y1(nao_out), y3(nao_out);
-        for (int kn = 0; kn < nn; ++kn)
+  // ---- digest, ON DEVICE -------------------------------------------------
+  // The quartet buffer is the largest object in this kernel, so it must not
+  // travel: the digest goes to it, not the other way round. Pulling it back to
+  // host was a regression -- invisible on an OpenMP backend, where the copy is
+  // nearly free, and the dominant cost on a real GPU.
+  //
+  // The parallel axis is (job, OUTPUT index n2), not the job alone, and that is
+  // what makes it scratch-free. y1 and y3 contract over the vector index and
+  // their only free index is the output one, so for a fixed n2 each is a SCALAR
+  // rather than a length-nao_out vector -- computed once per (job, kn, kQ) and
+  // reused across dir, kl, pos and the contraction fan-out. That is the same
+  // reuse hoisting bought on the host, without any per-thread storage.
+  auto dCL = detail::to_device(CL, static_cast<std::size_t>(orb.nao) * nvec, "rikd::cl");
+  auto dCR = detail::to_device(CR, static_cast<std::size_t>(orb.nao) * nvec, "rikd::cr");
+  auto dXh = detail::to_device(Xh, "rikd::xh"), dYh = detail::to_device(Yh, "rikd::yh");
+  auto djl = detail::to_device(jl, "rikd::jl"), djn = detail::to_device(jn, "rikd::jn");
+  auto djc = detail::to_device(jc, "rikd::jc");
+  auto delp = detail::to_device(elp, "rikd::elp"), delm = detail::to_device(elm, "rikd::elm");
+  auto denp = detail::to_device(enp, "rikd::enp"), denm = detail::to_device(enm, "rikd::enm");
+  auto dgrp = detail::to_device(grp, "rikd::grp");
+  auto dfnc = detail::to_device(fan.nctr, "rikd::nctr");
+  auto dfco = detail::to_device(fan.coff, "rikd::coff");
+  auto dfbs = detail::to_device(fan.base, "rikd::base");
+  auto dfw = detail::to_device(fan.w, "rikd::w");
+  std::vector<int> hoL(nso), hoO(nso), haL(nsa), haO(nsa);
+  std::vector<Real> hoA(nso);
+  for (int i2 = 0; i2 < nso; ++i2) {
+    hoL[i2] = orb.shells[i2].l;
+    hoO[i2] = orb.ao_off[i2];
+    hoA[i2] = orb.shells[i2].alpha;
+  }
+  for (int i2 = 0; i2 < nsa; ++i2) {
+    haL[i2] = aux.shells[i2].l;
+    haO[i2] = aux.ao_off[i2];
+  }
+  auto doL = detail::to_device(hoL, "rikd::oL"), doO = detail::to_device(hoO, "rikd::oO");
+  auto doA = detail::to_device(hoA, "rikd::oA");
+  auto daL = detail::to_device(haL, "rikd::aL"), daO = detail::to_device(haO, "rikd::aO");
+  auto offv = batch.out_offset;
+  Kokkos::View<Real *> Kd("rikd::K", static_cast<std::size_t>(npert) * N);
+  const int nsoK = nso, nvecK = nvec, naoK = nao_out;
+  const std::size_t slabK = slab, NK = N;
+  Kokkos::parallel_for(
+      "intti::rikd::digest",
+      Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {njob, nao_out}),
+      KOKKOS_LAMBDA(int j, int n2) {
+        const int l = djl(j), n = djn(j), c = djc(j);
+        const int ll = doL(l), ln = doL(n), lp = daL(c);
+        const int nl = ncart(ll), nn = ncart(ln), nP = ncart(lp);
+        const int on = doO(n), oc = daO(c);
+        const int cs[3] = {dgrp(l), dgrp(n), dgrp(nsoK + c)};
+        const int ent[2][2] = {{delp(j), delm(j)}, {denp(j), denm(j)}};
+        for (int kn = 0; kn < nn; ++kn) {
+          int n3[3];
+          cart_comp(ln, kn, n3[0], n3[1], n3[2]);
           for (int kQ = 0; kQ < nP; ++kQ) {
             const int B = on + kn, P = oc + kQ;
-            // y1[n2] = sum_i CL[B,i] Yhat[P][n2,i];  y3[m2] = sum_i Xhat[P][m2,i] CR[B,i]
-            detail::gemm('N', 'N', nao_out, 1, nvec, Real(1),
-                         Yh.data() + static_cast<std::size_t>(P) * slab, nvec,
-                         CL + static_cast<std::size_t>(B) * nvec, 1, Real(0), y1.data(), 1);
-            detail::gemm('N', 'N', nao_out, 1, nvec, Real(1),
-                         Xh.data() + static_cast<std::size_t>(P) * slab, nvec,
-                         CR + static_cast<std::size_t>(B) * nvec, 1, Real(0), y3.data(), 1);
-            int n3[3];
-            cart_comp(sn.l, kn, n3[0], n3[1], n3[2]);
+            Real y1 = 0, y3 = 0; // scalars: n2 is this thread's own index
+            for (int i3 = 0; i3 < nvecK; ++i3) {
+              y1 += dCL(static_cast<std::size_t>(B) * nvecK + i3) *
+                    dYh(static_cast<std::size_t>(P) * slabK + n2 * nvecK + i3);
+              y3 += dXh(static_cast<std::size_t>(P) * slabK + n2 * nvecK + i3) *
+                    dCR(static_cast<std::size_t>(B) * nvecK + i3);
+            }
+            if (y1 == Real(0) && y3 == Real(0)) continue;
             for (int dir = 0; dir < 3; ++dir)
               for (int kl = 0; kl < nl; ++kl) {
                 int l3[3];
-                cart_comp(sl.l, kl, l3[0], l3[1], l3[2]);
+                cart_comp(ll, kl, l3[0], l3[1], l3[2]);
                 Real dv[3];
                 for (int slot = 0; slot < 2; ++slot) {
                   int sg[2], ci[2];
                   Real co[2];
-                  const int nt =
-                      slot == 0
-                          ? detail::md_grad_terms(sl.l, l3, sl.alpha, dir, sg, ci, co)
-                          : detail::md_grad_terms(sn.l, n3, sn.alpha, dir, sg, ci, co);
+                  const int nt = slot == 0
+                                     ? detail::md_grad_terms(ll, l3, doA(l), dir, sg, ci, co)
+                                     : detail::md_grad_terms(ln, n3, doA(n), dir, sg, ci, co);
                   Real v = 0;
                   for (int t = 0; t < nt; ++t) {
                     const int ee = ent[slot][sg[t]];
                     if (ee < 0) continue;
                     const int sh = (sg[t] == 0) ? 1 : -1;
-                    const int mn2 = (slot == 1) ? ncart(sn.l + sh) : nn;
+                    const int mn2 = (slot == 1) ? ncart(ln + sh) : nn;
                     const int ia = (slot == 0) ? ci[t] : kl;
                     const int ib = (slot == 1) ? ci[t] : kn;
-                    v += co[t] *
-                         hq[hoff[ee] + (static_cast<std::size_t>(ia) * mn2 + ib) * nP + kQ];
+                    v += co[t] * qout(offv(ee) +
+                                      (static_cast<std::size_t>(ia) * mn2 + ib) * nP + kQ);
                   }
                   dv[slot] = -v; // md_grad_terms is d/dx; the centre derivative is -it
                 }
                 dv[2] = -(dv[0] + dv[1]); // ghost is exponent-free
                 for (int pos = 0; pos < 3; ++pos) {
                   if (dv[pos] == Real(0)) continue;
-                  const int xi = 3 * grp[cs[pos]] + dir; // folded onto the group
-                  Real *Kx = res.K[0].data() + static_cast<std::size_t>(xi) * N;
+                  const std::size_t xo = static_cast<std::size_t>(3 * cs[pos] + dir) * NK;
                   // the orbital index out of the derivative block is PRIMITIVE
-                  // and fans out onto the contracted AOs it feeds; n2 / m2 are
-                  // outputs and are already contracted. Trip count 1 for a
-                  // primitive basis.
-                  for (int cM = 0; cM < fan.nctr[l]; ++cM) {
-                    const Real w = fan.w[fan.coff[l] + cM] * dv[pos];
-                    const int I = fan.base[l] + cM * nl + kl;
-                    Real *row = Kx + static_cast<std::size_t>(I) * nao_out;
-                    for (int n2 = 0; n2 < nao_out; ++n2) row[n2] += w * y1[n2];
-                    Real *col = Kx + I;
-                    for (int m2 = 0; m2 < nao_out; ++m2)
-                      col[static_cast<std::size_t>(m2) * nao_out] += w * y3[m2];
+                  // and fans out onto the contracted AOs it feeds; n2 is an
+                  // output and is already contracted.
+                  for (int cM = 0; cM < dfnc(l); ++cM) {
+                    const Real w = dfw(dfco(l) + cM) * dv[pos];
+                    const int I = dfbs(l) + cM * nl + kl;
+                    Kokkos::atomic_add(&Kd(xo + static_cast<std::size_t>(I) * naoK + n2),
+                                       w * y1);
+                    Kokkos::atomic_add(&Kd(xo + static_cast<std::size_t>(n2) * naoK + I),
+                                       w * y3);
                   }
                 }
               }
           }
-      }
+        }
+      });
+  Kokkos::fence();
+  {
+    const auto hK = detail::to_host(Kd);
+    for (std::size_t i2 = 0; i2 < hK.size(); ++i2) res.K[0][i2] += hK[i2];
   }
   }
   // term 2, one perturbation at a time
