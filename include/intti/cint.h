@@ -146,6 +146,13 @@ int intti_coulomb_3c(double *out, const int *atm, int natm, const int *bas, int 
 int intti_real_to_complex(double *re, double *im, const double *M, const int *bas,
                           int nbas, int libcint_order);
 
+/* Rewrite an nao x nao AO matrix from intti's convention into another code's.
+ * to: 0 = intti, 1 = libcint/PySCF. spherical: nonzero for spherical shells.
+ * Ordering and PHASE only -- normalisation can depend on the primitive exponent,
+ * so it is not a per-l property and is handled at basis-set conversion. */
+int intti_convert_convention(double *out, const double *M, int to, int spherical,
+                             const int *bas, int nbas);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);

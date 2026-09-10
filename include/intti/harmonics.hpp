@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "c2s.hpp"
+#include "convention.hpp"
 #include "gto.hpp"
 
 namespace intti {
@@ -75,16 +76,21 @@ std::vector<std::complex<Real>> r2c_matrix(int l, RealOrder order = RealOrder::S
     U[static_cast<std::size_t>(-m + l) * nm + (m + l)] = C(inv, 0);
     U[static_cast<std::size_t>(-m + l) * nm + (-m + l)] = C(0, -inv);
   }
-  if (order == RealOrder::Libcint && l == 1) {
-    // libcint slot (0,1,2) = (x,y,z) = m (+1,-1,0); ours is (m=-1,0,+1).
-    // Permute the COLUMNS, which are the real-basis index.
-    const int col[3] = {2, 0, 1};
-    std::vector<C> P(U.size(), C(0));
-    for (int a = 0; a < nm; ++a)
-      for (int slot = 0; slot < nm; ++slot)
-        P[static_cast<std::size_t>(a) * nm + slot] =
-            U[static_cast<std::size_t>(a) * nm + col[slot]];
-    U.swap(P);
+  if (order == RealOrder::Libcint) {
+    // The real-basis index is the COLUMN, so the foreign ordering enters as a
+    // column permutation and phase. Taken from the shared convention table
+    // (convention.hpp) rather than restated here, so there is one place where a
+    // convention is defined and one place to validate.
+    const auto r = sph_reindex(AoConvention::Libcint, l);
+    if (!r.identity()) {
+      std::vector<C> P(U.size(), C(0));
+      for (int a = 0; a < nm; ++a)
+        for (int slot = 0; slot < nm; ++slot)
+          P[static_cast<std::size_t>(a) * nm + slot] =
+              static_cast<Real>(r.scale[slot]) *
+              U[static_cast<std::size_t>(a) * nm + r.perm[slot]];
+      U.swap(P);
+    }
   }
   return U;
 }

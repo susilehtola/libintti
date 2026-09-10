@@ -181,3 +181,45 @@ TEST(Harmonics, LibcintOrderDiffersOnlyAtP) {
     EXPECT_LT(worst, 1e-14) << "libcint-ordered r2c not unitary at l = " << l;
   }
 }
+
+// The convention layer: converting intti -> foreign -> intti must be the
+// identity, and must not be the identity in one step, or the table is inert.
+// The table's CORRECTNESS is established physically by the L_z test above --
+// this checks that applying it to a whole matrix is consistent, which is a
+// different failure mode (index bookkeeping rather than convention).
+TEST(Harmonics, ConventionRoundTrip) {
+  std::vector<int> ls;
+  auto basis = one_centre(ls);
+  int nsph = 0;
+  std::vector<int> soff;
+  const double origin[3] = {0.0, 0.0, 0.0};
+  auto L = intti::angular_momentum(basis, origin);
+  auto M = cart_to_sph(basis, L[2], nsph, soff);
+
+  std::vector<int> nfunc;
+  for (int l : ls) nfunc.push_back(2 * l + 1);
+  auto fwd = [&](int s) { return intti::sph_reindex(intti::AoConvention::Libcint, ls[s]); };
+  auto lc = intti::convert_matrix(soff, nfunc, nsph, M.data(), fwd);
+
+  // the inverse map: intti_i = scale[i] * foreign[perm^{-1}[i]]
+  auto inv = [&](int s) {
+    const auto r = intti::sph_reindex(intti::AoConvention::Libcint, ls[s]);
+    intti::ShellReindex q = intti::identity_reindex(static_cast<int>(r.perm.size()));
+    for (std::size_t i = 0; i < r.perm.size(); ++i) {
+      q.perm[r.perm[i]] = static_cast<int>(i);
+      q.scale[r.perm[i]] = r.scale[i];
+    }
+    return q;
+  };
+  auto back = intti::convert_matrix(soff, nfunc, nsph, lc.data(), inv);
+
+  double rt = 0, fwdiff = 0, scale = 0;
+  for (std::size_t i = 0; i < M.size(); ++i) {
+    rt = std::max(rt, std::abs(back[i] - M[i]));
+    fwdiff = std::max(fwdiff, std::abs(lc[i] - M[i]));
+    scale = std::max(scale, std::abs(M[i]));
+  }
+  EXPECT_GT(scale, 0.5) << "matrix trivially zero";
+  EXPECT_LT(rt, 1e-14 * scale) << "convention round trip is not the identity";
+  EXPECT_GT(fwdiff, 0.5) << "conversion changed nothing: the table is inert";
+}

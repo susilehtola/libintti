@@ -44,6 +44,7 @@
 #include "intti/jk.hpp"
 #include "intti/erihess.hpp"
 #include "intti/geohess.hpp"
+#include "intti/convention.hpp"
 #include "intti/harmonics.hpp"
 #include "intti/kernel.hpp"
 #include "intti/contracted.hpp"
@@ -769,6 +770,36 @@ extern "C" int intti_real_to_complex(double *re, double *im, const double *M,
     re[i] = C[i].real();
     im[i] = C[i].imag();
   }
+  return 0;
+}
+
+
+// Rewrite an nao x nao AO matrix from intti's convention into another code's.
+// `to`: 0 = intti (identity), 1 = libcint/PySCF. `spherical`: nonzero for
+// spherical shells (2l+1 functions), zero for Cartesian.
+//
+// Ordering and phase only. Normalisation is deliberately NOT here: it can depend
+// on the primitive exponent, so it is not a per-l property and is handled where
+// the basis set is converted. See convention.hpp.
+extern "C" int intti_convert_convention(double *out, const double *M, int to,
+                                        int spherical, const int *bas, int nbas) {
+  if (!out || !M || !bas) return -7;
+  const auto conv = (to == 1) ? intti::AoConvention::Libcint : intti::AoConvention::Intti;
+  std::vector<int> ls(nbas), off(nbas), nf(nbas);
+  int nao = 0;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const int l = bas[static_cast<std::size_t>(ish) * 8 + ANG_OF];
+    if (bas[static_cast<std::size_t>(ish) * 8 + NCTR_OF] != 1) return -1;
+    ls[ish] = l;
+    nf[ish] = spherical ? 2 * l + 1 : intti::ncart(l);
+    off[ish] = nao;
+    nao += nf[ish];
+  }
+  const auto C = intti::convert_matrix(
+      off, nf, nao, M, [&](int s) {
+        return spherical ? intti::sph_reindex(conv, ls[s]) : intti::cart_reindex(conv, ls[s]);
+      });
+  for (std::size_t i = 0; i < C.size(); ++i) out[i] = C[i];
   return 0;
 }
 
