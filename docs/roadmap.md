@@ -1937,3 +1937,31 @@ elevated-l block variant returning all (e,f) components), minor caching
   initial guesses where the density lives in a different basis than the target
   (heterogeneous pairs) -- validated by reducing exactly to coulomb_build /
   exchange_build when both bases coincide.
+
+- **SIMULTANEOUS CPU + GPU EXECUTION -- CANDIDATE, NOT SCHEDULED.** Kokkos can
+  enable CUDA and OpenMP in one build: `DefaultExecutionSpace` is CUDA,
+  `DefaultHostExecutionSpace` is OpenMP, one `KOKKOS_LAMBDA` is compiled for
+  both, and a policy names which space runs it. Genuine overlap works too,
+  because CUDA dispatch is asynchronous while OpenMP blocks -- launch the GPU
+  range, run the CPU range, fence.
+
+  The architecture already suits it. The batched-quartet consumer is a flat list
+  of independent jobs, so splitting `[0, f*N)` to the GPU and the rest to the CPU
+  is natural; grid-RI is the same with grid points. What it needs: a tuned or
+  measured split fraction (a bad `f` is worse than not splitting), per-space
+  output buffers summed at the end (atomics do not span memory spaces -- the
+  device-digest structure already has this shape), and read-only inputs either
+  duplicated per space or in SharedSpace/UVM, duplication usually winning.
+
+  Worth tempering: against a strong GPU the CPU share is typically ~5-20% while
+  doubling what must be validated. The case is much better on the GRID paths --
+  local hybrids have huge grids and a real bandwidth component, so a CPU share
+  buys more there than in the quartet engine. Prerequisite either way is the
+  space-flexible API (space.hpp), since the split needs per-space buffers at the
+  boundary.
+
+  NOT VALIDATABLE HERE: this box has no GPU, and the current build has no Kokkos
+  backend enabled at all -- every timing in the RI performance work was the
+  serial/OpenMP fallback. Anything written for dual-space execution stays
+  unverified until it runs on real hardware, the same gate that has been sitting
+  on GPU validation from the start.
