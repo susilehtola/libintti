@@ -44,6 +44,7 @@
 #include "intti/jk.hpp"
 #include "intti/erihess.hpp"
 #include "intti/geohess.hpp"
+#include "intti/harmonics.hpp"
 #include "intti/kernel.hpp"
 #include "intti/contracted.hpp"
 #include "intti/deriv.hpp"
@@ -734,6 +735,40 @@ extern "C" int intti_coulomb_3c(double *out, const int *atm, int natm, const int
         const std::size_t o = (static_cast<std::size_t>(i) * nao + j) * naux + P;
         out[o] = T[o] * oscale[i] * oscale[j] * ascale[P];
       }
+  return 0;
+}
+
+
+// Real -> complex spherical harmonics (Condon-Shortley), as a boundary
+// transform on a whole AO matrix. `M` is nao x nao in the REAL spherical basis
+// with shells ordered m = -l..+l; the result is written as separate real and
+// imaginary parts, since the C ABI here is double-only.
+//
+// This is not a second integral path: within a shell the two conventions differ
+// by a fixed unitary depending only on l, so the engine stays real Cartesian and
+// only the basis the caller sees changes. Its use is where m has to be a good
+// quantum number -- magnetic properties, spin-orbit -- because L_z is diagonal
+// in the complex basis and is not in the real one.
+extern "C" int intti_real_to_complex(double *re, double *im, const double *M,
+                                     const int *bas, int nbas, int libcint_order) {
+  if (!re || !im || !M || !bas) return -7;
+  std::vector<int> ls(nbas), off(nbas);
+  int nao = 0;
+  for (int ish = 0; ish < nbas; ++ish) {
+    const int l = bas[static_cast<std::size_t>(ish) * 8 + ANG_OF];
+    const int nctr = bas[static_cast<std::size_t>(ish) * 8 + NCTR_OF];
+    if (nctr != 1) return -1; // one l block per shell entry here
+    ls[ish] = l;
+    off[ish] = nao;
+    nao += 2 * l + 1;
+  }
+  const auto C = intti::real_to_complex(
+      ls, off, nao, M,
+      libcint_order ? intti::RealOrder::Libcint : intti::RealOrder::Standard);
+  for (std::size_t i = 0; i < C.size(); ++i) {
+    re[i] = C[i].real();
+    im[i] = C[i].imag();
+  }
   return 0;
 }
 

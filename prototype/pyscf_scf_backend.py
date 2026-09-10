@@ -78,6 +78,9 @@ def load(lib_path):
     hs.restype = ctypes.c_int
     hs.argtypes = [d, d, d, i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
     v = ctypes.c_void_p
+    r2c = lib.intti_real_to_complex
+    r2c.restype = ctypes.c_int
+    r2c.argtypes = [d, d, d, i, ctypes.c_int, ctypes.c_int]
     c2c = lib.intti_coulomb_2c
     c2c.restype = ctypes.c_int
     c2c.argtypes = [d, i, ctypes.c_int, i, ctypes.c_int, d]
@@ -102,7 +105,7 @@ def load(lib_path):
     rih.restype = ctypes.c_int
     rih.argtypes = [d, d, d, d, ctypes.c_int, i, ctypes.c_int, i, ctypes.c_int, d,
                     i, ctypes.c_int, i, ctypes.c_int, d, ctypes.c_double]
-    return f, g, hs, ip1, e1, rih, rid, (rop, rjk, rcl), (c2c, c3c)
+    return f, g, hs, ip1, e1, rih, rid, (rop, rjk, rcl), (c2c, c3c), r2c
 
 
 def make_1e(fn, mol):
@@ -685,12 +688,65 @@ def df_hessian_contracted(fn_rih, atoms, cases):
     return ok
 
 
+
+def complex_harmonics_check(fn_r2c):
+    """Complex spherical harmonics, Condon-Shortley, on PySCF's own integrals.
+
+    The phase convention is the one thing here that cannot be asserted into
+    correctness: a wrong relative sign inside a (+m, -m) pair leaves the
+    transform perfectly unitary. The oracle is physical instead. In the complex
+    basis L_z is diagonal with eigenvalue m, so with the AOs unnormalised the
+    exact statement is L_z = i m S -- and PySCF supplies BOTH matrices
+    (int1e_cg_irxp is <mu|r x nabla|nu>, and r x nabla is i L), by routes that
+    know nothing about this transform.
+
+    libcint_order is checked in BOTH positions on purpose: with it off the check
+    must FAIL, or the flag would be decorative rather than load-bearing.
+    """
+    dptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    iptr = lambda a: a.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+    mol = gto.M(atom=[["He", (0.0, 0.0, 0.0)]],
+                basis={"He": [[l, [0.8 + 0.1 * l, 1.0]] for l in range(5)]},
+                unit="Bohr", cart=False, verbose=0)
+    nao = mol.nao_nr()
+    bas = np.asarray(mol._bas, dtype=np.int32, order="C")
+    S = np.ascontiguousarray(mol.intor("int1e_ovlp"))
+    with mol.with_common_orig((0.0, 0.0, 0.0)):
+        Lz = np.ascontiguousarray(mol.intor("int1e_cg_irxp", comp=3)[2])
+    ms = np.concatenate([np.arange(-int(bas[k, 1]), int(bas[k, 1]) + 1)
+                         for k in range(mol.nbas)])
+
+    def to_complex(M, libcint_order):
+        re = np.zeros((nao, nao))
+        im = np.zeros((nao, nao))
+        rc = fn_r2c(dptr(re), dptr(im), dptr(np.ascontiguousarray(M)), iptr(bas),
+                    mol.nbas, int(libcint_order))
+        assert rc == 0, f"intti_real_to_complex rc={rc}"
+        return re + 1j * im
+
+    ok = True
+    for lc in (1, 0):
+        Lzc, Sc = to_complex(Lz, lc), to_complex(S, lc)
+        off = np.abs(Lzc - np.diag(np.diag(Lzc))).max()
+        dia = np.abs(np.diag(Lzc) - 1j * ms * np.diag(Sc)).max()
+        print(f"    libcint_order={lc}  L_z off-diag {off:.2e}   |L_z - i m S| {dia:.2e}")
+        if lc:
+            ok = ok and off < 1e-12 and dia < 1e-12
+        else:
+            # the wrong convention MUST be caught, not silently accepted
+            ok = ok and max(off, dia) > 1e-3
+    realoff = np.abs(Lz - np.diag(np.diag(Lz))).max()
+    print(f"    |m|max={int(np.abs(ms).max())}  L_z off-diag in the REAL basis "
+          f"{realoff:.2e} (must be large, or the test is vacuous)")
+    return ok and realoff > 0.5
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         return 1
     (fn, fn_ip1, fn_hess, fn_h1, fn_1e, fn_rih, fn_rid, fn_ri,
-     fn_nc) = load(sys.argv[1])
+     fn_nc, fn_r2c) = load(sys.argv[1])
     basis = {"O": uncontracted((0, O_S), (1, O_P)), "H": uncontracted((0, H_S))}
     mol = gto.M(atom=ATOM, basis=basis, unit="Bohr", cart=True, verbose=0)
 
@@ -926,6 +982,8 @@ def main():
         [("sto-3g", "cc-pvdz-jkfit"), ("6-31g", "cc-pvdz-jkfit"),
          ("cc-pvdz", "cc-pvdz-jkfit")],
         "contracted RI") and ok
+    print("complex spherical harmonics (Condon-Shortley), L_z = i m S:")
+    ok = complex_harmonics_check(fn_r2c) and ok
     print("mol.intor calls served by intti:", dict(sorted(served.items())))
     # a patch that never fired would look identical to success
     assert served.get("int1e_ipovlp", 0) > 0, "mol.intor interception never fired"

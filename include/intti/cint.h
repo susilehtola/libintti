@@ -137,6 +137,15 @@ int intti_coulomb_3c(double *out, const int *atm, int natm, const int *bas, int 
                      const double *env, const int *aatm, int anatm, const int *abas,
                      int anbas, const double *aenv);
 
+/* Real -> complex spherical harmonics (Condon-Shortley) on a whole nao x nao
+ * AO matrix, real and imaginary parts returned separately. Input is in the REAL
+ * spherical basis, one l block per bas entry (nctr == 1). Set libcint_order for
+ * input in libcint/PySCF's convention, which keeps p as (x,y,z); 0 for the
+ * standard m = -l..+l ordering c2s_matrix produces. A boundary transform, not a
+ * second integral path. */
+int intti_real_to_complex(double *re, double *im, const double *M, const int *bas,
+                          int nbas, int libcint_order);
+
 int intti_int2e_sph(double *out, const int *shls, const int *atm, int natm,
                      const int *bas, int nbas, const double *env, void *opt,
                      double *cache);

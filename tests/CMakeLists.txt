@@ -28,6 +28,7 @@ add_executable(intti_tests
   test_giao.cpp
   test_oneel.cpp
   test_contracted.cpp
+  test_harmonics.cpp
   test_nuclear.cpp
   test_ncenter.cpp
   test_localhybrid.cpp
