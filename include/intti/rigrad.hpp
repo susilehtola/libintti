@@ -253,9 +253,77 @@ PrimitiveShell<Real> ghost_shell(const PrimitiveShell<Real> &s) {
   return {Real(0), {s.center[0], s.center[1], s.center[2]}, 0};
 }
 
+/// All THREE Cartesian directions of the position-`pos` derivative at once.
+///
+/// The two promoted/demoted integral blocks depend only on `pos`; `dir` enters
+/// nowhere but the component bookkeeping of the assembly below. Calling the
+/// single-direction form for dir = 0, 1, 2 therefore evaluated the same pair of
+/// eri_block4 three times over -- and those evaluations, not the digest, are
+/// what these kernels spend their time on (ri_k_deriv_kernel measured 68 s
+/// against ri_j_deriv_kernel's 1 s for the same number of derivative blocks,
+/// the difference being that the latter goes through the batched engine).
+template <class Real>
+std::array<std::vector<Real>, 3>
+quartet_pos_deriv_blocks3(const PrimitiveShell<Real> &s0, const PrimitiveShell<Real> &s1,
+                          const PrimitiveShell<Real> &s2, const PrimitiveShell<Real> &s3,
+                          int pos, const TGrid<Real> &grid) {
+  const PrimitiveShell<Real> sh[4] = {s0, s1, s2, s3};
+  const int L[4] = {s0.l, s1.l, s2.l, s3.l};
+  const int nc[4] = {ncart(L[0]), ncart(L[1]), ncart(L[2]), ncart(L[3])};
+  const int lp = L[pos];
+  const Real ap = sh[pos].alpha;
+  auto promote = [&](int dl) {
+    PrimitiveShell<Real> s[4] = {s0, s1, s2, s3};
+    s[pos].l += dl;
+    return detail::eri_block4(s[0], s[1], s[2], s[3], grid);
+  };
+  const auto plus = promote(1);
+  std::vector<Real> minus;
+  if (lp >= 1) minus = promote(-1);
+  int npl[4], nmi[4];
+  for (int i = 0; i < 4; ++i) npl[i] = nmi[i] = nc[i];
+  npl[pos] = ncart(lp + 1);
+  if (lp >= 1) nmi[pos] = ncart(lp - 1);
+  auto idx = [](const int n[4], int a, int b, int c, int d) {
+    return ((static_cast<std::size_t>(a) * n[1] + b) * n[2] + c) * n[3] + d;
+  };
+  const std::size_t sz = static_cast<std::size_t>(nc[0]) * nc[1] * nc[2] * nc[3];
+  std::array<std::vector<Real>, 3> out;
+  for (int d = 0; d < 3; ++d) out[d].assign(sz, Real(0));
+  int k[4];
+  for (k[0] = 0; k[0] < nc[0]; ++k[0])
+    for (k[1] = 0; k[1] < nc[1]; ++k[1])
+      for (k[2] = 0; k[2] < nc[2]; ++k[2])
+        for (k[3] = 0; k[3] < nc[3]; ++k[3]) {
+          int b3[3];
+          cart_comp(lp, k[pos], b3[0], b3[1], b3[2]);
+          const std::size_t o = idx(nc, k[0], k[1], k[2], k[3]);
+          for (int dir = 0; dir < 3; ++dir) {
+            int m3[3] = {b3[0], b3[1], b3[2]};
+            m3[dir] += 1;
+            const int ip = detail::comp_index(lp + 1, m3[0], m3[1]);
+            int ii[4] = {k[0], k[1], k[2], k[3]};
+            ii[pos] = ip;
+            Real term = 2 * ap * plus[idx(npl, ii[0], ii[1], ii[2], ii[3])];
+            if (b3[dir] >= 1) {
+              int mm[3] = {b3[0], b3[1], b3[2]};
+              mm[dir] -= 1;
+              const int im = detail::comp_index(lp - 1, mm[0], mm[1]);
+              int jj[4] = {k[0], k[1], k[2], k[3]};
+              jj[pos] = im;
+              term -= Real(b3[dir]) * minus[idx(nmi, jj[0], jj[1], jj[2], jj[3])];
+            }
+            out[dir][o] = term;
+          }
+        }
+  return out;
+}
+
 /// Full (uncontracted) derivative block d/dR_{pos,dir} of the quartet
 /// (s0 s1 | s2 s3): out has the base component shape, out[idx] = the MD
-/// centre-shift 2 alpha [.+1_dir] - m [.-1_dir] of position `pos`.
+/// centre-shift 2 alpha [.+1_dir] - m [.-1_dir] of position `pos`. Prefer
+/// quartet_pos_deriv_blocks3 when all three directions are wanted, which is the
+/// usual case.
 template <class Real>
 std::vector<Real> quartet_pos_deriv_block(const PrimitiveShell<Real> &s0,
                                           const PrimitiveShell<Real> &s1,
@@ -834,9 +902,11 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
         const int om = orb.ao_off[m], on = orb.ao_off[n], oP = aux.ao_off[a];
         const int nm = ncart(sm.l), nn = ncart(sn.l), nP = ncart(sP.l);
         const int cs[3] = {cshell(false, m), cshell(false, n), cshell(true, a)};
-        for (int pos = 0; pos < 3; ++pos)
+        for (int pos = 0; pos < 3; ++pos) {
+          // all three directions share the two promoted blocks
+          auto blk3 = detail::quartet_pos_deriv_blocks3(sm, sn, sP, gh, pos, grid);
           for (int dir = 0; dir < 3; ++dir) {
-            auto blk = detail::quartet_pos_deriv_block(sm, sn, sP, gh, pos, dir, grid);
+            const auto &blk = blk3[dir];
             for (int km = 0; km < nm; ++km)
               for (int kn = 0; kn < nn; ++kn) {
                 const Real dmn = Dm(om + km, on + kn);
@@ -846,6 +916,7 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
                        dmn * blk[((static_cast<std::size_t>(km) * nn + kn) * nP + kP)]);
               }
           }
+        }
       }
   // -(M_x gamma): 2-centre (a ghost | b ghost), free aux index = a
   for (int a = 0; a < nsa; ++a)
@@ -854,9 +925,10 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
       const auto ghA = ghost(sA), ghB = ghost(sB);
       const int oA = aux.ao_off[a], oB = aux.ao_off[b];
       const int nA = ncart(sA.l), nB = ncart(sB.l);
-      for (int pos : {0, 2})
+      for (int pos : {0, 2}) {
+        auto blk3 = detail::quartet_pos_deriv_blocks3(sA, ghA, sB, ghB, pos, grid);
         for (int dir = 0; dir < 3; ++dir) {
-          auto blk = detail::quartet_pos_deriv_block(sA, ghA, sB, ghB, pos, dir, grid);
+          const auto &blk = blk3[dir];
           const int cs = (pos == 0) ? cshell(true, a) : cshell(true, b);
           for (int ka = 0; ka < nA; ++ka) {
             Real acc = 0;
@@ -865,6 +937,7 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
             radd(cs, dir, oA + ka, -acc);
           }
         }
+      }
     }
   // r was accumulated at PRIMITIVE auxiliary indices; M^{-1} lives in the
   // contracted space, so lift it there first: r_c = r Ca^T. Ca empty means the
@@ -2014,9 +2087,10 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
           const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
           const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
           const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
-          for (int pos = 0; pos < 3; ++pos)
+          for (int pos = 0; pos < 3; ++pos) {
+            auto blk3 = detail::quartet_pos_deriv_blocks3(sl, sn, sc, gh, pos, grid);
             for (int dir = 0; dir < 3; ++dir) {
-              auto blk = detail::quartet_pos_deriv_block(sl, sn, sc, gh, pos, dir, grid);
+              const auto &blk = blk3[dir];
               const int xi = 3 * cs[pos] + dir;
               for (int kl = 0; kl < nl; ++kl)
                 for (int kn = 0; kn < nn; ++kn)
@@ -2038,6 +2112,7 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
                     }
                   }
             }
+          }
         }
     // two-centre: P_x^Q[i,j] -= dM_QR/dx V^R[i,j]
     for (int c = 0; c < nsa; ++c)
@@ -2046,9 +2121,10 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
         const auto ghC = ghost(sC), ghE = ghost(sE);
         const int oC = aux.ao_off[c], oE = aux.ao_off[ee];
         const int nC = ncart(sC.l), nE = ncart(sE.l);
-        for (int pos : {0, 2})
+        for (int pos : {0, 2}) {
+          auto blk3 = detail::quartet_pos_deriv_blocks3(sC, ghC, sE, ghE, pos, grid);
           for (int dir = 0; dir < 3; ++dir) {
-            auto blk = detail::quartet_pos_deriv_block(sC, ghC, sE, ghE, pos, dir, grid);
+            const auto &blk = blk3[dir];
             const int cs = (pos == 0) ? cshell(true, c) : cshell(true, ee);
             const int xi = 3 * cs + dir;
             for (int kQ = 0; kQ < nC; ++kQ)
@@ -2065,6 +2141,7 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
                   }
               }
           }
+        }
       }
     // Pa and Pb were accumulated at PRIMITIVE auxiliary indices, since that is
     // what a derivative block carries; M^{-1} lives in the contracted space, so
@@ -2292,43 +2369,56 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
         const int ol = orb.ao_off[l], on = orb.ao_off[n], oc = aux.ao_off[c];
         const int nl = ncart(sl.l), nn = ncart(sn.l), nP = ncart(sc.l);
         const int cs[3] = {cshell(false, l), cshell(false, n), cshell(true, c)};
-        for (int pos = 0; pos < 3; ++pos)
-          for (int dir = 0; dir < 3; ++dir) {
-            const auto blk = detail::quartet_pos_deriv_block(sl, sn, sc, gh, pos, dir, grid);
-            const int xi = 3 * grp[cs[pos]] + dir; // folded onto the group (atoms)
-            for (int kl = 0; kl < nl; ++kl)
-              for (int kn = 0; kn < nn; ++kn)
-                for (int kQ = 0; kQ < nP; ++kQ) {
+        // The two contractions y1 and y3 below depend only on (B, P) -- NOT on
+        // kl, pos or dir. Leaving them inside those loops recomputed each one
+        // 9 * nl times, and they are the whole cost of this kernel: with the
+        // same number of derivative blocks as ri_j_deriv_kernel, this one
+        // measured 68 s against 1 s, so the integrals are ~1.5% and the digest
+        // is the rest. Hoisting them turns the innermost work from a
+        // length-nvec dot per output element into a plain axpy.
+        //
+        // The nine derivative blocks are therefore evaluated up front, and the
+        // loop order becomes (kn, kQ) outside (pos, dir, kl).
+        std::vector<Real> blocks[9];
+        for (int pos = 0; pos < 3; ++pos) {
+          auto three = detail::quartet_pos_deriv_blocks3(sl, sn, sc, gh, pos, grid);
+          for (int dir = 0; dir < 3; ++dir) blocks[pos * 3 + dir] = std::move(three[dir]);
+        }
+        std::vector<Real> y1(nao_out), y3(nao_out);
+        for (int kn = 0; kn < nn; ++kn)
+          for (int kQ = 0; kQ < nP; ++kQ) {
+            const int B = on + kn, P = oc + kQ;
+            // y1[n2] = sum_i CL[B,i] Yhat[P][n2,i];  y3[m2] = sum_i Xhat[P][m2,i] CR[B,i]
+            detail::gemm('N', 'N', nao_out, 1, nvec, Real(1),
+                         Yh.data() + static_cast<std::size_t>(P) * slab, nvec,
+                         CL + static_cast<std::size_t>(B) * nvec, 1, Real(0), y1.data(), 1);
+            detail::gemm('N', 'N', nao_out, 1, nvec, Real(1),
+                         Xh.data() + static_cast<std::size_t>(P) * slab, nvec,
+                         CR + static_cast<std::size_t>(B) * nvec, 1, Real(0), y3.data(), 1);
+            for (int pos = 0; pos < 3; ++pos) {
+              for (int dir = 0; dir < 3; ++dir) {
+                const auto &blk = blocks[pos * 3 + dir];
+                const int xi = 3 * grp[cs[pos]] + dir; // folded onto the group (atoms)
+                Real *Kx = res.K[0].data() + static_cast<std::size_t>(xi) * N;
+                for (int kl = 0; kl < nl; ++kl) {
                   const Real dv = blk[(static_cast<std::size_t>(kl) * nn + kn) * nP + kQ];
                   if (dv == Real(0)) continue;
-                  const int A = ol + kl, B = on + kn, P = oc + kQ;
-                  // A comes from the derivative block, so it is a PRIMITIVE
-                  // orbital index and is fanned out onto the contracted AOs it
-                  // feeds; n2 / m2 are output indices and are already
-                  // contracted. All trip counts are 1 for a primitive basis.
-                  // term 1: quartet read as (m l|P), m = A, l = B
-                  for (int n2 = 0; n2 < nao_out; ++n2) {
-                    Real acc = 0;
-                    for (int i = 0; i < nvec; ++i)
-                      acc += CL[static_cast<std::size_t>(B) * nvec + i] *
-                             Yh[static_cast<std::size_t>(P) * slab + n2 * nvec + i];
-                    if (acc == Real(0)) continue;
-                    for (int cM = 0; cM < fan.nctr[l]; ++cM)
-                      Kadd(xi, fan.base[l] + cM * nl + kl, n2,
-                           fan.w[fan.coff[l] + cM] * acc * dv);
-                  }
-                  // term 3: the same quartet read as (n s|Q), n = A, s = B
-                  for (int m2 = 0; m2 < nao_out; ++m2) {
-                    Real acc = 0;
-                    for (int i = 0; i < nvec; ++i)
-                      acc += Xh[static_cast<std::size_t>(P) * slab + m2 * nvec + i] *
-                             CR[static_cast<std::size_t>(B) * nvec + i];
-                    if (acc == Real(0)) continue;
-                    for (int cM = 0; cM < fan.nctr[l]; ++cM)
-                      Kadd(xi, m2, fan.base[l] + cM * nl + kl,
-                           fan.w[fan.coff[l] + cM] * acc * dv);
+                  // the orbital index out of the derivative block is PRIMITIVE
+                  // and fans out onto the contracted AOs it feeds; n2 / m2 are
+                  // outputs and are already contracted. Trip count 1 for a
+                  // primitive basis.
+                  for (int cM = 0; cM < fan.nctr[l]; ++cM) {
+                    const Real w = fan.w[fan.coff[l] + cM] * dv;
+                    const int I = fan.base[l] + cM * nl + kl;
+                    Real *row = Kx + static_cast<std::size_t>(I) * nao_out;
+                    for (int n2 = 0; n2 < nao_out; ++n2) row[n2] += w * y1[n2];
+                    Real *col = Kx + I;
+                    for (int m2 = 0; m2 < nao_out; ++m2)
+                      col[static_cast<std::size_t>(m2) * nao_out] += w * y3[m2];
                   }
                 }
+              }
+            }
           }
       }
   // term 2, one perturbation at a time
@@ -2346,6 +2436,9 @@ JKDerivResult<Real> ri_k_deriv_kernel(const ShellBasis<Real> &orb,
           const int nC = ncart(sC.l), nE = ncart(sE.l);
           for (int pos : {0, 2}) {
             const int cs = (pos == 0) ? cshell(true, c) : cshell(true, ee);
+            // only one direction survives the filter below, so the
+            // single-direction form is the right one here -- computing all
+            // three would discard two of them.
             for (int dir = 0; dir < 3; ++dir) {
               // every shell in the group contributes to the group's perturbation
               if (3 * grp[cs] + dir != x) continue;
