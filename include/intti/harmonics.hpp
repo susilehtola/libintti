@@ -60,8 +60,12 @@ enum class RealOrder { Standard, Libcint };
 
 /// (2l+1) x (2l+1) row-major unitary U with chi^complex_m = sum_m' U[m][m']
 /// chi^real_m', both indices ordered m = -l..+l.
+/// The general form: `order` is the reindex of the REAL basis this matrix is to
+/// consume, so a consumer with a convention intti does not ship supplies its own
+/// ShellReindex and needs no change here. The enum overload below is the
+/// convenience wrapper over the two conventions that are validated.
 template <class Real = double>
-std::vector<std::complex<Real>> r2c_matrix(int l, RealOrder order = RealOrder::Standard) {
+std::vector<std::complex<Real>> r2c_matrix(int l, const ShellReindex &order) {
   using C = std::complex<Real>;
   const int nm = 2 * l + 1;
   std::vector<C> U(static_cast<std::size_t>(nm) * nm, C(0));
@@ -76,23 +80,29 @@ std::vector<std::complex<Real>> r2c_matrix(int l, RealOrder order = RealOrder::S
     U[static_cast<std::size_t>(-m + l) * nm + (m + l)] = C(inv, 0);
     U[static_cast<std::size_t>(-m + l) * nm + (-m + l)] = C(0, -inv);
   }
-  if (order == RealOrder::Libcint) {
-    // The real-basis index is the COLUMN, so the foreign ordering enters as a
-    // column permutation and phase. Taken from the shared convention table
-    // (convention.hpp) rather than restated here, so there is one place where a
-    // convention is defined and one place to validate.
-    const auto r = sph_reindex(AoConvention::Libcint, l);
-    if (!r.identity()) {
-      std::vector<C> P(U.size(), C(0));
-      for (int a = 0; a < nm; ++a)
-        for (int slot = 0; slot < nm; ++slot)
-          P[static_cast<std::size_t>(a) * nm + slot] =
-              static_cast<Real>(r.scale[slot]) *
-              U[static_cast<std::size_t>(a) * nm + r.perm[slot]];
-      U.swap(P);
-    }
+  // The real-basis index is the COLUMN, so a foreign ordering enters as a column
+  // permutation and phase.
+  if (!order.identity()) {
+    std::vector<C> P(U.size(), C(0));
+    for (int a = 0; a < nm; ++a)
+      for (int slot = 0; slot < nm; ++slot)
+        P[static_cast<std::size_t>(a) * nm + slot] =
+            static_cast<Real>(order.scale[slot]) *
+            U[static_cast<std::size_t>(a) * nm + order.perm[slot]];
+    U.swap(P);
   }
   return U;
+}
+
+/// Convenience overload for the shipped conventions, via the shared table in
+/// convention.hpp -- so a convention is defined in one place and validated in
+/// one place.
+template <class Real = double>
+std::vector<std::complex<Real>> r2c_matrix(int l, RealOrder order = RealOrder::Standard) {
+  return r2c_matrix<Real>(l, sph_reindex(order == RealOrder::Libcint
+                                             ? AoConvention::Libcint
+                                             : AoConvention::Intti,
+                                         l));
 }
 
 /// Transform a whole nao x nao matrix from the real to the complex spherical
@@ -102,18 +112,23 @@ std::vector<std::complex<Real>> r2c_matrix(int l, RealOrder order = RealOrder::S
 /// conjugated, so M^c = conj(U) M^r U^T -- NOT U M U^dagger. The distinction
 /// matters: the two differ by an overall conjugation, which is exactly the
 /// sign of m and therefore the thing the L_z check is testing.
-template <class Real>
+/// General form: `reindex(l)` gives the ShellReindex of the real basis being
+/// consumed, so an unshipped convention plugs in here without touching this
+/// file. See the enum overload below for the validated presets.
+template <class Real, class Fn>
 std::vector<std::complex<Real>>
-real_to_complex(const std::vector<int> &shell_l, const std::vector<int> &ao_off, int nao,
-                const Real *M, RealOrder order = RealOrder::Standard) {
+real_to_complex_with(const std::vector<int> &shell_l, const std::vector<int> &ao_off,
+                     int nao, const Real *M, Fn reindex) {
   using C = std::complex<Real>;
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
   std::vector<C> tmp(N, C(0)), out(N, C(0));
-  static thread_local std::map<std::pair<int, int>, std::vector<C>> cache;
+  // No memo here: the reindex is caller-supplied, so there is no key to cache
+  // on. The matrices are (2l+1)^2 and built once per shell, which is nothing
+  // beside the integrals.
+  std::map<int, std::vector<C>> cache;
   auto Umat = [&](int l) -> const std::vector<C> & {
-    const std::pair<int, int> key{l, static_cast<int>(order)};
-    auto it = cache.find(key);
-    if (it == cache.end()) it = cache.emplace(key, r2c_matrix<Real>(l, order)).first;
+    auto it = cache.find(l);
+    if (it == cache.end()) it = cache.emplace(l, r2c_matrix<Real>(l, reindex(l))).first;
     return it->second;
   };
   // left index: tmp = conj(U) M
@@ -143,6 +158,17 @@ real_to_complex(const std::vector<int> &shell_l, const std::vector<int> &ao_off,
       }
   }
   return out;
+}
+
+/// Convenience overload for the shipped conventions.
+template <class Real>
+std::vector<std::complex<Real>>
+real_to_complex(const std::vector<int> &shell_l, const std::vector<int> &ao_off, int nao,
+                const Real *M, RealOrder order = RealOrder::Standard) {
+  const auto conv =
+      order == RealOrder::Libcint ? AoConvention::Libcint : AoConvention::Intti;
+  return real_to_complex_with(shell_l, ao_off, nao, M,
+                              [&](int l) { return sph_reindex(conv, l); });
 }
 
 /// The switch itself: return an AO matrix in the requested harmonic

@@ -223,3 +223,63 @@ TEST(Harmonics, ConventionRoundTrip) {
   EXPECT_LT(rt, 1e-14 * scale) << "convention round trip is not the identity";
   EXPECT_GT(fwdiff, 0.5) << "conversion changed nothing: the table is inert";
 }
+
+// The extension point, exercised from OUTSIDE the library: a convention intti
+// does not ship, defined only here, driven through real_to_complex_with. If this
+// compiles and reproduces the physics, a downstream consumer can add their own
+// ordering without touching intti -- which is the whole point of the layer.
+//
+// The convention used is deliberately awkward: Molden/Gaussian-style ordering
+// (m = 0, +1, -1, +2, -2, ...) with a sign flip on every negative m, so both
+// halves of a ShellReindex -- permutation AND phase -- are non-trivial.
+TEST(Harmonics, CallerSuppliedConventionPlugsIn) {
+  std::vector<int> ls;
+  auto basis = one_centre(ls);
+  const double origin[3] = {0.0, 0.0, 0.0};
+  auto L = intti::angular_momentum(basis, origin);
+  auto S = intti::overlap_matrix(basis);
+  int nsph = 0, n2 = 0;
+  std::vector<int> soff, soff2;
+  auto Lz_std = cart_to_sph(basis, L[2], nsph, soff);
+  auto S_std = cart_to_sph(basis, S, n2, soff2);
+
+  // foreign_i = intti[perm[i]] * scale[i]
+  auto molden_like = [](int l) {
+    intti::ShellReindex r;
+    r.perm.push_back(l); // m = 0
+    r.scale.push_back(1.0);
+    for (int m = 1; m <= l; ++m) {
+      r.perm.push_back(m + l);   // +m
+      r.scale.push_back(1.0);
+      r.perm.push_back(-m + l);  // -m, with a phase flip
+      r.scale.push_back(-1.0);
+    }
+    return r;
+  };
+  // rewrite the two matrices INTO that convention...
+  std::vector<int> nfunc;
+  for (int l : ls) nfunc.push_back(2 * l + 1);
+  auto fwd = [&](int s) { return molden_like(ls[s]); };
+  auto Lz_f = intti::convert_matrix(soff, nfunc, nsph, Lz_std.data(), fwd);
+  auto S_f = intti::convert_matrix(soff, nfunc, nsph, S_std.data(), fwd);
+  double moved = 0;
+  for (std::size_t i = 0; i < Lz_f.size(); ++i)
+    moved = std::max(moved, std::abs(Lz_f[i] - Lz_std[i]));
+  ASSERT_GT(moved, 0.5) << "the foreign convention must actually differ";
+
+  // ...and consume them through the open seam, which must undo it exactly.
+  auto Lz = intti::real_to_complex_with(ls, soff, nsph, Lz_f.data(), fwd);
+  auto Sc = intti::real_to_complex_with(ls, soff, nsph, S_f.data(), fwd);
+
+  double off = 0, worst = 0;
+  for (std::size_t s = 0; s < ls.size(); ++s)
+    for (int a = 0; a < 2 * ls[s] + 1; ++a) {
+      const std::size_t idx = static_cast<std::size_t>(soff[s] + a) * nsph + soff[s] + a;
+      worst = std::max(worst, std::abs(Lz[idx] - std::complex<double>(0.0, a - ls[s]) * Sc[idx]));
+    }
+  for (int i = 0; i < nsph; ++i)
+    for (int j = 0; j < nsph; ++j)
+      if (i != j) off = std::max(off, std::abs(Lz[static_cast<std::size_t>(i) * nsph + j]));
+  EXPECT_LT(off, 1e-12) << "caller-supplied convention: L_z not diagonal";
+  EXPECT_LT(worst, 1e-12) << "caller-supplied convention: L_z != i m S";
+}
