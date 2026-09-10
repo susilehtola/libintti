@@ -7,6 +7,7 @@
 // flat). Validated against exact eri_quartet across s/p/d pairs and separations.
 
 #include <cmath>
+#include <algorithm>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -79,3 +80,94 @@ TEST(Screening, MbieUpperBoundsAndBeatsSchwarz) {
 }
 
 } // namespace
+
+// t-RESOLVED screening: the quadrature is truncated per quartet, and the two
+// things that must hold are that the discarded tail really is below eps, and
+// that anything is discarded at all.
+//
+// The first is the correctness property and is checked against the EXACT
+// quartet: recompute on the truncated grid and compare. The second guards
+// against a bound so loose it never fires, which would pass the first
+// trivially.
+TEST(Screening, TResolvedTruncationRespectsEpsAndFires) {
+  auto full = intti::make_tgrid(intti::coulomb());
+  const int nt = full.n();
+  struct Cfg { int la, lb, lc, ld; };
+  const Cfg cfgs[] = {{0, 0, 0, 0}, {1, 0, 1, 0}, {1, 1, 1, 1}, {2, 0, 2, 0}};
+  const double eps = 1e-10;
+
+  for (const auto &cf : cfgs) {
+    auto a = Shell{1.1, {0, 0, 0}, cf.la};
+    auto b = Shell{0.8, {0.2, 0.1, 0}, cf.lb};
+    auto bra = intti::make_pair(a, b);
+    bool fired = false;
+    for (double R : {1.0, 2.0, 4.0, 8.0, 16.0}) {
+      auto c = Shell{0.9, {0, 0, R}, cf.lc};
+      auto d = Shell{0.7, {0.1, 0, R + 0.3}, cf.ld};
+      auto ket = intti::make_pair(c, d);
+
+      const int keep = intti::t_screen_keep(bra, ket, full, eps);
+      ASSERT_GE(keep, 0);
+      ASSERT_LE(keep, nt);
+      if (keep < nt) fired = true;
+
+      // exact quartet on the full grid
+      const int nb = intti::ncart(cf.la) * intti::ncart(cf.lb);
+      const int nk = intti::ncart(cf.lc) * intti::ncart(cf.ld);
+      std::vector<double> ref(static_cast<std::size_t>(nb) * nk);
+      intti::eri_quartet(bra, ket, full, ref.data());
+
+      // ...and on the truncated prefix
+      intti::TGrid<double> cut = full;
+      cut.t.resize(keep);
+      cut.w.resize(keep);
+      cut.tail_coeff = 0.0; // the tail term IS the discarded large-t region
+      std::vector<double> got(static_cast<std::size_t>(nb) * nk);
+      intti::eri_quartet(bra, ket, cut, got.data());
+
+      double worst = 0;
+      for (std::size_t i = 0; i < ref.size(); ++i)
+        worst = std::max(worst, std::abs(got[i] - ref[i]));
+      EXPECT_LT(worst, eps * 10)
+          << "truncating to " << keep << "/" << nt << " nodes at R=" << R
+          << " lost more than eps for " << cf.la << cf.lb << cf.lc << cf.ld;
+    }
+    EXPECT_TRUE(fired) << "t-screening never truncated for " << cf.la << cf.lb << cf.lc
+                       << cf.ld << ": the bound is too loose to be useful";
+  }
+}
+// How much it removes, and -- the point -- that it removes nearly as much for
+// p and d pairs as for s. MBIE-1 is monopole-level, so it screens p/d only at
+// much larger separation than s; here the decay is exact at every node and the
+// angular class barely enters. Asserting that keeps the advantage from silently
+// regressing to monopole behaviour.
+TEST(Screening, TResolvedTruncationIsAngularMomentumBlind) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nt = grid.n();
+  struct Cfg { int la, lb, lc, ld; };
+  const Cfg cfgs[] = {{0, 0, 0, 0}, {1, 0, 1, 0}, {1, 1, 1, 1}, {2, 0, 2, 0}};
+  int keep_far[4] = {0, 0, 0, 0};
+  for (int ci = 0; ci < 4; ++ci) {
+    const auto &cf = cfgs[ci];
+    auto a = Shell{1.1, {0, 0, 0}, cf.la};
+    auto b = Shell{0.8, {0.2, 0.1, 0}, cf.lb};
+    auto bra = intti::make_pair(a, b);
+
+    // close pairs must NOT be truncated: the clouds still overlap and the
+    // large-t nodes carry the short-range part
+    auto cn = Shell{0.9, {0, 0, 1.0}, cf.lc};
+    auto dn = Shell{0.7, {0.1, 0, 1.3}, cf.ld};
+    EXPECT_EQ(intti::t_screen_keep(bra, intti::make_pair(cn, dn), grid, 1e-10), nt)
+        << "a close quartet was truncated";
+
+    auto cf2 = Shell{0.9, {0, 0, 32.0}, cf.lc};
+    auto df2 = Shell{0.7, {0.1, 0, 32.3}, cf.ld};
+    keep_far[ci] = intti::t_screen_keep(bra, intti::make_pair(cf2, df2), grid, 1e-10);
+    EXPECT_LT(keep_far[ci], nt / 3) << "far quartet barely truncated";
+    EXPECT_GT(keep_far[ci], 0) << "the small-t nodes carry the 1/R tail and must survive";
+  }
+  const int lo = *std::min_element(keep_far, keep_far + 4);
+  const int hi = *std::max_element(keep_far, keep_far + 4);
+  EXPECT_LE(hi - lo, 4) << "truncation has become angular-momentum dependent, i.e. it has "
+                           "degraded towards monopole (MBIE-1) behaviour";
+}

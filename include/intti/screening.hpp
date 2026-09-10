@@ -18,7 +18,9 @@
 #include <cmath>
 
 #include "gto.hpp"
+#include "hermite1d.hpp"
 #include "math.hpp"
+#include "tgrid.hpp"
 
 namespace intti {
 namespace detail {
@@ -108,6 +110,119 @@ Real mbie_estimate(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
   if (sep <= Real(0)) return schwarz; // clouds may overlap -> Schwarz
   const Real mono = pair_charge_bound(bra) * pair_charge_bound(ket) / sep;
   return mono < schwarz ? mono : schwarz;
+}
+
+
+// ---------------------------------------------------------------------------
+// t-RESOLVED screening: truncate the quadrature per quartet, not the quartet.
+//
+// This one has no counterpart in a Boys-function code, because it needs the
+// Coulomb kernel resolved into Gaussians. At node t the kernel is e^{-t^2 r12^2}
+// and the two-pair matrix element carries an explicit e^{-theta(t) R^2}, with
+//     theta(t) = t^2 p q / (p q + t^2 (p + q)),   R = |P_bra - P_ket|.
+// theta is monotone in t and SATURATES at mu = pq/(p+q) rather than diverging,
+// so the damping is bounded by e^{-mu R^2} and never removes the small-t nodes
+// -- which is correct, because the small-t region is precisely where the 1/R
+// tail comes from. Taking theta ~ t^2 there, the contributing window is
+// t <~ sqrt(ln(1/eps))/R, and the integral over it reproduces q_ab q_cd / R:
+// the monopole estimate is not an approximation bolted on, it is what the
+// small-t part of the integrand IS.
+//
+// So the payoff is NOT rejecting distant quartets -- their interaction is real
+// -- but evaluating them on a short PREFIX of the grid. This composes with
+// Schwarz rather than replacing it.
+//
+// The bound. hermite_b gives B_n = (d/dX)^n e^{-theta X^2} = (-sqrt(theta))^n
+// H_n(sqrt(theta) X) e^{-theta X^2}. Cramer's inequality,
+// |H_n(u)| <= k 2^{n/2} sqrt(n!) e^{u^2/2} with k = 1.086435, absorbs the
+// polynomial growth into half the exponent:
+//     |B_n(theta, X)| <= k (2 theta)^{n/2} sqrt(n!) e^{-theta X^2 / 2}.
+// Multiplying the three directions and the absolute E-sums of the two pairs
+// bounds a node's contribution, and the tail is summed from the top of the grid
+// down. Loose by design -- it is a screening estimate, and every step is an
+// upper bound.
+
+namespace detail {
+
+/// Per-direction max over Cartesian components of sum_t |E_t^{ab}|: the
+/// t-independent half of a node's bound.
+template <class Real> void pair_e_absmax(const ShellPair<Real> &sp, Real out[3]) {
+  const int la = sp.la, lb = sp.lb, nt = la + lb + 1;
+  std::vector<Real> E(static_cast<std::size_t>(la + 1) * (lb + 1) * nt);
+  for (int d = 0; d < 3; ++d) {
+    const Real ab = sp.A[d] - sp.B[d];
+    // K is already folded into E_0^{00} by e_coeffs when passed here
+    e_coeffs(la, lb, sp.p, Real(sp.P[d] - sp.A[d]), Real(sp.P[d] - sp.B[d]),
+             Real(sp.K[d]), E.data());
+    (void)ab;
+    Real best = 0;
+    for (int i = 0; i <= la; ++i)
+      for (int j = 0; j <= lb; ++j) {
+        Real acc = 0;
+        for (int t = 0; t <= i + j; ++t)
+          acc += std::abs(E[(static_cast<std::size_t>(i) * (lb + 1) + j) * nt + t]);
+        if (acc > best) best = acc;
+      }
+    out[d] = best;
+  }
+}
+
+/// k^3 * max_{m <= L} (2 theta)^{m/2} sqrt(m!) -- the Cramer factor, maximised
+/// over the Hermite order because (2 theta)^{m/2} sqrt(m!) is not monotone in m
+/// when 2 theta < 1.
+template <class Real> Real cramer_factor(Real theta, int L) {
+  const Real k = Real(1.086435);
+  const Real two_theta = 2 * theta;
+  Real best = 0, pw = 1, fact = 1;
+  for (int m = 0; m <= L; ++m) {
+    if (m > 0) {
+      pw *= std::sqrt(two_theta);
+      fact *= std::sqrt(Real(m));
+    }
+    const Real v = pw * fact;
+    if (v > best) best = v;
+  }
+  return k * k * k * best;
+}
+
+} // namespace detail
+
+/// Number of leading quadrature nodes that must be kept for this quartet: nodes
+/// at index >= the return value contribute less than `eps` in total. Returns
+/// grid.n() when no truncation is justified.
+///
+/// theta is monotone in t, so this is a one-sided prefix -- the small-t nodes
+/// are never discarded.
+template <class Real>
+int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
+                  const TGrid<Real> &grid, Real eps) {
+  const int nt = grid.n();
+  Real Ea[3], Eb[3];
+  detail::pair_e_absmax(bra, Ea);
+  detail::pair_e_absmax(ket, Eb);
+  Real Epref = 1;
+  for (int d = 0; d < 3; ++d) Epref *= Ea[d] * Eb[d];
+  if (!(Epref > Real(0))) return 0;
+  Real R2 = 0;
+  for (int d = 0; d < 3; ++d) {
+    const Real dx = Real(bra.P[d]) - Real(ket.P[d]);
+    R2 += dx * dx;
+  }
+  const int L = bra.la + bra.lb + ket.la + ket.lb;
+  const Real p = bra.p, q = ket.p;
+  const Real pi = pi_v<Real>();
+  // walk down from the top of the grid, accumulating the discarded tail
+  Real tail = 0;
+  for (int i = nt - 1; i >= 0; --i) {
+    const Real t = grid.t[i];
+    const Real D = p * q + t * t * (p + q);
+    const Real theta = t * t * p * q / D;
+    const Real b = std::abs(grid.w[i]) * (pi / std::sqrt(D)) * Epref *
+                   detail::cramer_factor(theta, L) * std::exp(-theta * R2 / 2);
+    if (tail + b > eps) return i + 1; // node i must be kept
+    tail += b;
+  }
+  return 0;
 }
 
 } // namespace intti
