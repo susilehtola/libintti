@@ -839,6 +839,79 @@ TEST(Contracted, RiHessiansVsDecontractRecontract) {
   EXPECT_GT(kscale, 1e-3) << "RI-K Hessian trivially zero";
 }
 
+// Derivative RI Coulomb MATRICES over contracted bases. Unlike the Hessians the
+// output is AO-indexed per perturbation, so the contraction cannot be folded
+// entirely into coefficients: the derivative three-centre pass fans its result
+// out onto contracted AOs in the digest. Reference: the same builder with only
+// the ORBITAL basis decontracted (the auxiliary one must not be, or the fitting
+// span changes), folded from primitive shells onto their parents.
+TEST(Contracted, RiJDerivVsDecontractRecontract) {
+  auto cb = test_basis();
+  const int n = cb.nao;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  intti::ContractedShell<double> a0;
+  a0.center[0] = a0.center[1] = a0.center[2] = 0;
+  a0.l = 0; a0.alpha = {8.0, 2.0}; a0.coeff = {0.7, 0.4};
+  intti::ContractedShell<double> a1;
+  a1.center[0] = 0; a1.center[1] = 0; a1.center[2] = 1.3;
+  a1.l = 1; a1.alpha = {1.6, 0.5}; a1.coeff = {0.8, 0.3};
+  intti::ContractedShell<double> a2;
+  a2.center[0] = 0; a2.center[1] = 0.2; a2.center[2] = 0.5;
+  a2.l = 2; a2.alpha = {1.2}; a2.coeff = {1.0};
+  auto ca = intti::make_contracted_basis<double>({a0, a1, a2});
+  const int ncs = static_cast<int>(cb.shells.size()), nas = static_cast<int>(ca.shells.size());
+
+  auto D = sym_density(n);
+  std::vector<intti::JKRequest<double>> creq{
+      {D.data(), intti::DensitySymmetry::Symmetric, intti::FockTerms::Coulomb}};
+  auto got = intti::ri_j_deriv_build(cb, ca, creq, grid, 1e-12);
+
+  intti::ShellBasis<double> pb;
+  std::vector<double> C;
+  const int npao = decontract(cb, pb, C);
+  std::vector<intti::ContractedShell<double>> pshells;
+  for (const auto &sh : pb.shells) {
+    intti::ContractedShell<double> t;
+    t.l = sh.l;
+    for (int k = 0; k < 3; ++k) t.center[k] = sh.center[k];
+    t.alpha = {sh.alpha};
+    t.coeff = {1.0 / intti::cart_norm_pyscf(sh.l, sh.alpha)};
+    pshells.push_back(std::move(t));
+  }
+  auto pbc = intti::make_contracted_basis<double>(std::move(pshells));
+  auto Deff = pushdown(C, n, npao, D);
+  std::vector<intti::JKRequest<double>> preq{
+      {Deff.data(), intti::DensitySymmetry::Symmetric, intti::FockTerms::Coulomb}};
+  auto ref = intti::ri_j_deriv_build(pbc, ca, preq, grid, 1e-12);
+
+  std::vector<int> parent;
+  for (int a = 0; a < ncs; ++a)
+    for (int p = 0; p < cb.shells[a].nprim(); ++p) parent.push_back(a);
+  const int nps = static_cast<int>(parent.size());
+  for (int a = 0; a < nas; ++a) parent.push_back(ncs + a);
+  ASSERT_EQ(got.nshell, ncs + nas);
+  ASSERT_EQ(ref.nshell, nps + nas);
+
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  const std::size_t p2 = static_cast<std::size_t>(npao) * npao;
+  double worst = 0, scale = 0;
+  // each primitive-shell perturbation is congruence-transformed back onto the
+  // contracted AOs and folded onto its parent contracted shell
+  std::vector<double> refc(static_cast<std::size_t>(3 * (ncs + nas)) * n2, 0.0);
+  for (int x = 0; x < 3 * (nps + nas); ++x) {
+    std::vector<double> slice(ref.J[0].begin() + x * p2, ref.J[0].begin() + (x + 1) * p2);
+    auto rc = conjugate(C, n, npao, slice);
+    const int tgt = 3 * parent[x / 3] + (x % 3);
+    for (std::size_t i = 0; i < n2; ++i) refc[tgt * n2 + i] += rc[i];
+  }
+  for (std::size_t i = 0; i < refc.size(); ++i) {
+    worst = std::max(worst, std::abs(got.J[0][i] - refc[i]));
+    scale = std::max(scale, std::abs(refc[i]));
+  }
+  EXPECT_LT(worst, 1e-9 * std::max(scale, 1.0)) << "contracted RI-J deriv != decontracted";
+  EXPECT_GT(scale, 1e-3) << "RI-J derivative matrices trivially zero";
+}
+
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum
 // of nctr*ncart(l) over shells.
 TEST(Contracted, SymmetricAndSized) {

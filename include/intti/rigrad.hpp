@@ -996,6 +996,27 @@ void ri_fit_rhs(const ContractedBasis<Real> &orb, const ContractedBasis<Real> &a
        d.data(), 1);
 }
 
+/// M^{-1} alone (no right-hand side), with the same relative eigenvalue cutoff.
+template <class Real, class AuxBasis>
+std::vector<Real> ri_metric_inverse(const AuxBasis &aux, const TGrid<Real> &grid,
+                                    Real tau_lin) {
+  const int naux = aux.nao;
+  auto V = coulomb_2c(aux, grid);
+  std::vector<Real> eval(naux);
+  syevd(naux, V.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int k = 0; k < naux; ++k) {
+    if (eval[k] <= tau_lin * emax) continue;
+    const Real sc = Real(1) / eval[k];
+    for (int R = 0; R < naux; ++R)
+      for (int Q = 0; Q < naux; ++Q)
+        Minv[R * naux + Q] += sc * V[k * naux + R] * V[k * naux + Q];
+  }
+  return Minv;
+}
+
 template <class Real, class OrbBasis, class AuxBasis>
 void ri_solve_fit(const OrbBasis &orb, const AuxBasis &aux, const Real *D,
                   const TGrid<Real> &grid, Real tau_lin, int aux_tile_shells,
@@ -1139,14 +1160,34 @@ inline std::vector<int> perturbation_groups(const std::vector<int> &group, int n
 /// three-centre integral, d/dP = -(d/dm + d/dn); likewise d/dQ = -d/dP for the
 /// two-centre metric derivative. Those are exact and save evaluating the shifted
 /// auxiliary quartets.
+namespace detail {
+
+/// ri_j_deriv_build's kernel, over PRIMITIVE shells. Unlike the Hessians, the
+/// OUTPUT here is AO-indexed per perturbation, so the contraction cannot be
+/// folded entirely into the coefficients: the derivative three-centre pass has
+/// to fan its result out onto contracted AOs in the DIGEST (detail::ShellFanout,
+/// as the direct two-electron derivatives do), because lifting a
+/// per-perturbation nao^2 matrix afterwards would materialise the
+/// primitive-sized output -- the thing the atom fold exists to avoid.
+///
+/// Everything else follows the Coulomb Hessian: D and gamma arrive pushed DOWN
+/// to the primitive space, the metric stays CONTRACTED, and d_x and M_x gamma
+/// are accumulated at primitive auxiliary indices and lifted with Ca before the
+/// solve. `fo` null and `Ca` empty is the primitive case, where every one of
+/// those is the identity.
 template <class Real>
-JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
-                                     const std::vector<JKRequest<Real>> &reqs,
-                                     const TGrid<Real> &grid,
-                                     Real tau_lin = Real(1e-10),
-                                     int aux_tile_shells = 0,
-                                     const std::vector<int> &group = {}) {
+JKDerivResult<Real> ri_j_deriv_kernel(
+    const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+    const std::vector<JKRequest<Real>> &reqs, const TGrid<Real> &grid, int aux_tile_shells,
+    const std::vector<int> &group, const ShellFanout<Real> *fo, const std::vector<Real> &Ca,
+    int nauxc, const std::vector<Real> &Minv, const std::vector<std::vector<Real>> &gamma_c,
+    const std::vector<Real> *Tc) {
   const int nao = orb.nao, naux = aux.nao;
+  const int nao_out = fo ? fo->nao : nao;
+  const std::size_t Nout = static_cast<std::size_t>(nao_out) * nao_out;
+  ShellFanout<Real> idf;
+  if (!fo) idf = identity_fanout(orb);
+  const ShellFanout<Real> &fan = fo ? *fo : idf;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
   const int ncen = nso + nsa;
@@ -1157,49 +1198,50 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
   const std::size_t N = static_cast<std::size_t>(nao) * nao;
 
   if (aux_tile_shells < 1) aux_tile_shells = nsa;
-  auto M = coulomb_2c(aux, grid);
-  // The three-centre tensor is NEVER materialised: it is nao^2 x naux, the same
-  // shape the reverted exchange-derivative intermediate was rejected for. It is
-  // consumed in two auxiliary-tiled passes instead (the ri_j_tiled idiom), and
-  // the second pass is hoisted so the tile loop is OUTSIDE the perturbation
-  // loop -- tiling naively inside it would recompute the whole tensor
-  // nreq x npert times.
-  // metric pseudo-inverse, shared by gamma and every gamma_x
-  std::vector<Real> V = M, eval(naux);
-  detail::syevd(naux, V.data(), eval.data());
-  Real emax = 0;
-  for (Real e : eval) emax = std::max(emax, e);
-  auto solve = [&](const std::vector<Real> &rhs) {
-    std::vector<Real> x(naux, Real(0));
-    for (int k = 0; k < naux; ++k) {
-      if (eval[k] <= tau_lin * emax) continue;
-      Real vd = 0;
-      for (int P = 0; P < naux; ++P) vd += V[k * naux + P] * rhs[P];
-      const Real sc = vd / eval[k];
-      for (int P = 0; P < naux; ++P) x[P] += sc * V[k * naux + P];
+  // The three-centre tensor is NEVER materialised in the derivative passes: it
+  // is nao^2 x naux, the same shape the reverted exchange-derivative
+  // intermediate was rejected for. It is consumed in an auxiliary-tiled pass
+  // instead (the ri_j_tiled idiom), hoisted so the tile loop is OUTSIDE the
+  // perturbation loop -- tiling naively inside it would recompute the whole
+  // tensor nreq x npert times.
+  //
+  // The fit is solved in the CONTRACTED auxiliary space and handed in; the
+  // solve here is just the application of M^{-1}.
+  auto solve = [&](const std::vector<Real> &rhs_c) {
+    std::vector<Real> x(nauxc, Real(0));
+    for (int P = 0; P < nauxc; ++P) {
+      Real acc = 0;
+      for (int Q = 0; Q < nauxc; ++Q) acc += Minv[static_cast<std::size_t>(P) * nauxc + Q] * rhs_c[Q];
+      x[P] = acc;
     }
     return x;
   };
-  // pass 1: d_r,P = sum_mn (mn|P) D_r,mn, one auxiliary tile at a time
-  std::vector<std::vector<Real>> gamma(nreq);
-  {
-    std::vector<std::vector<Real>> d(nreq, std::vector<Real>(naux, Real(0)));
-    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
-      const int A1 = std::min(A0 + aux_tile_shells, nsa);
-      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
-      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
-      for (int r = 0; r < nreq; ++r)
-        detail::gemm('T', 'N', blk, 1, static_cast<int>(N), Real(1), Tblk.data(), blk,
-                     reqs[r].D, 1, Real(0), d[r].data() + p0, 1);
+  // lift a per-(request, perturbation) primitive-auxiliary array to contracted
+  auto lift_aux = [&](const std::vector<Real> &Ap) {
+    if (Ca.empty()) return Ap;
+    std::vector<Real> out(static_cast<std::size_t>(nreq) * npert * nauxc, Real(0));
+    detail::gemm('N', 'T', nreq * npert, nauxc, naux, Real(1), Ap.data(), naux, Ca.data(),
+                 naux, Real(0), out.data(), nauxc);
+    return out;
+  };
+  // gamma pushed DOWN to primitive auxiliary indices, which is where the
+  // derivative blocks meet it
+  std::vector<std::vector<Real>> gamma(nreq, std::vector<Real>(naux, Real(0)));
+  for (int r = 0; r < nreq; ++r) {
+    if (Ca.empty()) {
+      gamma[r] = gamma_c[r];
+    } else {
+      for (int P = 0; P < nauxc; ++P)
+        for (int p = 0; p < naux; ++p)
+          gamma[r][p] += Ca[static_cast<std::size_t>(P) * naux + p] * gamma_c[r][P];
     }
-    for (int r = 0; r < nreq; ++r) gamma[r] = solve(d[r]);
   }
 
   // ---- derivative three-centre pass -------------------------------------
   // accumulates, per perturbation x and request r:
   //   A[r][x] (nao x nao) = sum_P d(mn|P)/dx gamma_P
   //   dx[r][x] (naux)     = sum_mn d(mn|P)/dx D_mn
-  std::vector<Real> A(static_cast<std::size_t>(nreq) * npert * N, Real(0));
+  std::vector<Real> A(static_cast<std::size_t>(nreq) * npert * Nout, Real(0));
   std::vector<Real> dxv(static_cast<std::size_t>(nreq) * npert * naux, Real(0));
   {
     std::vector<ShellPair<Real>> plist;
@@ -1279,8 +1321,13 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
     auto offv = batch.out_offset;
     Kokkos::View<Real *> Ad("rijd::A", A.size()), Dxd("rijd::dx", dxv.size());
     auto dgrp = detail::to_device(grp, "rijd::grp");
+    auto fnc = detail::to_device(fan.nctr, "rijd::nctr");
+    auto fco = detail::to_device(fan.coff, "rijd::coff");
+    auto fbs = detail::to_device(fan.base, "rijd::base");
+    auto fw = detail::to_device(fan.w, "rijd::w");
     const std::size_t npert_ = static_cast<std::size_t>(npert);
-    const std::size_t nn2 = N, nax = naux;
+    const std::size_t nn2 = N, nax = naux, nout2 = Nout;
+    const int naoo = nao_out;
     Kokkos::parallel_for(
         "intti::rijd::digest", Kokkos::RangePolicy<>(0, njob), KOKKOS_LAMBDA(int j) {
           const int m = djm(j), n = djn(j), a = dja(j);
@@ -1327,9 +1374,24 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
                     // fold onto the perturbation group (atoms, typically)
                     const std::size_t px = static_cast<std::size_t>(3 * dgrp(tgt[slot]) + e);
                     for (int r = 0; r < nreq; ++r) {
-                      Kokkos::atomic_add(
-                          &Ad((static_cast<std::size_t>(r) * npert_ + px) * nn2 + imn),
-                          dv[slot] * dg(r * nax + Pg));
+                      // A is an AO-indexed OUTPUT, so the contraction fans out
+                      // here rather than folding into a coefficient. All trip
+                      // counts are 1 for a primitive basis.
+                      const Real gv = dv[slot] * dg(r * nax + Pg);
+                      const std::size_t abase =
+                          (static_cast<std::size_t>(r) * npert_ + px) * nout2;
+                      for (int cM = 0; cM < fnc(m); ++cM) {
+                        const Real wm = fw(fco(m) + cM) * gv;
+                        const int I = fbs(m) + cM * nm + km;
+                        for (int cN = 0; cN < fnc(n); ++cN) {
+                          const Real w = wm * fw(fco(n) + cN);
+                          const int Jn = fbs(n) + cN * nn + kn;
+                          Kokkos::atomic_add(
+                              &Ad(abase + static_cast<std::size_t>(I) * naoo + Jn), w);
+                        }
+                      }
+                      // d_x keeps its primitive auxiliary index; it is lifted
+                      // once, after the pass.
                       Kokkos::atomic_add(
                           &Dxd((static_cast<std::size_t>(r) * npert_ + px) * nax + Pg),
                           dv[slot] * dD(r * nn2 + imn));
@@ -1452,42 +1514,135 @@ JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBas
   // ---- assemble: dJ^x = A^x + T gamma_x, gamma_x = M^+ (d_x - M_x gamma) --
   JKDerivResult<Real> res;
   res.nshell = ngrp;
-  res.nao = nao;
+  res.nao = nao_out;
   res.J.resize(nreq);
   res.K.resize(nreq);
-  // gamma_x for every (request, perturbation) first: each is only naux long, so
-  // all of them together are nreq x npert x naux -- negligible beside the output
-  std::vector<Real> gx(static_cast<std::size_t>(nreq) * npert * naux, Real(0));
+  // d_x and M_x gamma were accumulated at PRIMITIVE auxiliary indices; the
+  // metric lives in the contracted space, so lift both before the solve.
+  const auto dxc = lift_aux(dxv), Mxc = lift_aux(Mxg);
+  // gamma_x for every (request, perturbation): each is only nauxc long, so all
+  // of them together are negligible beside the output
+  std::vector<Real> gx(static_cast<std::size_t>(nreq) * npert * nauxc, Real(0));
   for (int r = 0; r < nreq; ++r) {
-    res.J[r].assign(static_cast<std::size_t>(npert) * N, Real(0));
+    res.J[r].assign(static_cast<std::size_t>(npert) * Nout, Real(0));
     for (int x = 0; x < npert; ++x) {
-      std::vector<Real> rhs(naux);
-      const std::size_t b = (static_cast<std::size_t>(r) * npert + x) * naux;
-      for (int P = 0; P < naux; ++P) rhs[P] = dxv[b + P] - Mxg[b + P];
+      std::vector<Real> rhs(nauxc);
+      const std::size_t b = (static_cast<std::size_t>(r) * npert + x) * nauxc;
+      for (int P = 0; P < nauxc; ++P) rhs[P] = dxc[b + P] - Mxc[b + P];
       const auto g = solve(rhs);
-      for (int P = 0; P < naux; ++P) gx[b + P] = g[P];
+      for (int P = 0; P < nauxc; ++P) gx[b + P] = g[P];
     }
   }
-  // pass 2: J^x += T gamma_x, tile loop outermost so the three-centre tensor is
-  // built once per tile for ALL requests and perturbations
-  for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
-    const int A1 = std::min(A0 + aux_tile_shells, nsa);
-    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
-    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+  // pass 2: J^x += T gamma_x, with T in the OUTPUT (contracted) basis on both
+  // orbital indices and the contracted auxiliary index. When a contracted
+  // tensor is supplied it is used whole; otherwise the tile loop is outermost
+  // so the tensor is built once per tile for ALL requests and perturbations.
+  if (Tc) {
     for (int r = 0; r < nreq; ++r)
       for (int x = 0; x < npert; ++x)
-        detail::gemm('N', 'N', static_cast<int>(N), 1, blk, Real(1), Tblk.data(), blk,
-                     gx.data() + (static_cast<std::size_t>(r) * npert + x) * naux + p0, 1,
-                     Real(1), res.J[r].data() + static_cast<std::size_t>(x) * N, 1);
+        detail::gemm('N', 'N', static_cast<int>(Nout), 1, nauxc, Real(1), Tc->data(),
+                     nauxc, gx.data() + (static_cast<std::size_t>(r) * npert + x) * nauxc,
+                     1, Real(1), res.J[r].data() + static_cast<std::size_t>(x) * Nout, 1);
+  } else {
+    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+      const int A1 = std::min(A0 + aux_tile_shells, nsa);
+      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+      for (int r = 0; r < nreq; ++r)
+        for (int x = 0; x < npert; ++x)
+          detail::gemm('N', 'N', static_cast<int>(Nout), 1, blk, Real(1), Tblk.data(), blk,
+                       gx.data() + (static_cast<std::size_t>(r) * npert + x) * nauxc + p0,
+                       1, Real(1), res.J[r].data() + static_cast<std::size_t>(x) * Nout, 1);
+    }
   }
   // add the perturbation-independent term
   for (int r = 0; r < nreq; ++r)
     for (int x = 0; x < npert; ++x) {
-      const std::size_t o = static_cast<std::size_t>(x) * N;
-      const std::size_t ao = (static_cast<std::size_t>(r) * npert + x) * N;
-      for (std::size_t i = 0; i < N; ++i) res.J[r][o + i] += A[ao + i];
+      const std::size_t o = static_cast<std::size_t>(x) * Nout;
+      const std::size_t ao = (static_cast<std::size_t>(r) * npert + x) * Nout;
+      for (std::size_t i = 0; i < Nout; ++i) res.J[r][o + i] += A[ao + i];
     }
   return res;
+}
+
+} // namespace detail
+
+/// Derivative RI Coulomb matrices over primitive shells.
+template <class Real>
+JKDerivResult<Real> ri_j_deriv_build(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                                     const std::vector<JKRequest<Real>> &reqs,
+                                     const TGrid<Real> &grid,
+                                     Real tau_lin = Real(1e-10),
+                                     int aux_tile_shells = 0,
+                                     const std::vector<int> &group = {}) {
+  const int nreq = static_cast<int>(reqs.size());
+  const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
+  std::vector<std::vector<Real>> gam(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    std::vector<Real> d;
+    detail::ri_fit_rhs(orb, aux, reqs[r].D, grid, aux_tile_shells, d);
+    gam[r].assign(aux.nao, Real(0));
+    detail::gemm('N', 'N', aux.nao, 1, aux.nao, Real(1), Minv.data(), aux.nao, d.data(), 1,
+                 Real(0), gam[r].data(), 1);
+  }
+  const std::vector<Real> no_lift; // primitive: the two auxiliary spaces coincide
+  // explicit casts: nullptr alone gives the compiler nothing to deduce Real from
+  return detail::ri_j_deriv_kernel(
+      orb, aux, reqs, grid, aux_tile_shells, group,
+      static_cast<const detail::ShellFanout<Real> *>(nullptr), no_lift, aux.nao, Minv, gam,
+      static_cast<const std::vector<Real> *>(nullptr));
+}
+
+/// Same, over generally-contracted bases. The densities and the result are in
+/// CONTRACTED AOs; the fit is solved in the contracted auxiliary space.
+template <class Real>
+JKDerivResult<Real> ri_j_deriv_build(const ContractedBasis<Real> &orb,
+                                     const ContractedBasis<Real> &aux,
+                                     const std::vector<JKRequest<Real>> &reqs,
+                                     const TGrid<Real> &grid,
+                                     Real tau_lin = Real(1e-10),
+                                     int aux_tile_shells = 0,
+                                     const std::vector<int> &group = {}) {
+  const int nreq = static_cast<int>(reqs.size());
+  const int naoc = orb.nao, nauxc = aux.nao;
+  const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
+  const auto Tc = coulomb_3c(orb, aux, grid); // (MN, P), contracted throughout
+  std::vector<std::vector<Real>> gam(nreq);
+  for (int r = 0; r < nreq; ++r) {
+    std::vector<Real> d;
+    detail::ri_fit_rhs(orb, aux, reqs[r].D, grid, aux_tile_shells, d);
+    gam[r].assign(nauxc, Real(0));
+    detail::gemm('N', 'N', nauxc, 1, nauxc, Real(1), Minv.data(), nauxc, d.data(), 1,
+                 Real(0), gam[r].data(), 1);
+  }
+  ShellBasis<Real> po, pa;
+  const auto fo = detail::expand_contracted(orb, po);
+  const auto fa = detail::expand_contracted(aux, pa);
+  const auto Co = detail::fanout_matrix(fo, po);
+  const auto Ca = detail::fanout_matrix(fa, pa);
+  // densities push DOWN to the primitive space for the derivative pass
+  const int naop = po.nao;
+  std::vector<std::vector<Real>> Dp(nreq);
+  std::vector<JKRequest<Real>> preq(reqs);
+  for (int r = 0; r < nreq; ++r) {
+    std::vector<Real> tmp(static_cast<std::size_t>(naoc) * naop, Real(0));
+    detail::gemm('N', 'N', naoc, naop, naoc, Real(1), reqs[r].D, naoc, Co.data(), naop,
+                 Real(0), tmp.data(), naop);
+    Dp[r].assign(static_cast<std::size_t>(naop) * naop, Real(0));
+    detail::gemm('T', 'N', naop, naop, naoc, Real(1), Co.data(), naop, tmp.data(), naop,
+                 Real(0), Dp[r].data(), naop);
+    preq[r].D = Dp[r].data();
+  }
+  const int ncen = static_cast<int>(po.shells.size()) + static_cast<int>(pa.shells.size());
+  std::vector<int> parent(ncen);
+  for (int i = 0; i < static_cast<int>(po.shells.size()); ++i) parent[i] = fo.parent[i];
+  for (int i = 0; i < static_cast<int>(pa.shells.size()); ++i)
+    parent[static_cast<int>(po.shells.size()) + i] = fo.nsh + fa.parent[i];
+  // the caller's group map is over CONTRACTED centres; compose it with parent
+  std::vector<int> grp2(ncen);
+  for (int i = 0; i < ncen; ++i) grp2[i] = group.empty() ? parent[i] : group[parent[i]];
+  return detail::ri_j_deriv_kernel(po, pa, preq, grid, aux_tile_shells, grp2, &fo, Ca,
+                                   nauxc, Minv, gam, &Tc);
 }
 
 // The RI exchange derivative matrices, absent for a while, are reinstated below
@@ -1976,27 +2131,6 @@ std::vector<Real> ri_k_build_Y(const ContractedBasis<Real> &orb,
          Y.data() + static_cast<std::size_t>(Q) * slab, nvec);
   }
   return Y;
-}
-
-/// M^{-1} alone (no right-hand side), with the same relative eigenvalue cutoff.
-template <class Real, class AuxBasis>
-std::vector<Real> ri_metric_inverse(const AuxBasis &aux, const TGrid<Real> &grid,
-                                    Real tau_lin) {
-  const int naux = aux.nao;
-  auto V = coulomb_2c(aux, grid);
-  std::vector<Real> eval(naux);
-  syevd(naux, V.data(), eval.data());
-  Real emax = 0;
-  for (Real e : eval) emax = std::max(emax, e);
-  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
-  for (int k = 0; k < naux; ++k) {
-    if (eval[k] <= tau_lin * emax) continue;
-    const Real sc = Real(1) / eval[k];
-    for (int R = 0; R < naux; ++R)
-      for (int Q = 0; Q < naux; ++Q)
-        Minv[R * naux + Q] += sc * V[k * naux + R] * V[k * naux + Q];
-  }
-  return Minv;
 }
 
 } // namespace detail
