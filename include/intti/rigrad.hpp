@@ -1705,58 +1705,53 @@ RIGrad<Real> ri_k_gradient_occ(const ShellBasis<Real> &orb, const ShellBasis<Rea
 // nvec x nvec per auxiliary function: their auxiliary index is contracted
 // throughout and only meets M^{-1}, so they need no lift at all.
 
+namespace detail {
+
+/// ri_k_hessian_occ's derivative kernel, over PRIMITIVE shells, with the fit and
+/// the Y intermediate supplied. See the CONTRACTION note above: orbital-side
+/// factors (CL, CR) arrive already pushed DOWN to the primitive space, the
+/// metric inverse stays in the CONTRACTED auxiliary space, and anything that
+/// meets a derivative block at a primitive auxiliary index is LIFTED there with
+/// Ca (nauxc x naux, row-major; empty when the two spaces coincide).
+///
+/// Y is nauxc x nao_primitive x nvec: its auxiliary index is contracted, because
+/// it only ever meets M^{-1}; its orbital index is primitive, because it is
+/// contracted away against CL/CR, which are primitive.
 template <class Real>
-std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
-                                   const Real *CL, const Real *CR, int nvec,
-                                   const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
-                                   int aux_tile_shells = 0, int vec_block = 0) {
+std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
+                                      const ShellBasis<Real> &aux, const Real *CL,
+                                      const Real *CR, int nvec, const std::vector<Real> &Y,
+                                      const std::vector<Real> &Minv,
+                                      const std::vector<Real> &Ca, int nauxc,
+                                      const std::vector<int> &parent, int ngrp,
+                                      const TGrid<Real> &grid, int vec_block) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
-  const int ncen = nso + nsa, dim = 3 * ncen;
-  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  const int dim = 3 * ngrp;
   if (vec_block < 1) vec_block = nvec;
-  const std::size_t N = static_cast<std::size_t>(nao) * nao;
   const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
   const std::size_t vv = static_cast<std::size_t>(nvec) * nvec;
-  auto cshell = [&](bool isaux, int i) { return isaux ? nso + i : i; };
+  auto cshell = [&](bool isaux, int i) { return parent[isaux ? nso + i : i]; };
   const auto ghost = [&](const PrimitiveShell<Real> &sx) { return detail::ghost_shell(sx); };
+  // Lift a contracted-auxiliary-indexed array (nauxc x w) to primitive auxiliary
+  // indices (naux x w) -- the form every object takes when it meets a derivative
+  // block. Identity when the two spaces coincide.
+  auto lift = [&](const std::vector<Real> &A, std::size_t w) {
+    if (Ca.empty()) return A;
+    std::vector<Real> out(static_cast<std::size_t>(naux) * w, Real(0));
+    detail::gemm('T', 'N', naux, static_cast<int>(w), nauxc, Real(1), Ca.data(), naux,
+                 A.data(), static_cast<int>(w), Real(0), out.data(), static_cast<int>(w));
+    return out;
+  };
 
-  auto M = coulomb_2c(aux, grid);
-  std::vector<Real> V = M, eval(naux);
-  detail::syevd(naux, V.data(), eval.data());
-  Real emax = 0;
-  for (Real e : eval) emax = std::max(emax, e);
-  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
-  for (int k = 0; k < naux; ++k) {
-    if (eval[k] <= tau_lin * emax) continue;
-    const Real sc = Real(1) / eval[k];
-    for (int R = 0; R < naux; ++R)
-      for (int Q = 0; Q < naux; ++Q)
-        Minv[R * naux + Q] += sc * V[k * naux + R] * V[k * naux + Q];
-  }
-  // Y, Yhat, Z, W, c2 exactly as in ri_k_gradient_occ
-  std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0));
-  {
-    std::vector<Real> Tq(N);
-    for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
-      const int A1 = std::min(A0 + aux_tile_shells, nsa);
-      const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
-      const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
-      for (int Q = 0; Q < blk; ++Q) {
-        for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = Tblk[mn * blk + Q];
-        detail::gemm('T', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
-                     Y.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
-      }
-    }
-  }
   std::vector<Real> Yh(Y.size(), Real(0));
-  detail::gemm('N', 'N', naux, static_cast<int>(slab), naux, Real(1), Minv.data(), naux,
+  detail::gemm('N', 'N', nauxc, static_cast<int>(slab), nauxc, Real(1), Minv.data(), nauxc,
                Y.data(), static_cast<int>(slab), Real(0), Yh.data(), static_cast<int>(slab));
-  std::vector<Real> Z(static_cast<std::size_t>(naux) * vv, Real(0));
-  std::vector<Real> W(static_cast<std::size_t>(naux) * vv, Real(0));
-  std::vector<Real> Vm(static_cast<std::size_t>(naux) * vv, Real(0)); // V^R[i,j]
-  for (int R = 0; R < naux; ++R) {
+  std::vector<Real> Z(static_cast<std::size_t>(nauxc) * vv, Real(0));
+  std::vector<Real> W(static_cast<std::size_t>(nauxc) * vv, Real(0));
+  std::vector<Real> Vm(static_cast<std::size_t>(nauxc) * vv, Real(0)); // V^R[i,j]
+  for (int R = 0; R < nauxc; ++R) {
     detail::gemm('T', 'N', nvec, nvec, nao, Real(-0.5), CR, nvec,
                  Yh.data() + static_cast<std::size_t>(R) * slab, nvec, Real(0),
                  Z.data() + static_cast<std::size_t>(R) * vv, nvec);
@@ -1769,15 +1764,29 @@ std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis
                  Vm.data() + static_cast<std::size_t>(R) * vv, nvec);
   }
   std::vector<Real> Wp(W.size(), Real(0));
-  for (int T = 0; T < naux; ++T)
+  for (int T = 0; T < nauxc; ++T)
     for (int i2 = 0; i2 < nvec; ++i2)
       for (int j2 = 0; j2 < nvec; ++j2)
         Wp[static_cast<std::size_t>(T) * vv + i2 * nvec + j2] =
             W[static_cast<std::size_t>(T) * vv + j2 * nvec + i2];
-  std::vector<Real> c2(static_cast<std::size_t>(naux) * naux, Real(0));
-  detail::gemm('N', 'T', naux, naux, static_cast<int>(vv), Real(0.25), W.data(),
+  std::vector<Real> c2(static_cast<std::size_t>(nauxc) * nauxc, Real(0));
+  detail::gemm('N', 'T', nauxc, nauxc, static_cast<int>(vv), Real(0.25), W.data(),
                static_cast<int>(vv), Wp.data(), static_cast<int>(vv), Real(0), c2.data(),
-               naux);
+               nauxc);
+  // Objects that meet a derivative block live at PRIMITIVE auxiliary indices.
+  // c2 meets TWO of them (the two-centre second derivative), so it is lifted on
+  // both sides; Z and Vm meet one each.
+  const std::vector<Real> Zp = lift(Z, vv);
+  const std::vector<Real> Vmp = lift(Vm, vv);
+  std::vector<Real> c2p;
+  if (Ca.empty()) {
+    c2p = c2;
+  } else {
+    const auto half = lift(c2, static_cast<std::size_t>(nauxc)); // naux x nauxc
+    c2p.assign(static_cast<std::size_t>(naux) * naux, Real(0));
+    detail::gemm('N', 'N', naux, naux, nauxc, Real(1), half.data(), nauxc, Ca.data(), naux,
+                 Real(0), c2p.data(), naux);
+  }
 
   std::vector<Real> Hess(static_cast<std::size_t>(dim) * dim, Real(0));
   // ---- skeleton terms, factorised c3 (Mode 4) and c2 (Mode 3) -------------
@@ -1802,8 +1811,8 @@ std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis
         jB.add(sh, tg, aux.ao_off[a], 0, aux.ao_off[b]);
       }
     auto clv = detail::to_device(CL, static_cast<std::size_t>(nao) * nvec, "rikh::cl");
-    auto zv = detail::to_device(Z, "rikh::z");
-    auto c2d = detail::to_device(c2, "rikh::c2");
+    auto zv = detail::to_device(Zp, "rikh::z");
+    auto c2d = detail::to_device(c2p, "rikh::c2");
     Kokkos::View<const Real *> none;
     Kokkos::View<Real *> Hd("rikh::H", static_cast<std::size_t>(dim) * dim);
     detail::ri_hess_digest<Real, 4>(jA, posA, grid, none, nao, none, none, none, naux, dim,
@@ -1882,25 +1891,178 @@ std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis
                 for (int ii = 0; ii < ib; ++ii)
                   for (int j = 0; j < nvec; ++j) {
                     Pa[Pidx(xi, QQ, ii, j)] -=
-                        dv * Vm[static_cast<std::size_t>(RR) * vv + (i0 + ii) * nvec + j];
+                        dv * Vmp[static_cast<std::size_t>(RR) * vv + (i0 + ii) * nvec + j];
                     Pb[Pidx(xi, QQ, ii, j)] -=
-                        dv * Vm[static_cast<std::size_t>(RR) * vv + j * nvec + (i0 + ii)];
+                        dv * Vmp[static_cast<std::size_t>(RR) * vv + j * nvec + (i0 + ii)];
                   }
               }
           }
       }
-    // Hess[x][y] += -1/2 sum_{Q,R,i,j} Pa_x[Q,i,j] Minv[Q,R] Pb_y[R,i,j]
-    std::vector<Real> MPb(Pb.size(), Real(0));
+    // Pa and Pb were accumulated at PRIMITIVE auxiliary indices, since that is
+    // what a derivative block carries; M^{-1} lives in the contracted space, so
+    // lift both first: P_c = Ca P_p. (This is the counterpart of r -> r Ca^T in
+    // the Coulomb kernel -- there the free index is the row, here the column.)
     const int inner = static_cast<int>(static_cast<std::size_t>(ib) * nvec);
+    const std::size_t cstride = static_cast<std::size_t>(nauxc) * ib * nvec;
+    std::vector<Real> Pac, Pbc;
+    if (Ca.empty()) {
+      Pac = std::move(Pa);
+      Pbc = std::move(Pb);
+    } else {
+      Pac.assign(static_cast<std::size_t>(dim) * cstride, Real(0));
+      Pbc.assign(static_cast<std::size_t>(dim) * cstride, Real(0));
+      for (int x = 0; x < dim; ++x) {
+        detail::gemm('N', 'N', nauxc, inner, naux, Real(1), Ca.data(), naux,
+                     Pa.data() + static_cast<std::size_t>(x) * pstride, inner, Real(0),
+                     Pac.data() + static_cast<std::size_t>(x) * cstride, inner);
+        detail::gemm('N', 'N', nauxc, inner, naux, Real(1), Ca.data(), naux,
+                     Pb.data() + static_cast<std::size_t>(x) * pstride, inner, Real(0),
+                     Pbc.data() + static_cast<std::size_t>(x) * cstride, inner);
+      }
+    }
+    // Hess[x][y] += -1/2 sum_{Q,R,i,j} Pa_x[Q,i,j] Minv[Q,R] Pb_y[R,i,j]
+    std::vector<Real> MPb(Pbc.size(), Real(0));
     for (int y = 0; y < dim; ++y)
-      detail::gemm('N', 'N', naux, inner, naux, Real(1), Minv.data(), naux,
-                   Pb.data() + static_cast<std::size_t>(y) * pstride, inner, Real(0),
-                   MPb.data() + static_cast<std::size_t>(y) * pstride, inner);
-    detail::gemm('N', 'T', dim, dim, static_cast<int>(pstride), Real(-0.5), Pa.data(),
-                 static_cast<int>(pstride), MPb.data(), static_cast<int>(pstride), Real(1),
+      detail::gemm('N', 'N', nauxc, inner, nauxc, Real(1), Minv.data(), nauxc,
+                   Pbc.data() + static_cast<std::size_t>(y) * cstride, inner, Real(0),
+                   MPb.data() + static_cast<std::size_t>(y) * cstride, inner);
+    detail::gemm('N', 'T', dim, dim, static_cast<int>(cstride), Real(-0.5), Pac.data(),
+                 static_cast<int>(cstride), MPb.data(), static_cast<int>(cstride), Real(1),
                  Hess.data(), dim);
   }
   return Hess;
+}
+
+/// Y^Q_{n,i} = sum_s (n s|Q) C_R[s,i], auxiliary index CONTRACTED, orbital index
+/// primitive. Overloaded on the basis types so the primitive path keeps its
+/// auxiliary tiling; the contracted path uses the mixed (primitive orbital |
+/// contracted auxiliary) tensor, obtained by wrapping the primitive orbital
+/// basis as trivially-contracted shells.
+template <class Real>
+std::vector<Real> ri_k_build_Y(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                               const Real *CR, int nvec, const TGrid<Real> &grid,
+                               int aux_tile_shells) {
+  const int nao = orb.nao, naux = aux.nao;
+  const int nsa = static_cast<int>(aux.shells.size());
+  if (aux_tile_shells < 1) aux_tile_shells = nsa;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
+  std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0)), Tq(N);
+  for (int A0 = 0; A0 < nsa; A0 += aux_tile_shells) {
+    const int A1 = std::min(A0 + aux_tile_shells, nsa);
+    const int p0 = aux.ao_off[A0], blk = aux.ao_off[A1] - p0;
+    const auto Tblk = coulomb_3c_auxblock(orb, aux, grid, A0, A1);
+    for (int Q = 0; Q < blk; ++Q) {
+      for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = Tblk[mn * blk + Q];
+      gemm('T', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
+           Y.data() + static_cast<std::size_t>(p0 + Q) * slab, nvec);
+    }
+  }
+  return Y;
+}
+
+template <class Real>
+std::vector<Real> ri_k_build_Y(const ContractedBasis<Real> &orb,
+                               const ContractedBasis<Real> &aux, const Real *CR, int nvec,
+                               const TGrid<Real> &grid, int) {
+  const int nao = orb.nao, naux = aux.nao;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  const std::size_t slab = static_cast<std::size_t>(nao) * nvec;
+  const auto T = coulomb_3c(orb, aux, grid); // (m n, Q) row-major
+  std::vector<Real> Y(static_cast<std::size_t>(naux) * slab, Real(0)), Tq(N);
+  for (int Q = 0; Q < naux; ++Q) {
+    for (std::size_t mn = 0; mn < N; ++mn) Tq[mn] = T[mn * naux + Q];
+    gemm('T', 'N', nao, nvec, nao, Real(1), Tq.data(), nao, CR, nvec, Real(0),
+         Y.data() + static_cast<std::size_t>(Q) * slab, nvec);
+  }
+  return Y;
+}
+
+/// M^{-1} alone (no right-hand side), with the same relative eigenvalue cutoff.
+template <class Real, class AuxBasis>
+std::vector<Real> ri_metric_inverse(const AuxBasis &aux, const TGrid<Real> &grid,
+                                    Real tau_lin) {
+  const int naux = aux.nao;
+  auto V = coulomb_2c(aux, grid);
+  std::vector<Real> eval(naux);
+  syevd(naux, V.data(), eval.data());
+  Real emax = 0;
+  for (Real e : eval) emax = std::max(emax, e);
+  std::vector<Real> Minv(static_cast<std::size_t>(naux) * naux, Real(0));
+  for (int k = 0; k < naux; ++k) {
+    if (eval[k] <= tau_lin * emax) continue;
+    const Real sc = Real(1) / eval[k];
+    for (int R = 0; R < naux; ++R)
+      for (int Q = 0; Q < naux; ++Q)
+        Minv[R * naux + Q] += sc * V[k * naux + R] * V[k * naux + Q];
+  }
+  return Minv;
+}
+
+} // namespace detail
+
+template <class Real>
+std::vector<Real> ri_k_hessian_occ(const ShellBasis<Real> &orb, const ShellBasis<Real> &aux,
+                                   const Real *CL, const Real *CR, int nvec,
+                                   const TGrid<Real> &grid, Real tau_lin = Real(1e-10),
+                                   int aux_tile_shells = 0, int vec_block = 0) {
+  const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
+  const auto Y = detail::ri_k_build_Y(orb, aux, CR, nvec, grid, aux_tile_shells);
+  const int ncen =
+      static_cast<int>(orb.shells.size()) + static_cast<int>(aux.shells.size());
+  std::vector<int> parent(ncen);
+  for (int i = 0; i < ncen; ++i) parent[i] = i;
+  return detail::ri_k_hessian_kernel(orb, aux, CL, CR, nvec, Y, Minv, {}, aux.nao, parent,
+                                     ncen, grid, vec_block);
+}
+
+/// Same, over generally-contracted orbital and auxiliary bases. CL and CR are
+/// nao_contracted x nvec; the result is indexed by CONTRACTED shell centre.
+template <class Real>
+std::vector<Real> ri_k_hessian_occ(const ContractedBasis<Real> &orb,
+                                   const ContractedBasis<Real> &aux, const Real *CL,
+                                   const Real *CR, int nvec, const TGrid<Real> &grid,
+                                   Real tau_lin = Real(1e-10), int aux_tile_shells = 0,
+                                   int vec_block = 0) {
+  const auto Minv = detail::ri_metric_inverse(aux, grid, tau_lin);
+  ShellBasis<Real> po, pa;
+  const auto fo = detail::expand_contracted(orb, po);
+  const auto fa = detail::expand_contracted(aux, pa);
+  const auto Co = detail::fanout_matrix(fo, po); // nao_c x nao_p
+  const auto Ca = detail::fanout_matrix(fa, pa); // naux_c x naux_p
+  // orbital-side factors push DOWN once: CLp = C^T CL. The density arrives
+  // factorised, so it is the FACTORS that transform, not D by congruence.
+  const int naoc = orb.nao, naop = po.nao;
+  auto pushdown = [&](const Real *X) {
+    std::vector<Real> Xp(static_cast<std::size_t>(naop) * nvec, Real(0));
+    detail::gemm('T', 'N', naop, nvec, naoc, Real(1), Co.data(), naop, X, nvec, Real(0),
+                 Xp.data(), nvec);
+    return Xp;
+  };
+  const auto CLp = pushdown(CL), CRp = pushdown(CR);
+  // Y wants a primitive orbital index and a contracted auxiliary one: wrap the
+  // primitive orbitals as trivially-contracted shells and use the contracted
+  // three-centre builder.
+  std::vector<ContractedShell<Real>> tw;
+  tw.reserve(po.shells.size());
+  for (const auto &sh : po.shells) {
+    ContractedShell<Real> t;
+    t.l = sh.l;
+    for (int k = 0; k < 3; ++k) t.center[k] = sh.center[k];
+    t.alpha = {sh.alpha};
+    t.coeff = {Real(1) / cart_norm_pyscf(sh.l, sh.alpha)};
+    tw.push_back(std::move(t));
+  }
+  const auto pow_ = make_contracted_basis<Real>(std::move(tw));
+  const auto Y = detail::ri_k_build_Y(pow_, aux, CRp.data(), nvec, grid, 0);
+  const int ncen = static_cast<int>(po.shells.size()) + static_cast<int>(pa.shells.size());
+  const int ngrp = fo.nsh + fa.nsh;
+  std::vector<int> parent(ncen);
+  for (int i = 0; i < static_cast<int>(po.shells.size()); ++i) parent[i] = fo.parent[i];
+  for (int i = 0; i < static_cast<int>(pa.shells.size()); ++i)
+    parent[static_cast<int>(po.shells.size()) + i] = fo.nsh + fa.parent[i];
+  return detail::ri_k_hessian_kernel(po, pa, CLp.data(), CRp.data(), nvec, Y, Minv, Ca,
+                                     aux.nao, parent, ngrp, grid, vec_block);
 }
 
 /// Derivative RI EXCHANGE matrices for a factorised density, D = C_L C_R^T.

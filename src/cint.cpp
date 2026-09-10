@@ -376,12 +376,19 @@ extern "C" int intti_ri_hess_jk(double *hj, double *hk, const double *dm,
     // Result stays indexed by CONTRACTED shell, so the caller's shell -> atom
     // fold is unchanged. RI-K has no contracted path yet and is refused rather
     // than answered with the wrong basis.
-    if (hk) return -9;
-    if (!hj || !dm) return -7;
     const auto co = contracted_basis_from(atm, bas, nbas, env);
     const auto ca = contracted_basis_from(aatm, abas, anbas, aenv);
-    const auto H = intti::ri_j_hessian(co, ca, dm, default_grid(), tau_lin);
-    for (std::size_t i = 0; i < dimc * dimc; ++i) hj[i] = H[i];
+    if (hj) {
+      if (!dm) return -7;
+      const auto H = intti::ri_j_hessian(co, ca, dm, default_grid(), tau_lin);
+      for (std::size_t i = 0; i < dimc * dimc; ++i) hj[i] = H[i];
+    }
+    if (hk) {
+      if (!cocc || nvec < 1) return -7;
+      const auto H = intti::ri_k_hessian_occ(co, ca, cocc, cocc, nvec, default_grid(),
+                                             tau_lin);
+      for (std::size_t i = 0; i < dimc * dimc; ++i) hk[i] = H[i];
+    }
     return 0;
   }
   std::vector<double> oscale, ascale;

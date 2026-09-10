@@ -741,7 +741,7 @@ TEST(Contracted, RiJKVsDecontractRecontract) {
 // primitive shells onto their parent contracted shells. As in the RI J/K test,
 // the auxiliary basis must not be decontracted -- that would enlarge the
 // fitting span and legitimately change the answer.
-TEST(Contracted, RiJHessianVsDecontractRecontract) {
+TEST(Contracted, RiHessiansVsDecontractRecontract) {
   auto cb = test_basis();
   const int n = cb.nao;
   auto grid = intti::make_tgrid(intti::coulomb<double>());
@@ -805,6 +805,38 @@ TEST(Contracted, RiJHessianVsDecontractRecontract) {
   EXPECT_LT(worst, 1e-9 * std::max(scale, 1.0)) << "contracted RI-J Hessian != decontracted";
   EXPECT_GT(scale, 1e-2) << "RI-J Hessian trivially zero";
   EXPECT_LT(asym, 1e-9 * (scale + 1)) << "RI-J Hessian must be symmetric";
+
+  // ---- and the exchange Hessian, same reference construction ----------------
+  // The density arrives FACTORISED here, so it is the factors that push down,
+  // not D by congruence: CLp = C^T CL.
+  const int nvec = 2;
+  std::vector<double> CL(static_cast<std::size_t>(n) * nvec);
+  for (int i2 = 0; i2 < n; ++i2)
+    for (int k = 0; k < nvec; ++k)
+      CL[i2 * nvec + k] = 0.3 * std::cos(0.7 * i2 + k) / (1.0 + i2);
+  std::vector<double> CLp(static_cast<std::size_t>(npao) * nvec, 0.0);
+  for (int I = 0; I < n; ++I)
+    for (int j = 0; j < npao; ++j) {
+      const double c = C[static_cast<std::size_t>(I) * npao + j];
+      if (c == 0) continue;
+      for (int k = 0; k < nvec; ++k) CLp[j * nvec + k] += c * CL[I * nvec + k];
+    }
+  auto gotK = intti::ri_k_hessian_occ(cb, ca, CL.data(), CL.data(), nvec, grid, 1e-12);
+  auto Kp = intti::ri_k_hessian_occ(pbc, ca, CLp.data(), CLp.data(), nvec, grid, 1e-12);
+  std::vector<double> refK(static_cast<std::size_t>(dimc) * dimc, 0.0);
+  for (int i2 = 0; i2 < nps + nas; ++i2)
+    for (int e = 0; e < 3; ++e)
+      for (int j = 0; j < nps + nas; ++j)
+        for (int f = 0; f < 3; ++f)
+          refK[(3 * parent[i2] + e) * static_cast<std::size_t>(dimc) + 3 * parent[j] + f] +=
+              Kp[(3 * i2 + e) * static_cast<std::size_t>(dimp) + 3 * j + f];
+  double kworst = 0, kscale = 0;
+  for (std::size_t i2 = 0; i2 < gotK.size(); ++i2) {
+    kworst = std::max(kworst, std::abs(gotK[i2] - refK[i2]));
+    kscale = std::max(kscale, std::abs(refK[i2]));
+  }
+  EXPECT_LT(kworst, 1e-9 * std::max(kscale, 1.0)) << "contracted RI-K Hessian != decontracted";
+  EXPECT_GT(kscale, 1e-3) << "RI-K Hessian trivially zero";
 }
 
 // Symmetry and offset bookkeeping: S is symmetric and its dimension is the sum
