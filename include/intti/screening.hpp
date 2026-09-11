@@ -228,107 +228,415 @@ template <class Real> Real cramer_factor(Real theta, int L) {
 /// are never discarded.
 namespace detail {
 
-/// t_screen_keep with the per-pair E factors already computed.
+/// Largest total Hermite order the full-Gaussian branch will handle; above it
+/// that branch is skipped and the other two stand alone, so exceeding it costs
+/// tightness and never correctness.
 ///
-/// ONE formula, shared with the device kernel in t_screen_batch. They were
-/// briefly different -- this one scanning node by node while the device used the
-/// collective bound -- which meant the same quartet could be screened two ways
-/// depending on which entry point a caller used, and the sweep tests validated
-/// only the host one.
-template <class Real>
-int t_screen_keep_pre(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
-                      const Real *Ea, const Real *Eb, const Real *Fa, const Real *Fb,
-                      const TGrid<Real> &grid, Real eps, int refine = 16) {
-  const int nt = grid.n();
-  const Real pi = pi_v<Real>();
-  const Real kc = Real(1.086435);
-  Real Epref = 1;
-  for (int d = 0; d < 3; ++d) Epref *= Ea[d] * Eb[d];
-  if (!(Epref > Real(0))) return 0;
-  Real R2 = 0;
-  for (int d = 0; d < 3; ++d) {
-    const Real dx = Real(bra.P[d]) - Real(ket.P[d]);
-    R2 += dx * dx;
-  }
-  const int L = bra.la + bra.lb + ket.la + ket.lb;
-  const int nbh = bra.la + bra.lb + 1, nkh = ket.la + ket.lb + 1;
-  const Real p = bra.p, q = ket.p;
-  const Real mu = p * q / (p + q);
-  const Real pr = pi / std::sqrt(p * q);
-  const Real pref3 = pr * pr * pr;
-  Real wsum = 0;
-  for (int i = 0; i < nt; ++i) wsum += std::abs(grid.w[i]);
+/// 21 covers (hh|hh), i.e. every quartet a real basis set produces -- g appears
+/// in quadruple-zeta sets and h in quintuple. LMAX is 8, so a pathological
+/// (ll|ll) would reach 33; the fallback handles it. The cost of the choice is
+/// stack: 3*21 + 21 doubles of per-thread scratch, against the 5.8 KB the
+/// J-build kernel already carries.
+inline constexpr int TSCR_NMAX = 21;
 
-  // (a) factorised, (b) per Hermite order -- see t_screen_batch for the algebra
-  Real best = 0, pw = 1, fact = 1;
-  const Real smu = std::sqrt(2 * mu);
-  for (int m = 0; m <= L; ++m) {
-    if (m > 0) {
-      pw *= smu;
-      fact *= std::sqrt(Real(m));
+/// Per-direction coefficients of the full-Gaussian Hermite bound, as a
+/// polynomial in theta.
+///
+/// This is the other half of the story Cramer's inequality tells. Cramer bounds
+/// |H_n(u)| by k 2^{n/2} sqrt(n!) e^{u^2/2}, which is sharp near u ~ sqrt(n) but
+/// spends HALF THE GAUSSIAN to do it: |B_n(theta,X)| <= k (2 theta)^{n/2}
+/// sqrt(n!) e^{-theta X^2/2} keeps only e^{-theta X^2/2} where the true object
+/// decays as e^{-theta X^2}. For a distant pair that missing half IS the
+/// estimate -- at theta R^2/2 = 37, measured on a diffuse f-shell quartet at
+/// R = 20, it is a factor e^{37} = 1e16, and it was the largest single source of
+/// slack left in the bound.
+///
+/// Bounding |H_n| by its own all-positive coefficients instead keeps
+/// e^{-theta X^2} intact at the price of a polynomial in |u|:
+///   |H_n(u)| <= G_n(|u|),  G_0 = 1, G_n = 2u G_{n-1} + 2(n-1) G_{n-2},
+/// and substituting u = sqrt(theta) a collapses the whole per-direction factor
+/// to a polynomial in theta alone,
+///   sum_n c_n theta^{n/2} G_n(sqrt(theta) a) = sum_k b_k theta^k,
+///   b_k = sum_{n=k}^{min(2k,N)} c_n n!/((n-k)! (2k-n)!) (2a)^{2k-n},
+/// which is what this returns. Writing it in theta matters: every term is then
+/// theta^k e^{-theta a^2}, whose peak in theta is known exactly, and that is
+/// what lets the tail be charged at the right place instead of at saturation.
+///
+/// c is the convolution of the bra and ket per-order E masses (the coupling
+/// runs over B_{tau_bra + tau_ket}), and the recurrences avoid dividing by a,
+/// so a = 0 is not special-cased.
+template <class Real>
+KOKKOS_INLINE_FUNCTION void t_screen_bpoly(const Real *c, int n1, Real a, Real *b) {
+  for (int k = 0; k < n1; ++k) b[k] = 0;
+  const Real a2 = 2 * a, a4 = a2 * a2;
+  for (int n = 0; n < n1; ++n) {
+    if (!(c[n] > Real(0))) continue;
+    const int mmax = n / 2;
+    // T = n!/(m! j!) (2a)^j at m = mmax, j = n - 2 mmax (0 or 1)
+    Real T = 1;
+    for (int f = mmax + 1; f <= n; ++f) T *= Real(f); // n!/mmax!
+    int j = n - 2 * mmax;
+    if (j == 1) T *= a2;
+    for (int m = mmax; m >= 0; --m) {
+      b[n - m] += c[n] * T;
+      if (m == 0) break;
+      // step to (m-1, j+2): T *= m (2a)^2 / ((j+1)(j+2))
+      T *= Real(m) * a4 / (Real(j + 1) * Real(j + 2));
+      j += 2;
     }
-    best = std::max(best, pw * fact);
   }
-  const Real A_fac = pref3 * kc * kc * kc * best * wsum * Epref;
-  const Real s4 = std::sqrt(4 * mu);
-  Real A_ord = pref3 * kc * kc * kc * wsum;
+}
+
+/// The Cramer-derived Hermite factor at a GIVEN theta, without the prefactor:
+/// min of the factorised bound (max_m (2 theta)^{m/2} sqrt(m!) against the whole
+/// E mass) and the per-order one (each order weighted by its own E mass).
+template <class Real>
+KOKKOS_INLINE_FUNCTION Real t_screen_phi(Real th, Real Epref, int L, int nbh, int nkh,
+                                         const Real *Fb, const Real *Fk) {
+  Real bf = 0, fact = 1, pw = 1;
+  const Real s2 = sqrt_(2 * th);
+  for (int m = 0; m <= L; ++m) {
+    if (m > 0) { pw *= s2; fact *= sqrt_(Real(m)); }
+    const Real v = pw * fact;
+    if (v > bf) bf = v;
+  }
+  bf *= Epref;
+  Real bo = 1;
+  const Real s4 = sqrt_(4 * th);
   for (int d = 0; d < 3; ++d) {
     Real gb = 0, pwb = 1, fb = 1;
     for (int n = 0; n < nbh; ++n) {
-      if (n > 0) { pwb *= s4; fb *= std::sqrt(Real(n)); }
-      gb += Fa[d * nbh + n] * fb * pwb;
+      if (n > 0) { pwb *= s4; fb *= sqrt_(Real(n)); }
+      gb += Fb[d * nbh + n] * fb * pwb;
     }
     Real gk = 0, pwk = 1, fk = 1;
     for (int n = 0; n < nkh; ++n) {
-      if (n > 0) { pwk *= s4; fk *= std::sqrt(Real(n)); }
-      gk += Fb[d * nkh + n] * fk * pwk;
+      if (n > 0) { pwk *= s4; fk *= sqrt_(Real(n)); }
+      gk += Fk[d * nkh + n] * fk * pwk;
     }
-    A_ord *= gb * gk;
+    bo *= gb * gk;
   }
-  const Real C = std::min(A_fac, A_ord);
+  return bf < bo ? bf : bo;
+}
 
-  if (!(C > eps)) return 0;
-  if (!(R2 > Real(0))) return nt;
-  const Real thstar = 2 * std::log(C / eps) / R2;
-  if (thstar >= mu) return nt;
-  const Real den = p * q - thstar * (p + q);
-  if (!(den > Real(0))) return nt;
-  const Real t2star = thstar * p * q / den;
+/// Largest the product pref^3(u) * Phi(theta(u)) can be anywhere on the tail
+/// u >= ui, where Phi is the Cramer-derived Hermite factor. Both branches are
+/// rigorous upper bounds; the smaller wins. Epref (the total E mass) belongs to
+/// the factorised branch only -- the per-order branch carries its E mass inside
+/// the F arrays.
+template <class Real>
+KOKKOS_INLINE_FUNCTION Real t_screen_M(Real ui, Real pq, Real ps, Real mu, Real Epref,
+                                       int L, int nbh, int nkh, const Real *Fb,
+                                       const Real *Fk, Real uord) {
+  const Real pi = pi_v<Real>();
+  // (a) FACTORISED: max_m (2 theta)^{m/2} sqrt(m!) against the whole E mass.
+  //     Each order m is charged at its OWN peak max(ui, m mu/3) -- past that
+  //     point the term decays, so charging it at saturation was pure slack.
+  Real Mfac = 0, fact = 1;
+  for (int m = 0; m <= L; ++m) {
+    if (m > 0) fact *= sqrt_(Real(m));
+    const Real upk = Real(m) * mu / 3;
+    const Real um = ui > upk ? ui : upk;
+    const Real D = pq + um * ps;
+    const Real pr = pi / sqrt_(D);
+    const Real sc = sqrt_(2 * um * pq / D);
+    Real v = pr * pr * pr * fact * Epref;
+    for (int j = 0; j < m; ++j) v *= sc;
+    if (v > Mfac) Mfac = v;
+  }
+  // (b) PER ORDER: each Hermite order weighted by its own E mass, which is far
+  //     tighter at high angular momentum -- (a) charges sqrt(L!), 21886 at
+  //     L = 12, against E mass that is not there. The six polynomial factors
+  //     multiply out to total degree Nord, so the product may be charged at
+  //     theta(ui) only once ui is past the last peak, uord = Nord mu / 3;
+  //     below that the prefactor still moves but Phi is held at saturation.
+  const Real D = pq + ui * ps;
+  const Real pr = pi / sqrt_(D);
+  const Real thu = (ui >= uord) ? ui * pq / D : mu;
+  Real Mord = pr * pr * pr;
+  const Real s4 = sqrt_(4 * thu);
+  for (int d = 0; d < 3; ++d) {
+    Real gb = 0, pwb = 1, fb = 1;
+    for (int n = 0; n < nbh; ++n) {
+      if (n > 0) { pwb *= s4; fb *= sqrt_(Real(n)); }
+      gb += Fb[d * nbh + n] * fb * pwb;
+    }
+    Real gk = 0, pwk = 1, fk = 1;
+    for (int n = 0; n < nkh; ++n) {
+      if (n > 0) { pwk *= s4; fk *= sqrt_(Real(n)); }
+      gk += Fk[d * nkh + n] * fk * pwk;
+    }
+    Mord *= gb * gk;
+  }
+  return Mfac < Mord ? Mfac : Mord;
+}
+
+/// Upper bound on everything node i and beyond can contribute.
+///
+/// TWO independent factorisations of the same sum, both rigorous, smaller wins:
+///
+///  (1) WEIGHT x PEAK.  sum_j |w_j| <= W(i) times the largest the integrand
+///      pref^3 Phi can be anywhere on the tail. Good when Phi climbs fast --
+///      high angular momentum -- because each order is charged at its own peak.
+///
+///  (2) WEIGHTED PREFACTOR x SATURATION.  Phi is held at its saturating value
+///      Phi(mu) and the PREFACTOR is summed node by node, which is where this
+///      one wins: (1) charges pref^3 at its largest value against every weight
+///      in the tail, and most of that weight sits where pref^3 is orders of
+///      magnitude smaller. At l = 0, where Phi == 1 and there is no angular
+///      momentum in play at all, that single substitution was the whole
+///      remaining slack -- a measured factor of 2e4 to 5e5.
+///
+///      The node sum is closed-form because pref^3(u) = pi^3 (p+q)^{-3/2}
+///      (mu + u)^{-3/2}, and (mu + u)^{-3/2} <= max(mu, u)^{-3/2}, which is
+///      mu^{-3/2} below t^2 = mu and t^{-3} above it. So with W and V the
+///      suffix sums of |w| and |w|/t^3, and jm the first node past t^2 = mu,
+///        sum_{j>=i} |w_j| pref^3(u_j)
+///          <= pi^3 (p+q)^{-3/2} [ mu^{-3/2} (W(i) - W(m)) + V(m) ],  m = max(i, jm).
+///      The substitution costs at most 2^{3/2} = 2.83 (at t^2 = mu exactly,
+///      where max(mu,u) = mu but mu + u = 2mu), uniformly -- a bounded 2.8x for
+///      an unbounded 1e5x.
+///  (3) FULL GAUSSIAN.  The same weighted prefactor sum as (2), but with the
+///      Hermite factor bounded by t_screen_bpoly, which keeps e^{-theta R^2}
+///      instead of e^{-theta R^2/2}. Its polynomial is bigger than Cramer's near
+///      contact and irrelevant beside a squared exponential once the pairs are
+///      apart -- which is the case screening exists for.
+///
+///      Per direction the factor is sum_k b_k theta^k e^{-theta a^2}, and EACH
+///      TERM is charged at its own constrained peak,
+///        max_{theta in [theta_i, mu]} theta^k e^{-theta a^2}
+///          at theta_k* = clamp(k / a^2, theta_i, mu),
+///      which is the last instance of the mistake this bound kept making --
+///      charging the polynomial at one end of the grid and the exponential at
+///      the other. The three cases (past peak, at peak, short of peak) split the
+///      k range into three contiguous pieces, so one pass and two exponentials
+///      per direction cover it; only the middle piece needs a power, and it is
+///      usually narrow or empty. `bv` null means the caller skipped the branch.
+template <class Real>
+KOKKOS_INLINE_FUNCTION Real t_screen_tail(int i, Real p, Real qq, Real R2, Real Epref,
+                                          int L, int nbh, int nkh, const Real *Fb,
+                                          const Real *Fk, const Real *tv,
+                                          const Real *wsuf, const Real *vsuf, int jm,
+                                          Real phimu, const Real *bv, int n1,
+                                          const Real *ax, int nt, Real uord) {
+  if (i >= nt) return Real(0);
+  const Real kc = Real(1.086435);
+  const Real k3 = kc * kc * kc;
+  const Real pi = pi_v<Real>();
+  const Real pq = p * qq, ps = p + qq, mu = pq / ps;
+  const Real ui = tv[i] * tv[i];
+  const Real th = ui * pq / (pq + ui * ps);
+
+  const Real b1 = wsuf[i] * t_screen_M(ui, pq, ps, mu, Epref, L, nbh, nkh, Fb, Fk, uord);
+
+  const int m = i > jm ? i : jm;
+  const Real rps = Real(1) / sqrt_(ps);
+  const Real rmu = Real(1) / sqrt_(mu);
+  const Real pre = pi * pi * pi * rps * rps * rps;
+  const Real S = pre * (rmu * rmu * rmu * (wsuf[i] - wsuf[m]) + vsuf[m]);
+  const Real b2 = S * phimu;
+
+  Real best = k3 * (b1 < b2 ? b1 : b2) * exp_(-th * R2 / 2);
+  if (bv != nullptr) {
+    const Real ee = exp_(Real(1));
+    Real b3 = S;
+    for (int d = 0; d < 3; ++d) {
+      const Real a2 = ax[d] * ax[d];
+      const Real *bd = bv + d * TSCR_NMAX;
+      const Real klo = th * a2, khi = mu * a2;
+      const Real eth = exp_(-th * a2), emu = exp_(-mu * a2);
+      Real acc = 0, thp = 1, mup = 1;
+      for (int k = 0; k < n1; ++k) {
+        if (k > 0) {
+          thp *= th;
+          mup *= mu;
+        }
+        const Real kk = Real(k);
+        if (kk <= klo)
+          acc += bd[k] * thp * eth;
+        else if (kk >= khi)
+          acc += bd[k] * mup * emu;
+        else {
+          const Real r = kk / (a2 * ee);
+          Real v = bd[k];
+          for (int j = 0; j < k; ++j) v *= r;
+          acc += v;
+        }
+      }
+      b3 *= acc;
+    }
+    if (b3 < best) best = b3;
+  }
+  return best;
+}
+
+/// THE t-screening estimate -- ONE implementation, called from both the host
+/// entry (t_screen_keep_pre) and the device kernel (t_screen_batch). They were
+/// briefly two, which meant the same quartet could be screened two ways
+/// depending on which entry point a caller used, and the sweep tests validated
+/// only the host one.
+///
+/// Returns how many leading t nodes must be evaluated for the discarded
+/// remainder to stay under eps.
+///
+/// WHAT IS BOUNDED. Node j contributes, per Cartesian direction, a factor
+/// w_j (pi/sqrt(D_j)) B_n(theta_j, X) with D_j = pq + t_j^2 (p+q) and
+/// theta_j = t_j^2 pq / D_j, and Cramer's inequality gives
+///   |B_n(theta, X)| <= k (2 theta)^{n/2} sqrt(n!) e^{-theta X^2/2}, k = 1.086435.
+/// Collecting the three directions, the tail from node i onward is at most
+///   T(i) = k^3 W(i) M(i) e^{-theta_i R^2/2},  W(i) = sum_{j>=i} |w_j|,
+/// with M as in t_screen_M. Every factor is nonincreasing in i, so the smallest
+/// i with T(i) <= eps is found by bisection: 6 evaluations at nt = 64.
+///
+/// WHY M IS TAKEN AT THE TRUNCATION POINT, which is the tightening. The earlier
+/// form bounded M's two factors at OPPOSITE ends of the grid -- the prefactor at
+/// D >= pq (its t = 0 value) and the Hermite factor at theta <= mu (its t = inf
+/// value). No node is at both, and that gap was most of the nine orders of
+/// unused budget this used to carry. Two facts close it: pref^3 is decreasing in
+/// u, so on the tail it is at most its value at u_i; and a term of order N rides
+/// theta^{N/2}, whose product with pref^3 is UNIMODAL in u with its peak at
+/// u = N mu / 3 (set d/du of (N/2) ln u - (N+3)/2 ln D to zero), so past the
+/// peak it may be charged at u_i rather than at saturation.
+///
+/// A consequence worth naming: T(i) now falls with i even at R = 0, because the
+/// prefactor and the weights decay on their own. Coincident-centre quartets --
+/// which a distance-only bound can never truncate, and which are exactly the
+/// compact high-L case -- are screened like any other.
+template <class Real>
+KOKKOS_INLINE_FUNCTION int
+t_screen_scan(Real p, Real qq, const Real *X, Real Epref, int L, int nbh, int nkh,
+              const Real *Fb, const Real *Fk, const Real *tv, const Real *wv,
+              const Real *wsuf, const Real *vsuf, int nt, Real eps, int refine) {
+  const Real kc = Real(1.086435);
+  const Real k3 = kc * kc * kc;
+  const Real pi = pi_v<Real>();
+  const Real pq = p * qq, ps = p + qq, mu = pq / ps;
+  const Real uord = Real(3 * (nbh - 1) + 3 * (nkh - 1)) * mu / 3;
+  Real R2 = 0, ax[3];
+  for (int d = 0; d < 3; ++d) {
+    ax[d] = X[d] < Real(0) ? -X[d] : X[d];
+    R2 += X[d] * X[d];
+  }
+  // quartet invariants, hoisted out of the bisection
+  const Real phimu = t_screen_phi(mu, Epref, L, nbh, nkh, Fb, Fk);
+  // Per-direction convolution of the bra and ket E masses: the coupling in
+  // direction d runs over B_{tau_b + tau_k}, so the coefficient of total order n
+  // is sum_{a+b=n} F^bra_a F^ket_b. Built ONCE here rather than inside the
+  // bisection, which is what keeps the third branch to O(L) per evaluation.
+  const int n1 = nbh + nkh - 1;
+  const bool use_g = n1 <= TSCR_NMAX;
+  Real bv[3 * TSCR_NMAX];
+  if (use_g) {
+    Real cv[TSCR_NMAX];
+    for (int d = 0; d < 3; ++d) {
+      for (int n = 0; n < n1; ++n) cv[n] = 0;
+      for (int a = 0; a < nbh; ++a)
+        for (int b = 0; b < nkh; ++b) cv[a + b] += Fb[d * nbh + a] * Fk[d * nkh + b];
+      t_screen_bpoly(cv, n1, ax[d], &bv[d * TSCR_NMAX]);
+    }
+  }
+  const Real *bvp = use_g ? bv : nullptr;
+  int jm = 0, jhi = nt; // first node with t^2 > mu
+  while (jm < jhi) {
+    const int mid = (jm + jhi) / 2;
+    if (tv[mid] * tv[mid] > mu)
+      jhi = mid;
+    else
+      jm = mid + 1;
+  }
+
   int lo = 0, hi = nt;
   while (lo < hi) {
     const int mid = (lo + hi) / 2;
-    if (grid.t[mid] * grid.t[mid] > t2star)
+    if (t_screen_tail(mid, p, qq, R2, Epref, L, nbh, nkh, Fb, Fk, tv, wsuf, vsuf, jm,
+                      phimu, bvp, n1, ax, nt, uord) <= eps)
       hi = mid;
     else
       lo = mid + 1;
   }
-  // capped refinement, identical to the device kernel -- see t_screen_batch
-  if (lo > 0 && refine > 0) {
-    const Real tl = grid.t[lo];
-    const Real Tc =
-        C * std::exp(-((tl * tl * p * q) / (p * q + tl * tl * (p + q))) * R2 / 2);
-    Real S = 0;
-    int i = lo - 1;
-    const int stop = std::max(lo - refine, 0);
-    for (; i >= stop; --i) {
-      const Real t = grid.t[i];
-      const Real D = p * q + t * t * (p + q);
-      const Real th = t * t * p * q / D;
-      Real bb = 0, pwb = 1, fb = 1;
-      const Real sth = std::sqrt(2 * th);
-      for (int m = 0; m <= L; ++m) {
-        if (m > 0) { pwb *= sth; fb *= std::sqrt(Real(m)); }
-        bb = std::max(bb, pwb * fb);
+  if (lo == 0 || refine <= 0) return lo;
+
+  // REFINE. The closed form still charges the whole tail against one bounding
+  // node; walking down from its answer and accumulating the EXACT per-node
+  // bound recovers the rest, and stays rigorous because everything at or above
+  // `lo` is already covered by T(lo). Capped, so the cost is O(refine) rather
+  // than the O(nt) node-by-node scan this replaced.
+  const Real Tc = t_screen_tail(lo, p, qq, R2, Epref, L, nbh, nkh, Fb, Fk, tv, wsuf,
+                                vsuf, jm, phimu, bvp, n1, ax, nt, uord);
+  Real S = 0;
+  int i = lo - 1;
+  const int stop = lo - refine > 0 ? lo - refine : 0;
+  for (; i >= stop; --i) {
+    const Real u = tv[i] * tv[i];
+    const Real D = pq + u * ps;
+    const Real th = u * pq / D;
+    const Real pr = pi / sqrt_(D);
+    // at this node's exact theta -- a single node needs no peak argument
+    const Real wabs = wv[i] < Real(0) ? -wv[i] : wv[i];
+    const Real pr3 = pr * pr * pr;
+    Real b = wabs * pr3 * k3 * t_screen_phi(th, Epref, L, nbh, nkh, Fb, Fk) *
+             exp_(-th * R2 / 2);
+    if (use_g) {
+      Real g = 1;
+      for (int d = 0; d < 3; ++d) {
+        const Real *bd = &bv[d * TSCR_NMAX];
+        Real acc = 0, thp = 1;
+        for (int k = 0; k < n1; ++k) {
+          if (k > 0) thp *= th;
+          acc += bd[k] * thp;
+        }
+        g *= acc * exp_(-th * ax[d] * ax[d]);
       }
-      const Real prd = pi / std::sqrt(D);
-      const Real b = std::abs(grid.w[i]) * prd * prd * prd * Epref * kc * kc * kc * bb *
-                     std::exp(-th * R2 / 2);
-      if (S + b + Tc > eps) break;
-      S += b;
+      const Real bg = wabs * pr3 * g;
+      if (bg < b) b = bg;
     }
-    lo = i + 1;
+    if (S + b + Tc > eps) break;
+    S += b;
   }
-  return lo;
+  return i + 1;
+}
+
+/// t_screen_keep with the per-pair E factors already computed.
+///
+/// `wsuf` holds the suffix sums sum_{j>=i} |w_j| of the grid weights -- the
+/// caller builds it once rather than paying O(nt) per quartet for what used to
+/// be a single total. Using the SUFFIX is itself a small tightening: the old
+/// form charged the whole grid's weight against a tail that starts partway up.
+template <class Real>
+int t_screen_keep_pre(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
+                      const Real *Ea, const Real *Eb, const Real *Fa, const Real *Fb,
+                      const TGrid<Real> &grid, const Real *wsuf, const Real *vsuf,
+                      Real eps, int refine = 16) {
+  Real Epref = 1;
+  for (int d = 0; d < 3; ++d) Epref *= Ea[d] * Eb[d];
+  if (!(Epref > Real(0))) return 0;
+  Real X[3];
+  for (int d = 0; d < 3; ++d) X[d] = Real(bra.P[d]) - Real(ket.P[d]);
+  return t_screen_scan<Real>(bra.p, ket.p, X, Epref, bra.la + bra.lb + ket.la + ket.lb,
+                             bra.la + bra.lb + 1, ket.la + ket.lb + 1, Fa, Fb,
+                             grid.t.data(), grid.w.data(), wsuf, vsuf, grid.n(), eps,
+                             refine);
+}
+
+/// The two suffix sums t_screen_scan needs: W(i) = sum_{j>=i} |w_j| and
+/// V(i) = sum_{j>=i} |w_j| / t_j^3. Both are built once per grid.
+///
+/// W keeps an (nt+1)-th entry of zero so the tail bound can difference it
+/// without a bounds check. V is only ever read at indices past t^2 = mu > 0,
+/// so its small-t entries are never used; they are floored anyway rather than
+/// left to overflow on a grid whose first node is near zero.
+template <class Real>
+std::pair<std::vector<Real>, std::vector<Real>> weight_suffix(const TGrid<Real> &grid) {
+  const int nt = grid.n();
+  std::vector<Real> w(nt + 1, Real(0)), v(nt + 1, Real(0));
+  const Real tiny = Real(1e-8);
+  for (int i = nt - 1; i >= 0; --i) {
+    const Real wa = grid.w[i] < Real(0) ? -grid.w[i] : grid.w[i];
+    const Real t = grid.t[i] > tiny ? grid.t[i] : tiny;
+    w[i] = w[i + 1] + wa;
+    v[i] = v[i + 1] + wa / (t * t * t);
+  }
+  return {std::move(w), std::move(v)};
 }
 
 } // namespace detail
@@ -344,7 +652,9 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
   std::vector<Real> Fa(3 * (bra.la + bra.lb + 1)), Fb(3 * (ket.la + ket.lb + 1));
   detail::pair_e_absmax_n(bra, Fa.data());
   detail::pair_e_absmax_n(ket, Fb.data());
-  return detail::t_screen_keep_pre(bra, ket, Ea, Eb, Fa.data(), Fb.data(), grid, eps);
+  const auto [wsuf, vsuf] = detail::weight_suffix(grid);
+  return detail::t_screen_keep_pre(bra, ket, Ea, Eb, Fa.data(), Fb.data(), grid,
+                                   wsuf.data(), vsuf.data(), eps);
 }
 
 
@@ -451,11 +761,24 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   //     worst loss          6.9e-12   -> 7.4e-20  (of a 1e-11 budget)
   //     pre-filter nout     14.2%     -> 17.4%
   //
-  // Nine orders of unused budget: the collective bound charges F(mu), the
-  // largest theta, against every node including the small-t ones that dominate
-  // the sum. Weighting each Hermite order by its own E mass (the A_ord branch)
-  // was added to recover high-L tightness and does not close this -- the
-  // looseness is the mu substitution, not the L factor.
+  // That nine orders of unused budget is now largely closed -- see
+  // t_screen_scan and t_screen_tail for the three bounds that did it. What the
+  // tightening bought, on identical systems, is node work:
+  //
+  //     SOC chain, 5 / 7 / 9 centres    0.651 / 0.524 / 0.450  ->  0.491 / 0.376 / 0.323
+  //     ERI chain, 6 / 10 / 16 centres  0.672 / 0.263 / 0.090  ->  0.454 / 0.165 / 0.057
+  //
+  // and against a brute-force ideal (the smallest truncation that actually
+  // stays under eps, found by bisection on a 60-quartet probe spanning l <= 3,
+  // alpha over two decades and R from 0 to 20), waste fell from 17.6% of the
+  // grid to 7.7%, worst case 11.5x to 9.0x.
+  //
+  // A NOTE ON WHAT eps BUYS. It is a PER-QUARTET budget -- the same convention
+  // as the Schwarz tolerance elsewhere in the library -- so an output element
+  // that sums N quartets is guaranteed only N eps. That was always true; it
+  // became visible only once the estimate was tight enough to actually spend
+  // what it was given, which is why two n-centre tests had to be restated
+  // rather than the bound loosened.
   //
   // RECOVERED by the capped refinement walk below: the closed form gives a valid
   // starting index, then the walk accumulates the EXACT per-node bound downward
@@ -507,9 +830,9 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   }
   auto dqb = detail::to_device(hqb, "tscr::qb"), dqk = detail::to_device(hqk, "tscr::qk");
   auto tv = grid.t_dev, wv = grid.w_dev;
-  Real wsum_h = 0;
-  for (int i = 0; i < nt; ++i) wsum_h += std::abs(grid.w[i]);
-  const Real wsum = wsum_h;
+  const auto wvpair = detail::weight_suffix(grid);
+  auto wsv = detail::to_device(wvpair.first, "tscr::wsuf");
+  auto vsv = detail::to_device(wvpair.second, "tscr::vsuf");
   auto keep = batch.keep;
   auto ampv = amp;
   const Real eps0 = eps;
@@ -519,139 +842,20 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   Kokkos::parallel_for(
       "intti::tscreen", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int q) {
         const int ib = dqb(q), ik = dqk(q);
-        const Real eps = ampv.extent(0) ? eps0 / ampv(q) : eps0;
+        const Real epsq = ampv.extent(0) ? eps0 / ampv(q) : eps0;
         Real Epref = 1;
         for (int d = 0; d < 3; ++d) Epref *= dE(3 * ib + d) * dE(3 * ik + d);
         if (!(Epref > Real(0))) {
           keep(q) = 0;
           return;
         }
+        Real X[3];
+        for (int d = 0; d < 3; ++d) X[d] = dP(3 * ib + d) - dP(3 * ik + d);
         const int nbh = dla(ib) + dlb(ib) + 1, nkh = dla(ik) + dlb(ik) + 1;
-        Real R2 = 0;
-        for (int d = 0; d < 3; ++d) {
-          const Real dx = dP(3 * ib + d) - dP(3 * ik + d);
-          R2 += dx * dx;
-        }
-        const int L = dla(ib) + dlb(ib) + dla(ik) + dlb(ik);
-        const Real p = dp(ib), qq = dp(ik);
-        // The discarded tail is bounded COLLECTIVELY rather than summed term by
-        // term, which turns an O(nt) walk with ~450 transcendentals into O(1):
-        //
-        //   sum_{j>=i} w_j (pi/sqrt(D_j)) F(theta_j) e^{-theta_j R^2/2}
-        //     <= e^{-theta_i R^2/2} * (pi/sqrt(pq)) * F(mu) * sum_j |w_j|
-        //
-        // using theta_j increasing (so the exponential is largest at j = i),
-        // D_j >= pq, theta_j <= mu = pq/(p+q), and F increasing in theta. Every
-        // step is an upper bound, so the result is still rigorous -- just looser,
-        // which costs some truncation depth and buys the whole scan.
-        const Real mu = p * qq / (p + qq);
-        // pref^3, one power per Cartesian direction (see the host path)
-        const Real pr = pi / sqrt_(p * qq);
-        const Real pref3 = pr * pr * pr;
-
-        // (a) FACTORISED: max_n |B_n| charged against the whole E mass.
-        Real best = 0, pw = 1, fact = 1;
-        const Real smu = sqrt_(2 * mu);
-        for (int m = 0; m <= L; ++m) {
-          if (m > 0) {
-            pw *= smu;
-            fact *= sqrt_(Real(m));
-          }
-          const Real v = pw * fact;
-          if (v > best) best = v;
-        }
-        const Real A_fac = pref3 * kc * kc * kc * best * wsum * Epref;
-
-        // (b) PER ORDER: weight each Hermite order by its own E mass. Using
-        //     sqrt((ta+tb)!) <= sqrt(ta!) sqrt(tb!) 2^{(ta+tb)/2} the double sum
-        //     factorises into one polynomial per pair per direction,
-        //       G(theta) = sum_n F_n sqrt(n!) (4 theta)^{n/2},
-        //     which is far tighter at high angular momentum: (a) charges
-        //     sqrt(L!) -- 21886 at L = 12 -- against E mass that is not there.
-        const Real s4 = sqrt_(4 * mu);
-        Real A_ord = pref3 * kc * kc * kc * wsum;
-        for (int d = 0; d < 3; ++d) {
-          Real gb = 0, pwb = 1, fb = 1;
-          for (int n = 0; n < nbh; ++n) {
-            if (n > 0) { pwb *= s4; fb *= sqrt_(Real(n)); }
-            gb += dEn(dEoff(ib) + d * nbh + n) * fb * pwb;
-          }
-          Real gk = 0, pwk = 1, fk = 1;
-          for (int n = 0; n < nkh; ++n) {
-            if (n > 0) { pwk *= s4; fk *= sqrt_(Real(n)); }
-            gk += dEn(dEoff(ik) + d * nkh + n) * fk * pwk;
-          }
-          A_ord *= gb * gk;
-        }
-        // both are valid upper bounds, so use the smaller
-        const Real C = A_fac < A_ord ? A_fac : A_ord;
-        if (!(C > eps)) { // even the whole tail is negligible
-          keep(q) = 0;
-          return;
-        }
-        if (!(R2 > Real(0))) { // coincident centres: no distance decay to exploit
-          keep(q) = nt;
-          return;
-        }
-        // need theta_i > theta* for the tail beyond i to fall under eps
-        const Real thstar = 2 * log_(C / eps) / R2;
-        if (thstar >= mu) { // theta saturates below the threshold: keep all
-          keep(q) = nt;
-          return;
-        }
-        // theta(t) > thstar  <=>  t^2 > thstar pq / (pq - thstar (p+q))
-        const Real den = p * qq - thstar * (p + qq);
-        if (!(den > Real(0))) {
-          keep(q) = nt;
-          return;
-        }
-        const Real t2star = thstar * p * qq / den;
-        // keep the nodes with t^2 <= t2star; grid.t is ascending
-        int lo = 0, hi = nt; // first index with t^2 > t2star
-        while (lo < hi) {
-          const int mid = (lo + hi) / 2;
-          if (tv(mid) * tv(mid) > t2star)
-            hi = mid;
-          else
-            lo = mid + 1;
-        }
-
-        // REFINE. The closed form is loose because it charges F(mu) -- the
-        // largest theta -- against every node. Walking down from its answer and
-        // accumulating the EXACT per-node bound recovers most of that, and it is
-        // rigorous: everything at or above `lo` is already bounded by the closed
-        // form evaluated there, so the test is S_exact + T_closed < eps.
-        //
-        // Capped, because the cost is O(steps) and the closed form can be far
-        // from the truth at high L -- an uncapped walk would reintroduce the
-        // O(nt) scan this replaced.
-        if (lo > 0 && refine_n > 0) {
-          Real Tc = C * exp_(-((tv(lo) * tv(lo) * p * qq) /
-                               (p * qq + tv(lo) * tv(lo) * (p + qq))) * R2 / 2);
-          Real S = 0;
-          int i = lo - 1;
-          const int stop = lo - refine_n > 0 ? lo - refine_n : 0;
-          for (; i >= stop; --i) {
-            const Real t = tv(i);
-            const Real D = p * qq + t * t * (p + qq);
-            const Real th = t * t * p * qq / D;
-            Real bb = 0, pwb = 1, fb = 1;
-            const Real sth = sqrt_(2 * th);
-            for (int m = 0; m <= L; ++m) {
-              if (m > 0) { pwb *= sth; fb *= sqrt_(Real(m)); }
-              const Real v = pwb * fb;
-              if (v > bb) bb = v;
-            }
-            const Real prd = pi / sqrt_(D);
-            const Real wabs = wv(i) < 0 ? -wv(i) : wv(i);
-            const Real b = wabs * prd * prd * prd * Epref * kc * kc * kc * bb *
-                           exp_(-th * R2 / 2);
-            if (S + b + Tc > eps) break;
-            S += b;
-          }
-          lo = i + 1;
-        }
-        keep(q) = lo;
+        keep(q) = detail::t_screen_scan<Real>(
+            dp(ib), dp(ik), X, Epref, nbh - 1 + nkh - 1, nbh, nkh,
+            &dEn(dEoff(ib)), &dEn(dEoff(ik)), tv.data(), wv.data(), wsv.data(),
+            vsv.data(), nt, epsq, refine_n);
       });
   Kokkos::fence();
   batch.nt_full = nt;
@@ -680,12 +884,13 @@ std::vector<int> t_screen_keeps(const std::vector<std::pair<int, int>> &quartets
     detail::pair_e_absmax(pair_list[i], &Eabs[3 * i]);
     detail::pair_e_absmax_n(pair_list[i], &Fn[Foff[i]]);
   }
+  const auto [wsuf, vsuf] = detail::weight_suffix(grid);
   std::vector<int> keep(quartets.size());
   for (std::size_t q = 0; q < quartets.size(); ++q) {
     const auto [ib, ik] = quartets[q];
     keep[q] = detail::t_screen_keep_pre(pair_list[ib], pair_list[ik], &Eabs[3 * ib],
                                         &Eabs[3 * ik], &Fn[Foff[ib]], &Fn[Foff[ik]], grid,
-                                        eps);
+                                        wsuf.data(), vsuf.data(), eps);
   }
   return keep;
 }

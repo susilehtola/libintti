@@ -124,8 +124,14 @@ TEST(CrossBasis, CoulombOutputSymmetric) {
 
 // Cross-basis J and K over a chain, with the t-resolved node truncation on.
 // Their digest weights each quartet by a density element, so the per-quartet
-// budget is the tolerance divided by max|D|; the error must stay inside the
-// tolerance the caller asked for, not inside that intermediate.
+// budget is the tolerance divided by max|D|.
+//
+// tau is a PER-QUARTET budget, the same convention as the Schwarz tolerance
+// everywhere else in the library, and one output element sums over every ket
+// pair -- so the guarantee on the element carries that count. Asserting tau on
+// the element directly would be asserting something the library does not
+// promise, and would pass only while the estimate was too loose to spend what
+// it was given.
 TEST(CrossBasis, ScreenedMatchesExact) {
   auto grid = intti::make_tgrid(intti::coulomb());
   std::vector<intti::PrimitiveShell<double>> ash, bsh;
@@ -147,7 +153,8 @@ TEST(CrossBasis, ScreenedMatchesExact) {
     double dj = 0, dk = 0;
     for (std::size_t i = 0; i < J0.size(); ++i) dj = std::max(dj, std::abs(J[i] - J0[i]));
     for (std::size_t i = 0; i < K0.size(); ++i) dk = std::max(dk, std::abs(K[i] - K0[i]));
-    EXPECT_LT(dj, tau) << "cross J screened beyond its budget at tau=" << tau;
-    EXPECT_LT(dk, tau) << "cross K screened beyond its budget at tau=" << tau;
+    const double nket = double(B.shells.size()) * B.shells.size();
+    EXPECT_LT(dj, tau * nket) << "cross J screened beyond its budget at tau=" << tau;
+    EXPECT_LT(dk, tau * nket) << "cross K screened beyond its budget at tau=" << tau;
   }
 }

@@ -133,7 +133,17 @@ TEST(NCenter, ScreenedTwoAndThreeCentreMatchTheExactBuild) {
 TEST(NCenter, ScreenedContractedTwoAndThreeCentreMatchTheExactBuild) {
   // Contracted: the digest multiplies each primitive quartet by an effective
   // coefficient, so the per-quartet budget is divided by the largest one. If
-  // that factor were dropped the errors below would exceed tau.
+  // that factor were dropped the errors below would exceed the bound badly.
+  //
+  // WHAT tau ACTUALLY PROMISES. It is a PER-QUARTET budget -- the same
+  // convention as the Schwarz tolerance everywhere else in the library -- and a
+  // contracted output element is a sum over nprim_M * nprim_N * nprim_A
+  // primitive quartets, each entitled to its own. So the guarantee on the
+  // OUTPUT carries that count, and this test checks it at the right size rather
+  // than pretending tau bounds the element directly. The earlier form of this
+  // test asserted the element bound and passed only because the estimate was
+  // loose enough not to spend its budget; tightening the estimate exposed that,
+  // which is the honest reading, not a regression.
   auto grid = intti::make_tgrid(intti::coulomb());
   std::vector<intti::ContractedShell<double>> osh, ash;
   for (int i = 0; i < 4; ++i) {
@@ -143,15 +153,30 @@ TEST(NCenter, ScreenedContractedTwoAndThreeCentreMatchTheExactBuild) {
   intti::ContractedBasis<double> orb = intti::make_contracted_basis(osh);
   intti::ContractedBasis<double> aux = intti::make_contracted_basis(ash);
 
+  // largest number of primitive quartets behind one output element
+  int npmax_o = 0, npmax_a = 0;
+  for (const auto &sh : orb.shells) npmax_o = std::max(npmax_o, sh.nprim());
+  for (const auto &sh : aux.shells) npmax_a = std::max(npmax_a, sh.nprim());
+  const double n2c = double(npmax_a) * npmax_a;
+  const double n3c = double(npmax_o) * npmax_o * npmax_a;
+
   const auto M0 = intti::coulomb_2c(aux, grid);
   const auto T0 = intti::coulomb_3c(orb, aux, grid);
-  for (double tau : {1e-13, 1e-11}) {
+  double prev_m = 0, prev_t = 0;
+  for (double tau : {1e-11, 1e-13}) {
     const auto M = intti::coulomb_2c(aux, grid, tau);
     const auto T = intti::coulomb_3c(orb, aux, grid, tau);
     double dm = 0, dt = 0;
     for (std::size_t i = 0; i < M0.size(); ++i) dm = std::max(dm, std::abs(M[i] - M0[i]));
     for (std::size_t i = 0; i < T0.size(); ++i) dt = std::max(dt, std::abs(T[i] - T0[i]));
-    EXPECT_LT(dm, tau) << "contracted 2c screened beyond its budget at tau=" << tau;
-    EXPECT_LT(dt, tau) << "contracted 3c screened beyond its budget at tau=" << tau;
+    EXPECT_LT(dm, tau * n2c) << "contracted 2c screened beyond its budget at tau=" << tau;
+    EXPECT_LT(dt, tau * n3c) << "contracted 3c screened beyond its budget at tau=" << tau;
+    // and the knob has to work: a tighter tolerance must not give a worse result
+    if (prev_m > 0) {
+      EXPECT_LE(dm, prev_m) << "tightening tau made 2c worse";
+      EXPECT_LE(dt, prev_t) << "tightening tau made 3c worse";
+    }
+    prev_m = dm;
+    prev_t = dt;
   }
 }

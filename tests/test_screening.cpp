@@ -472,15 +472,17 @@ TEST(Screening, BoundsHoldUnderASweep) {
 
 // High total angular momentum, which the sweep above does not reach (it tops out
 // at L = la+lb+lc+ld = 4). The Cramer factor carries sqrt(L!), so if the bound
-// degrades anywhere it is here -- a real basis reaches L = 8 for (dd|dd) and 12
-// for (ff|ff).
+// degrades anywhere it is here -- a real basis reaches L = 8 for (dd|dd), 12 for
+// (ff|ff) and 16 for (gg|gg), the last of which is past the point where the
+// full-Gaussian branch used to be skipped, so it pins that branch at the size
+// where its polynomial coefficients are largest.
 TEST(Screening, BoundsHoldAtHighAngularMomentum) {
   auto grid = intti::make_tgrid(intti::coulomb());
   const int nt = grid.n();
   const double eps = 1e-11;
   int truncated = 0, checked = 0;
   double worst_loss = 0, worst_mbie = 0;
-  for (int l = 1; l <= 3; ++l)
+  for (int l = 1; l <= 4; ++l)
     for (double aa : {0.3, 2.0, 30.0})
       for (double R : {1.0, 3.0, 8.0, 20.0}) {
         auto a = Shell{aa, {0, 0, 0}, l};
@@ -516,7 +518,7 @@ TEST(Screening, BoundsHoldAtHighAngularMomentum) {
         EXPECT_LT(lost, eps) << "t-screening lost more than eps at L=" << 4 * l
                              << " alpha=" << aa << " R=" << R << " keep=" << keep;
       }
-  printf("high-L: %d checks up to L=12, %d truncated, worst loss %.2e, "
+  printf("high-L: %d checks up to L=16, %d truncated, worst loss %.2e, "
          "worst MBIE true/est %.3f\n", checked, truncated, worst_loss, worst_mbie);
   EXPECT_GT(truncated, 0) << "no truncation at high L: the sweep proves nothing there";
 }
@@ -579,4 +581,101 @@ TEST(Screening, AmplificationIsExactlyAToleranceRescale) {
   intti::t_screen_batch(one, plist, grid, eps, 16, amp);
   const auto kone = grab(one);
   for (std::size_t q = 0; q < kref.size(); ++q) ASSERT_EQ(kone[q], kplain[q]);
+}
+
+// t_screen_bpoly must reproduce EXACTLY the polynomial it claims to be:
+//   sum_k b_k theta^k  ==  sum_n c_n theta^{n/2} G_n(sqrt(theta) a),
+// G being the Hermite polynomial with every coefficient made positive. The
+// sweeps above prove the bound is SAFE; this proves it is the one intended, so
+// that an algebra slip cannot masquerade as a tightness regression -- the
+// rewrite in theta is what lets each term be charged at its own peak, and it is
+// worth nothing if the rewrite is wrong.
+TEST(Screening, FullGaussianPolynomialIsTheHermiteBound) {
+  double worst = 0;
+  for (double a : {0.0, 0.3, 2.0, 20.0})
+    for (double th : {0.01, 0.4, 3.0, 50.0})
+      for (int n1 : {1, 3, 7, 13}) {
+        std::vector<double> c(n1), b(n1);
+        for (int i = 0; i < n1; ++i) c[i] = std::abs(0.3 + 0.7 * std::sin(1.7 * i + 0.4));
+        intti::detail::t_screen_bpoly(c.data(), n1, a, b.data());
+        double lhs = 0, thp = 1;
+        for (int k = 0; k < n1; ++k) {
+          if (k) thp *= th;
+          lhs += b[k] * thp;
+        }
+        const double u = std::sqrt(th) * a;
+        double gm1 = 0, g = 1, sp = 1, rhs = c[0];
+        for (int n = 1; n < n1; ++n) {
+          const double gn = 2 * u * g + 2 * (n - 1) * gm1;
+          gm1 = g;
+          g = gn;
+          sp *= std::sqrt(th);
+          rhs += c[n] * sp * g;
+        }
+        const double rel = std::abs(lhs - rhs) / (std::abs(rhs) + 1e-300);
+        worst = std::max(worst, rel);
+        EXPECT_LT(rel, 1e-10) << "a=" << a << " th=" << th << " n1=" << n1;
+      }
+  printf("bpoly identity: worst relative mismatch %.3e\n", worst);
+}
+
+// A regression guard on TIGHTNESS, not just safety. Safety is what every other
+// screening test checks; nothing stopped the estimate from quietly going slack
+// and still passing all of them, which is how the earlier nine orders of unused
+// budget survived as long as they did.
+//
+// The brute-force ideal is the smallest truncation that actually stays under
+// eps, found by evaluating the quartet on every prefix of the grid. The bound
+// may never undercut it (that would be a correctness failure) and must stay
+// close to it.
+TEST(Screening, TruncationStaysCloseToTheBruteForceIdeal) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nt = grid.n();
+  const double eps = 1e-11;
+  long tot_keep = 0, tot_ideal = 0, n = 0;
+  int unsafe = 0;
+  double worst_ratio = 0;
+  for (int l = 0; l <= 3; ++l)
+    for (double aa : {0.3, 2.0, 30.0})
+      for (double R : {0.0, 1.0, 3.0, 8.0, 20.0}) {
+        auto a = Shell{aa, {0, 0, 0}, l};
+        auto b = Shell{aa * 0.4, {0.19, 0.07, 0}, l};
+        auto c = Shell{aa * 0.8, {0, 0, R}, l};
+        auto d = Shell{aa * 0.3, {0.13, 0, R + 0.21}, l};
+        if (R == 0.0) {
+          c = Shell{aa * 0.8, {0, 0, 0}, l};
+          d = Shell{aa * 0.3, {0, 0, 0}, l};
+        }
+        auto bra = intti::make_pair(a, b);
+        auto ket = intti::make_pair(c, d);
+        const int nb = intti::ncart(l) * intti::ncart(l);
+        std::vector<double> ref(static_cast<std::size_t>(nb) * nb);
+        intti::eri_quartet(bra, ket, grid, ref.data());
+        int ideal = nt;
+        for (int k = 0; k <= nt; ++k) {
+          intti::TGrid<double> cut = grid;
+          cut.t.resize(k);
+          cut.w.resize(k);
+          cut.tail_coeff = 0.0;
+          std::vector<double> got(ref.size());
+          intti::eri_quartet(bra, ket, cut, got.data());
+          double lost = 0;
+          for (std::size_t i = 0; i < ref.size(); ++i)
+            lost = std::max(lost, std::abs(got[i] - ref[i]));
+          if (lost < eps) { ideal = k; break; }
+        }
+        const int keep = intti::t_screen_keep(bra, ket, grid, eps);
+        tot_keep += keep;
+        tot_ideal += ideal;
+        ++n;
+        if (keep < ideal) ++unsafe;
+        if (ideal > 0) worst_ratio = std::max(worst_ratio, double(keep) / ideal);
+      }
+  const double waste = double(tot_keep - tot_ideal) / (n * nt);
+  printf("vs ideal: keep=%ld ideal=%ld waste=%.1f%% of grid, worst ratio %.2f\n",
+         tot_keep, tot_ideal, 100 * waste, worst_ratio);
+  EXPECT_EQ(unsafe, 0) << "the estimate truncated harder than the true integral allows";
+  // measured 7.7% and 9.0x; the margins catch a real slackening, not noise
+  EXPECT_LT(waste, 0.10) << "the estimate has gone slack against the ideal";
+  EXPECT_LT(worst_ratio, 11.0) << "a single case has gone badly slack";
 }
