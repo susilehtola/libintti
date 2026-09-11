@@ -131,7 +131,7 @@ TEST(Screening, TResolvedTruncationRespectsEpsAndFires) {
       double worst = 0;
       for (std::size_t i = 0; i < ref.size(); ++i)
         worst = std::max(worst, std::abs(got[i] - ref[i]));
-      EXPECT_LT(worst, eps * 10)
+      EXPECT_LT(worst, eps)
           << "truncating to " << keep << "/" << nt << " nodes at R=" << R
           << " lost more than eps for " << cf.la << cf.lb << cf.lc << cf.ld;
     }
@@ -225,7 +225,7 @@ TEST(Screening, ScreenedBatchMatchesUnscreened) {
     scale = std::max(scale, std::abs(hr(i)));
   }
   EXPECT_GT(scale, 1e-3) << "integrals trivially zero";
-  EXPECT_LT(worst, eps * 100) << "screened batch differs from unscreened by more than eps";
+  EXPECT_LT(worst, eps) << "screened batch differs from unscreened by more than eps";
   printf("t-screening: %zu of %zu nodes evaluated (%.1f%%), max deviation %.2e\n", after,
          before, 100.0 * after / before, worst);
 }
@@ -330,4 +330,72 @@ TEST(Screening, DerivativeScreeningDoesNotAmplify) {
   probe(2.2, 0.45);
   probe(11720.0, 0.0737); // cc-pVDZ oxygen span
   probe(1.0e6, 0.05);
+}
+
+// Filtering BEFORE the batch is built, rather than zeroing node counts after.
+// A fully-screened quartet left in the batch still pays the f-phase and still
+// occupies output slots, so nout_total -- which sets the largest allocation in
+// the engine -- does not shrink at all. This checks that dropping them changes
+// nothing numerically and does shrink it.
+TEST(Screening, PreFilterShrinksTheBatchWithoutChangingResults) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nt = grid.n();
+  std::vector<Shell> sh;
+  for (int i = 0; i < 6; ++i) {
+    const double z = i * 9.0;
+    sh.push_back(Shell{1.3, {0, 0, z}, 0});
+    sh.push_back(Shell{0.4, {0, 0, z}, 1});
+  }
+  std::vector<intti::ShellPair<double>> plist;
+  for (std::size_t i = 0; i < sh.size(); ++i)
+    for (std::size_t j = 0; j < sh.size(); ++j)
+      plist.push_back(intti::make_pair(sh[i], sh[j]));
+  auto tab = intti::make_pair_table(plist);
+  const int npair = static_cast<int>(plist.size());
+  std::vector<std::pair<int, int>> qs;
+  for (int a = 0; a < npair; ++a)
+    for (int b = a; b < npair; ++b) qs.push_back({a, b});
+
+  intti::QuartetWorkspace<double> ws;
+  auto full = intti::make_batch(tab, qs);
+  Kokkos::View<double *> ref("ref", full.nout_total);
+  intti::eri_quartets(tab, full, grid, ref, ws);
+
+  const double eps = 1e-11;
+  auto [live, livekeep] = intti::t_screen_filter(qs, plist, grid, eps);
+  auto lean = intti::make_batch(tab, live);
+  intti::t_screen_apply(lean, livekeep, nt);
+  Kokkos::View<double *> got("got", lean.nout_total);
+  intti::eri_quartets(tab, lean, grid, got, ws);
+
+  EXPECT_LT(live.size(), qs.size()) << "nothing was dropped: the filter is inert";
+  EXPECT_LT(lean.nout_total, full.nout_total) << "nout_total did not shrink";
+
+  // every surviving quartet must match the unfiltered result, and every dropped
+  // one must have been genuinely negligible
+  auto hr = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, ref);
+  auto hg = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, got);
+  double worst_live = 0, worst_dropped = 0, scale = 0;
+  std::size_t li = 0;
+  for (std::size_t q = 0; q < qs.size(); ++q) {
+    const std::size_t o0 = full.h_offset[q], o1 = full.h_offset[q + 1];
+    const bool kept = li < live.size() && live[li] == qs[q];
+    for (std::size_t k = o0; k < o1; ++k) scale = std::max(scale, std::abs(hr(k)));
+    if (kept) {
+      const std::size_t p0 = lean.h_offset[li];
+      for (std::size_t k = 0; k < o1 - o0; ++k)
+        worst_live = std::max(worst_live, std::abs(hg(p0 + k) - hr(o0 + k)));
+      ++li;
+    } else {
+      for (std::size_t k = o0; k < o1; ++k)
+        worst_dropped = std::max(worst_dropped, std::abs(hr(k)));
+    }
+  }
+  EXPECT_EQ(li, live.size()) << "survivor bookkeeping is out of step";
+  EXPECT_GT(scale, 1e-3) << "integrals trivially zero";
+  EXPECT_LT(worst_live, eps) << "a surviving quartet changed";
+  EXPECT_LT(worst_dropped, eps) << "a DROPPED quartet was not negligible";
+  printf("pre-filter: %zu of %zu quartets kept, nout %zu -> %zu (%.1f%%); "
+         "worst dropped %.2e\n", live.size(), qs.size(), full.nout_total,
+         lean.nout_total, 100.0 * lean.nout_total / full.nout_total, worst_dropped);
 }

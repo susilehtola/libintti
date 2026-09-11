@@ -218,7 +218,13 @@ int t_screen_keep_pre(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
     const Real t = grid.t[i];
     const Real D = p * q + t * t * (p + q);
     const Real theta = t * t * p * q / D;
-    const Real b = std::abs(grid.w[i]) * (pi / std::sqrt(D)) * Epref *
+    // pref enters ONCE PER CARTESIAN DIRECTION: the quartet value is
+    // w * pref^3 * (three Hermite sums), not w * pref * (...). A single power
+    // UNDERESTIMATES whenever pi/sqrt(D) > 1, i.e. for diffuse pairs at small t,
+    // which makes the whole estimate not a bound. Found by a dropped quartet
+    // measuring 2.2e-11 against eps = 1e-11.
+    const Real pref3 = (pi / std::sqrt(D)) * (pi / std::sqrt(D)) * (pi / std::sqrt(D));
+    const Real b = std::abs(grid.w[i]) * pref3 * Epref *
                    detail::cramer_factor(theta, L) * std::exp(-theta * R2 / 2);
     if (tail + b > eps) return i + 1; // node i must be kept
     tail += b;
@@ -376,7 +382,9 @@ void t_screen_batch(QuartetBatch<Real> &batch,
           const Real v = pw * fact;
           if (v > best) best = v;
         }
-        const Real A = (pi / sqrt_(p * qq)) * kc * kc * kc * best * wsum;
+        // pref^3, one power per Cartesian direction (see the host path)
+        const Real pr = pi / sqrt_(p * qq);
+        const Real A = pr * pr * pr * kc * kc * kc * best * wsum;
         const Real C = Epref * A;
         if (!(C > eps)) { // even the whole tail is negligible
           keep(q) = 0;
@@ -411,6 +419,58 @@ void t_screen_batch(QuartetBatch<Real> &batch,
         keep(q) = lo;
       });
   Kokkos::fence();
+  batch.nt_full = nt;
+}
+
+/// Per-quartet node counts for a quartet LIST, before a batch exists.
+///
+/// Screening after make_batch leaves fully-screened quartets (keep == 0) in the
+/// batch: they evaluate no nodes, but still pay the f-phase E-coefficient
+/// assembly and still occupy output slots, so nout_total is unchanged. Running
+/// the estimate first lets the caller drop them outright.
+template <class Real>
+std::vector<int> t_screen_keeps(const std::vector<std::pair<int, int>> &quartets,
+                                const std::vector<ShellPair<Real>> &pair_list,
+                                const TGrid<Real> &grid, Real eps) {
+  const int npair = static_cast<int>(pair_list.size());
+  std::vector<Real> Eabs(static_cast<std::size_t>(npair) * 3);
+  for (int i = 0; i < npair; ++i) detail::pair_e_absmax(pair_list[i], &Eabs[3 * i]);
+  std::vector<int> keep(quartets.size());
+  for (std::size_t q = 0; q < quartets.size(); ++q) {
+    const auto [ib, ik] = quartets[q];
+    keep[q] = detail::t_screen_keep_pre(pair_list[ib], pair_list[ik], &Eabs[3 * ib],
+                                        &Eabs[3 * ik], grid, eps);
+  }
+  return keep;
+}
+
+/// Drop the quartets that contribute nothing, returning the survivors and their
+/// node counts. Feed the survivors to make_batch and the counts to
+/// t_screen_apply.
+template <class Real>
+std::pair<std::vector<std::pair<int, int>>, std::vector<int>>
+t_screen_filter(const std::vector<std::pair<int, int>> &quartets,
+                const std::vector<ShellPair<Real>> &pair_list, const TGrid<Real> &grid,
+                Real eps) {
+  const auto keep = t_screen_keeps(quartets, pair_list, grid, eps);
+  std::vector<std::pair<int, int>> live;
+  std::vector<int> livekeep;
+  live.reserve(quartets.size());
+  livekeep.reserve(quartets.size());
+  for (std::size_t q = 0; q < quartets.size(); ++q)
+    if (keep[q] > 0) {
+      live.push_back(quartets[q]);
+      livekeep.push_back(keep[q]);
+    }
+  return {std::move(live), std::move(livekeep)};
+}
+
+/// Install already-computed node counts on a batch built from the survivors.
+template <class Real>
+void t_screen_apply(QuartetBatch<Real> &batch, const std::vector<int> &keep, int nt) {
+  auto h = Kokkos::create_mirror_view(batch.keep);
+  for (int q = 0; q < batch.nq; ++q) h(q) = keep[q];
+  Kokkos::deep_copy(batch.keep, h);
   batch.nt_full = nt;
 }
 
