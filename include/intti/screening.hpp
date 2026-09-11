@@ -238,7 +238,7 @@ namespace detail {
 template <class Real>
 int t_screen_keep_pre(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
                       const Real *Ea, const Real *Eb, const Real *Fa, const Real *Fb,
-                      const TGrid<Real> &grid, Real eps) {
+                      const TGrid<Real> &grid, Real eps, int refine = 16) {
   const int nt = grid.n();
   const Real pi = pi_v<Real>();
   const Real kc = Real(1.086435);
@@ -301,6 +301,32 @@ int t_screen_keep_pre(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
       hi = mid;
     else
       lo = mid + 1;
+  }
+  // capped refinement, identical to the device kernel -- see t_screen_batch
+  if (lo > 0 && refine > 0) {
+    const Real tl = grid.t[lo];
+    const Real Tc =
+        C * std::exp(-((tl * tl * p * q) / (p * q + tl * tl * (p + q))) * R2 / 2);
+    Real S = 0;
+    int i = lo - 1;
+    const int stop = std::max(lo - refine, 0);
+    for (; i >= stop; --i) {
+      const Real t = grid.t[i];
+      const Real D = p * q + t * t * (p + q);
+      const Real th = t * t * p * q / D;
+      Real bb = 0, pwb = 1, fb = 1;
+      const Real sth = std::sqrt(2 * th);
+      for (int m = 0; m <= L; ++m) {
+        if (m > 0) { pwb *= sth; fb *= std::sqrt(Real(m)); }
+        bb = std::max(bb, pwb * fb);
+      }
+      const Real prd = pi / std::sqrt(D);
+      const Real b = std::abs(grid.w[i]) * prd * prd * prd * Epref * kc * kc * kc * bb *
+                     std::exp(-th * R2 / 2);
+      if (S + b + Tc > eps) break;
+      S += b;
+    }
+    lo = i + 1;
   }
   return lo;
 }
@@ -369,7 +395,7 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
 template <class Real>
 void t_screen_batch(QuartetBatch<Real> &batch,
                     const std::vector<ShellPair<Real>> &pair_list,
-                    const TGrid<Real> &grid, Real eps) {
+                    const TGrid<Real> &grid, Real eps, int refine = 16) {
   const int nt = grid.n();
   // Two things keep this from costing more than it saves.
   //
@@ -407,11 +433,24 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   // was added to recover high-L tightness and does not close this -- the
   // looseness is the mu substitution, not the L factor.
   //
-  // The way back, not taken here: use the closed form to get a valid starting
-  // index cheaply, then walk DOWN from it accumulating the exact tail while it
-  // stays under eps. Cost is O(keep_closed - keep_exact) rather than O(nt), so
-  // it is cheap exactly when the two are close and expensive when the gain is
-  // largest -- which needs measuring before it is worth doing.
+  // RECOVERED by the capped refinement walk below: the closed form gives a valid
+  // starting index, then the walk accumulates the EXACT per-node bound downward
+  // while S + T_closed stays under eps (everything at or above the start is
+  // already bounded by the closed form there, so this is rigorous). The cap
+  // keeps the worst case O(refine) instead of O(nt).
+  //
+  // Measured on a 6-centre spd system, 52650 quartets:
+  //
+  //     refine  nodes   scan     eval
+  //        0    5.2%    9.4 ms   2.00 s
+  //        8    4.4%   12.8 ms   2.00 s
+  //       16    4.2%   18.0 ms   2.12 s
+  //       64    4.2%   21.8 ms   1.87 s
+  //
+  // Node work falls 5.2 -> 4.2% and saturates by 16, for a scan that stays ~1%
+  // of the total. Hence the default. (Wall-clock nets came out 3.2-3.7x across
+  // all settings, i.e. within this machine's noise -- the node fraction is the
+  // measurement that means anything here.)
   const int npair = static_cast<int>(pair_list.size());
   std::vector<Real> hE(static_cast<std::size_t>(npair) * 3);
   std::vector<Real> hp(npair), hP(static_cast<std::size_t>(npair) * 3);
@@ -450,6 +489,7 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   auto keep = batch.keep;
   const Real pi = pi_v<Real>();
   const Real kc = Real(1.086435);
+  const int refine_n = refine;
   Kokkos::parallel_for(
       "intti::tscreen", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int q) {
         const int ib = dqb(q), ik = dqk(q);
@@ -547,6 +587,42 @@ void t_screen_batch(QuartetBatch<Real> &batch,
             hi = mid;
           else
             lo = mid + 1;
+        }
+
+        // REFINE. The closed form is loose because it charges F(mu) -- the
+        // largest theta -- against every node. Walking down from its answer and
+        // accumulating the EXACT per-node bound recovers most of that, and it is
+        // rigorous: everything at or above `lo` is already bounded by the closed
+        // form evaluated there, so the test is S_exact + T_closed < eps.
+        //
+        // Capped, because the cost is O(steps) and the closed form can be far
+        // from the truth at high L -- an uncapped walk would reintroduce the
+        // O(nt) scan this replaced.
+        if (lo > 0 && refine_n > 0) {
+          Real Tc = C * exp_(-((tv(lo) * tv(lo) * p * qq) /
+                               (p * qq + tv(lo) * tv(lo) * (p + qq))) * R2 / 2);
+          Real S = 0;
+          int i = lo - 1;
+          const int stop = lo - refine_n > 0 ? lo - refine_n : 0;
+          for (; i >= stop; --i) {
+            const Real t = tv(i);
+            const Real D = p * qq + t * t * (p + qq);
+            const Real th = t * t * p * qq / D;
+            Real bb = 0, pwb = 1, fb = 1;
+            const Real sth = sqrt_(2 * th);
+            for (int m = 0; m <= L; ++m) {
+              if (m > 0) { pwb *= sth; fb *= sqrt_(Real(m)); }
+              const Real v = pwb * fb;
+              if (v > bb) bb = v;
+            }
+            const Real prd = pi / sqrt_(D);
+            const Real wabs = wv(i) < 0 ? -wv(i) : wv(i);
+            const Real b = wabs * prd * prd * prd * Epref * kc * kc * kc * bb *
+                           exp_(-th * R2 / 2);
+            if (S + b + Tc > eps) break;
+            S += b;
+          }
+          lo = i + 1;
         }
         keep(q) = lo;
       });
