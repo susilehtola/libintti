@@ -399,3 +399,124 @@ TEST(Screening, PreFilterShrinksTheBatchWithoutChangingResults) {
          "worst dropped %.2e\n", live.size(), qs.size(), full.nout_total,
          lean.nout_total, 100.0 * lean.nout_total / full.nout_total, worst_dropped);
 }
+
+// Both bounds, swept hard. The t-screening estimate was wrong for eight commits
+// because the tests asserted at eps*10 and eps*100 -- slack that large tests an
+// order of magnitude, not a bound. This sweeps angular momenta, exponent ratios
+// and separations together and asserts each estimate is >= the true value with
+// only round-off allowed, which is the only assertion that actually tests the
+// claim.
+TEST(Screening, BoundsHoldUnderASweep) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nt = grid.n();
+  const double alphas[] = {0.05, 0.4, 3.0, 40.0, 900.0};
+  int mbie_checked = 0, tscr_checked = 0, tscr_truncated = 0;
+  double worst_mbie_ratio = 0, worst_tscr = 0;
+
+  for (int la = 0; la <= 2; ++la)
+    for (int lb = 0; lb <= 2 - la; ++lb)
+      for (int lc = 0; lc <= 2; ++lc)
+        for (int ld = 0; ld <= 2 - lc; ++ld)
+          for (double aa : alphas)
+            for (double ac : alphas)
+              for (double R : {0.5, 1.5, 4.0, 10.0, 25.0}) {
+                auto a = Shell{aa, {0, 0, 0}, la};
+                auto b = Shell{aa * 0.35, {0.21, 0.13, 0}, lb};
+                auto c = Shell{ac, {0, 0, R}, lc};
+                auto d = Shell{ac * 0.6, {0.11, 0, R + 0.17}, ld};
+                auto bra = intti::make_pair(a, b);
+                auto ket = intti::make_pair(c, d);
+
+                const int nb = intti::ncart(la) * intti::ncart(lb);
+                const int nk = intti::ncart(lc) * intti::ncart(ld);
+                std::vector<double> blk(static_cast<std::size_t>(nb) * nk);
+                intti::eri_quartet(bra, ket, grid, blk.data());
+                double tru = 0;
+                for (double v : blk) tru = std::max(tru, std::abs(v));
+
+                // (1) MBIE must be an upper bound on the true maximum
+                const double Qb = schwarz_Q(bra, grid), Qk = schwarz_Q(ket, grid);
+                const double est = intti::mbie_estimate(bra, ket, Qb, Qk, 1e-12);
+                ++mbie_checked;
+                if (tru > 0) worst_mbie_ratio = std::max(worst_mbie_ratio, tru / est);
+                EXPECT_GE(est * (1 + 1e-10), tru)
+                    << "MBIE under-estimates: l=" << la << lb << lc << ld
+                    << " alpha=" << aa << "," << ac << " R=" << R;
+
+                // (2) truncating to t_screen_keep must lose less than eps
+                const double eps = 1e-11;
+                const int keep = intti::t_screen_keep(bra, ket, grid, eps);
+                ++tscr_checked;
+                if (keep < nt) ++tscr_truncated;
+                intti::TGrid<double> cut = grid;
+                cut.t.resize(keep);
+                cut.w.resize(keep);
+                cut.tail_coeff = 0.0;
+                std::vector<double> got(static_cast<std::size_t>(nb) * nk);
+                intti::eri_quartet(bra, ket, cut, got.data());
+                double lost = 0;
+                for (std::size_t i = 0; i < blk.size(); ++i)
+                  lost = std::max(lost, std::abs(got[i] - blk[i]));
+                worst_tscr = std::max(worst_tscr, lost);
+                EXPECT_LT(lost, eps)
+                    << "t-screening lost more than eps: l=" << la << lb << lc << ld
+                    << " alpha=" << aa << "," << ac << " R=" << R << " keep=" << keep;
+              }
+  printf("sweep: %d MBIE checks (worst true/est = %.3f), %d t-screen checks "
+         "(%d truncated, worst loss %.2e)\n",
+         mbie_checked, worst_mbie_ratio, tscr_checked, tscr_truncated, worst_tscr);
+  EXPECT_GT(tscr_truncated, tscr_checked / 10)
+      << "the sweep barely exercised truncation";
+  EXPECT_LE(worst_mbie_ratio, 1.0 + 1e-9) << "MBIE was exceeded somewhere in the sweep";
+}
+
+// High total angular momentum, which the sweep above does not reach (it tops out
+// at L = la+lb+lc+ld = 4). The Cramer factor carries sqrt(L!), so if the bound
+// degrades anywhere it is here -- a real basis reaches L = 8 for (dd|dd) and 12
+// for (ff|ff).
+TEST(Screening, BoundsHoldAtHighAngularMomentum) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nt = grid.n();
+  const double eps = 1e-11;
+  int truncated = 0, checked = 0;
+  double worst_loss = 0, worst_mbie = 0;
+  for (int l = 1; l <= 3; ++l)
+    for (double aa : {0.3, 2.0, 30.0})
+      for (double R : {1.0, 3.0, 8.0, 20.0}) {
+        auto a = Shell{aa, {0, 0, 0}, l};
+        auto b = Shell{aa * 0.4, {0.19, 0.07, 0}, l};
+        auto c = Shell{aa * 0.8, {0, 0, R}, l};
+        auto d = Shell{aa * 0.3, {0.13, 0, R + 0.21}, l};
+        auto bra = intti::make_pair(a, b);
+        auto ket = intti::make_pair(c, d);
+        const int nb = intti::ncart(l) * intti::ncart(l);
+        std::vector<double> blk(static_cast<std::size_t>(nb) * nb);
+        intti::eri_quartet(bra, ket, grid, blk.data());
+        double tru = 0;
+        for (double v : blk) tru = std::max(tru, std::abs(v));
+
+        const double est = intti::mbie_estimate(bra, ket, schwarz_Q(bra, grid),
+                                                schwarz_Q(ket, grid), 1e-12);
+        if (tru > 0) worst_mbie = std::max(worst_mbie, tru / est);
+        EXPECT_GE(est * (1 + 1e-10), tru) << "MBIE under-estimates at L=" << 4 * l;
+
+        const int keep = intti::t_screen_keep(bra, ket, grid, eps);
+        ++checked;
+        if (keep < nt) ++truncated;
+        intti::TGrid<double> cut = grid;
+        cut.t.resize(keep);
+        cut.w.resize(keep);
+        cut.tail_coeff = 0.0;
+        std::vector<double> got(blk.size());
+        intti::eri_quartet(bra, ket, cut, got.data());
+        double lost = 0;
+        for (std::size_t i = 0; i < blk.size(); ++i)
+          lost = std::max(lost, std::abs(got[i] - blk[i]));
+        worst_loss = std::max(worst_loss, lost);
+        EXPECT_LT(lost, eps) << "t-screening lost more than eps at L=" << 4 * l
+                             << " alpha=" << aa << " R=" << R << " keep=" << keep;
+      }
+  printf("high-L: %d checks up to L=12, %d truncated, worst loss %.2e, "
+         "worst MBIE true/est %.3f\n", checked, truncated, worst_loss, worst_mbie);
+  EXPECT_GT(truncated, 0) << "no truncation at high L: the sweep proves nothing there";
+}
