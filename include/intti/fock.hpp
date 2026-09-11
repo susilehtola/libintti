@@ -137,6 +137,81 @@ std::vector<Real> schwarz(const PairTable<Real> &pairs,
 /// space (see jbuild.hpp::coulomb_build); defaults reproduce the serial
 /// result byte-for-byte. See mpi.hpp for the MPI_Allreduce-wrapped entry
 /// point.
+
+namespace detail {
+
+/// Pair-blocked density with the symmetry fold (D_ij + D_ji off-diagonal),
+/// built WHERE D LIVES. It was a host loop over the AO matrix, which forced the
+/// density to be host-resident even though every later use of it is on device.
+template <class Real, class DV>
+Kokkos::View<Real *> pack_pair_density(const DV &Dv, int nao,
+                                       const Kokkos::View<int *> &offv,
+                                       const Kokkos::View<int *> &rowv,
+                                       const Kokkos::View<int *> &colv,
+                                       const Kokkos::View<int *> &ncbv,
+                                       const Kokkos::View<int *> &diagv, int npair,
+                                       std::size_t ntot) {
+  Kokkos::View<Real *> Dp("intti::j::Dp", ntot);
+  Kokkos::parallel_for(
+      "intti::j::pack", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        const int ncb = ncbv(p), n = offv(p + 1) - offv(p), na = n / ncb;
+        for (int ka = 0; ka < na; ++ka)
+          for (int kb = 0; kb < ncb; ++kb) {
+            const int r = rowv(p) + ka, c = colv(p) + kb;
+            const Real d = Dv(static_cast<std::size_t>(r) * nao + c);
+            Dp(offv(p) + ka * ncb + kb) =
+                diagv(p) ? d : d + Dv(static_cast<std::size_t>(c) * nao + r);
+          }
+      });
+  Kokkos::fence();
+  return Dp;
+}
+
+/// Scatter the pair-blocked J back to the AO matrix (J is symmetric), on device.
+template <class Real, class JV>
+void scatter_pair_j(const Kokkos::View<Real *> &Jp, const JV &Jout, int nao,
+                    const Kokkos::View<int *> &offv, const Kokkos::View<int *> &rowv,
+                    const Kokkos::View<int *> &colv, const Kokkos::View<int *> &ncbv,
+                    int npair) {
+  Kokkos::parallel_for(
+      "intti::j::scatter", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        const int ncb = ncbv(p), n = offv(p + 1) - offv(p), na = n / ncb;
+        for (int ka = 0; ka < na; ++ka)
+          for (int kb = 0; kb < ncb; ++kb) {
+            const int r = rowv(p) + ka, c = colv(p) + kb;
+            const Real v = Jp(offv(p) + ka * ncb + kb);
+            Jout(static_cast<std::size_t>(r) * nao + c) = v;
+            Jout(static_cast<std::size_t>(c) * nao + r) = v;
+          }
+      });
+  Kokkos::fence();
+}
+
+/// Per-pair max |Dp|, the density half of the Coulomb screening bound.
+template <class Real>
+Kokkos::View<Real *> pair_density_max(const Kokkos::View<Real *> &Dp,
+                                      const Kokkos::View<int *> &offv, int npair) {
+  Kokkos::View<Real *> m("intti::j::dmax", npair);
+  Kokkos::parallel_for(
+      "intti::j::dmax", Kokkos::RangePolicy<>(0, npair), KOKKOS_LAMBDA(int p) {
+        Real best = 0;
+        for (int c = offv(p); c < offv(p + 1); ++c) {
+          const Real a = Dp(c) < 0 ? -Dp(c) : Dp(c);
+          if (a > best) best = a;
+        }
+        m(p) = best;
+      });
+  Kokkos::fence();
+  return m;
+}
+
+} // namespace detail
+
+template <class Real, class DView, class JView>
+void coulomb_build_into(const ShellBasis<Real> &basis, const DView &D,
+                        const TGrid<Real> &grid, const JView &J, Real tau = Real(0),
+                        int rank = 0, int nranks = 1);
+
 template <class Real>
 void coulomb_build(const ShellBasis<Real> &basis, const Real *D,
                    const TGrid<Real> &grid, Real *J, Real tau = Real(0),
@@ -150,47 +225,68 @@ void coulomb_build(const ShellBasis<Real> &basis, const Real *D,
   std::vector<int> off(npair + 1, 0);
   for (int p = 0; p < npair; ++p)
     off[p + 1] = off[p] + ncart(plist[p].la) * ncart(plist[p].lb);
-  std::vector<Real> Dp(off[npair]), Jp(off[npair]);
   const int nao = basis.nao;
+  const std::size_t N = static_cast<std::size_t>(nao) * nao;
+  auto Dv = detail::to_device(D, N, "intti::j::D");
+  Kokkos::View<Real *> Jv("intti::j::Jout", N);
+  coulomb_build_into(basis, Dv, grid, Jv, tau, rank, nranks);
+  const auto hJ = detail::to_host(Jv);
+  for (std::size_t i = 0; i < N; ++i) J[i] = hJ[i];
+}
+
+/// Coulomb with the density and the result in EITHER memory space; nothing is
+/// copied that is already where the kernel needs it (space.hpp). The
+/// host-pointer form above is unchanged and remains the right call for a
+/// host-only code.
+///
+/// The pair-blocked pack, the screening density bound and the scatter back to
+/// the AO matrix all run where D lives; they used to be host loops over the AO
+/// matrix, which is what forced the density to be host-resident.
+template <class Real, class DView, class JView>
+void coulomb_build_into(const ShellBasis<Real> &basis, const DView &D,
+                        const TGrid<Real> &grid, const JView &J, Real tau, int rank,
+                        int nranks) {
+  std::vector<ShellPair<Real>> plist;
+  std::vector<std::pair<int, int>> pshell;
+  make_shell_pairs(basis, plist, pshell);
+  auto tab = make_pair_table(plist);
+  const int npair = tab.npair;
+  const int nao = basis.nao;
+  std::vector<int> off(npair + 1, 0), hrow(npair), hcol(npair), hncb(npair), hdiag(npair);
   for (int p = 0; p < npair; ++p) {
+    off[p + 1] = off[p] + ncart(plist[p].la) * ncart(plist[p].lb);
     const auto [i, j] = pshell[p];
-    const int ncb = ncart(plist[p].lb);
-    for (int ka = 0; ka < ncart(plist[p].la); ++ka)
-      for (int kb = 0; kb < ncb; ++kb) {
-        const int r = basis.ao_off[i] + ka, c = basis.ao_off[j] + kb;
-        Dp[off[p] + ka * ncb + kb] =
-            i == j ? D[r * nao + c] : D[r * nao + c] + D[c * nao + r];
-      }
+    hrow[p] = basis.ao_off[i];
+    hcol[p] = basis.ao_off[j];
+    hncb[p] = ncart(plist[p].lb);
+    hdiag[p] = (i == j) ? 1 : 0;
   }
-  // screening bounds
+  auto offv = detail::to_device(off, "intti::j::off");
+  auto rowv = detail::to_device(hrow, "intti::j::row");
+  auto colv = detail::to_device(hcol, "intti::j::col");
+  auto ncbv = detail::to_device(hncb, "intti::j::ncb");
+  auto diagv = detail::to_device(hdiag, "intti::j::diag");
+
+  auto Dv = device_in(D); // no copy when already device-resident
+  auto Dp = detail::pack_pair_density<Real>(Dv, nao, offv, rowv, colv, ncbv, diagv, npair,
+                                            static_cast<std::size_t>(off[npair]));
   std::vector<Real> Q, bound;
   const Real *Qp = nullptr, *bp = nullptr;
   if (tau > Real(0)) {
     Q = schwarz(tab, plist, grid);
+    const auto dmax = detail::pair_density_max<Real>(Dp, offv, npair);
+    const auto hd = detail::to_host(dmax);
     bound.resize(npair);
-    for (int p = 0; p < npair; ++p) {
-      Real dmax = 0;
-      for (int c = off[p]; c < off[p + 1]; ++c) {
-        const Real a = Dp[c] < 0 ? -Dp[c] : Dp[c];
-        if (a > dmax) dmax = a;
-      }
-      bound[p] = Q[p] * dmax;
-    }
+    for (int p = 0; p < npair; ++p) bound[p] = Q[p] * hd[p];
     Qp = Q.data();
     bp = bound.data();
   }
-  coulomb_build(tab, Dp.data(), grid, Jp.data(), Qp, bp, tau, rank, nranks);
-  // scatter to the AO matrix (J is symmetric)
-  for (int p = 0; p < npair; ++p) {
-    const auto [i, j] = pshell[p];
-    const int ncb = ncart(plist[p].lb);
-    for (int ka = 0; ka < ncart(plist[p].la); ++ka)
-      for (int kb = 0; kb < ncb; ++kb) {
-        const int r = basis.ao_off[i] + ka, c = basis.ao_off[j] + kb;
-        J[r * nao + c] = Jp[off[p] + ka * ncb + kb];
-        J[c * nao + r] = J[r * nao + c];
-      }
-  }
+  Kokkos::View<Real *> Jpv("intti::j::Jp", off[npair]);
+  coulomb_build_dev(tab, Dp, grid, Jpv, Qp, bp, tau, rank, nranks, Real(0), 0, -1,
+                    false);
+  DeviceOut<Real> out(J, "intti::j::Jscat");
+  detail::scatter_pair_j<Real>(Jpv, out.view(), nao, offv, rowv, colv, ncbv, npair);
+  out.commit();
 }
 
 /// Memory-tiled Coulomb build for GPUs that cannot hold the whole per-pair

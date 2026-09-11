@@ -179,3 +179,66 @@ TEST(Space, ExchangeAgreesAcrossAllFourCombinations) {
     intti::exchange_build_into(basis, Dhost, grid, K);
     check("host in / device out", grab(K)); }
 }
+
+// coulomb_build across the same four combinations. Its prologue used to make
+// two host passes over the AO density -- the pair-blocked pack with the
+// symmetry fold, and the per-pair screening bound -- and its epilogue scattered
+// the pair-blocked J back on the host, so a device-resident density made a full
+// round trip on every J build. All three now run where D lives, and the
+// pair-blocked density goes straight into the device core of the driver.
+TEST(Space, CoulombAgreesAcrossAllFourCombinations) {
+  auto basis = small_basis();
+  const int n = basis.nao;
+  const std::size_t n2 = static_cast<std::size_t>(n) * n;
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+
+  std::vector<double> Dh(n2);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) Dh[i * n + j] = 0.1 + 0.3 * std::sin(0.9 * i + 1.7 * j);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) Dh[i * n + j] = Dh[j * n + i];
+
+  std::vector<double> ref(n2, 0.0);
+  intti::coulomb_build(basis, Dh.data(), grid, ref.data());
+  double sj = 0;
+  for (double v : ref) sj = std::max(sj, std::abs(v));
+  ASSERT_GT(sj, 1e-3);
+
+  HostView Dhost("Dhost", n2);
+  for (std::size_t i = 0; i < n2; ++i) Dhost(i) = Dh[i];
+  DevView Ddev("Ddev", n2);
+  Kokkos::deep_copy(Ddev, Dhost);
+
+  auto grab = [&](const auto &V) {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, V);
+    return std::vector<double>(h.data(), h.data() + n2);
+  };
+  auto check = [&](const char *what, const std::vector<double> &J) {
+    double dj = 0;
+    for (std::size_t i = 0; i < n2; ++i) dj = std::max(dj, std::abs(J[i] - ref[i]));
+    EXPECT_LT(dj, 1e-13 * sj) << what << ": J differs by memory space";
+  };
+
+  { HostView J("J", n2);
+    intti::coulomb_build_into(basis, Dhost, grid, J);
+    check("host in / host out", grab(J)); }
+  { DevView J("J", n2);
+    intti::coulomb_build_into(basis, Ddev, grid, J);
+    check("device in / device out", grab(J)); }
+  { HostView J("J", n2);
+    intti::coulomb_build_into(basis, Ddev, grid, J);
+    check("device in / host out", grab(J)); }
+  { DevView J("J", n2);
+    intti::coulomb_build_into(basis, Dhost, grid, J);
+    check("host in / device out", grab(J)); }
+
+  // and with screening on, where the density bound is the part that moved
+  { DevView J("J", n2);
+    std::vector<double> refs(n2, 0.0);
+    intti::coulomb_build(basis, Dh.data(), grid, refs.data(), 1e-12);
+    intti::coulomb_build_into(basis, Ddev, grid, J, 1e-12);
+    const auto got = grab(J);
+    double dj = 0;
+    for (std::size_t i = 0; i < n2; ++i) dj = std::max(dj, std::abs(got[i] - refs[i]));
+    EXPECT_LT(dj, 1e-13 * sj) << "screened J differs by memory space"; }
+}

@@ -172,12 +172,18 @@ void coulomb_farfield_add(const PairTable<Real> &pairs, const Real *D,
 /// handled by the exponent-free multipole tensor instead of the t-node sweep,
 /// with relative error ~ far_tau. far_tau = 0 (default) reproduces the pure
 /// t-quadrature build exactly.
-template <class Real>
-void coulomb_build(const PairTable<Real> &pairs, const Real *D,
-                   const TGrid<Real> &grid, Real *J, const Real *Q = nullptr,
-                   const Real *bound = nullptr, Real tau = Real(0),
-                   int rank = 0, int nranks = 1, Real far_tau = Real(0),
-                   int p0 = 0, int p1 = -1, bool tiled = false) {
+/// Device-resident core of coulomb_build: the pair-blocked density Dv and the
+/// pair-blocked output Jv (tile-local, jv_sz entries) both live in the default
+/// execution space and are neither copied in nor copied out. The host-pointer
+/// entry below is a staging wrapper around this; a caller whose density is
+/// already on the device (fock.hpp::coulomb_build_into) calls this directly and
+/// the AO matrix never crosses the bus. The far field is host-side, so it stays
+/// in the wrapper (the device path runs far_tau = 0).
+template <class Real, class DV, class JV>
+void coulomb_build_dev(const PairTable<Real> &pairs, const DV &Dv,
+                       const TGrid<Real> &grid, const JV &Jv, const Real *Q,
+                       const Real *bound, Real tau, int rank, int nranks,
+                       Real far_tau, int p0, int p1, bool tiled) {
   static_assert(kokkos_scalar_v<Real>,
                 "coulomb_build requires float, double or long double");
   // Output tiling: when tiled, phase 1 (the full ket Hermite density d^q) is
@@ -215,9 +221,7 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
 
   auto prodv = detail::to_device(h_prod, "intti::j::prod");
   auto hoffv = detail::to_device(h_hoff, "intti::j::hoff");
-  auto Dv = detail::to_device(D, static_cast<std::size_t>(nprod), "intti::j::D");
   Kokkos::View<Real *> dq("intti::j::dq", nherm), jp("intti::j::jp", jp_sz);
-  Kokkos::View<Real *> Jv("intti::j::J", jv_sz);
   auto Qv = screen ? detail::to_device(Q, static_cast<std::size_t>(npair), "intti::j::Q")
                    : Kokkos::View<Real *>("intti::j::Q", 1);
   auto bv = screen ? detail::to_device(bound, static_cast<std::size_t>(npair), "intti::j::bound")
@@ -395,6 +399,34 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
         }
       });
 
+
+}
+
+/// Host-pointer entry: stages the pair-blocked density onto the device, runs the
+/// core, copies the pair-blocked J back, and adds the host-side far field.
+template <class Real>
+void coulomb_build(const PairTable<Real> &pairs, const Real *D,
+                   const TGrid<Real> &grid, Real *J, const Real *Q = nullptr,
+                   const Real *bound = nullptr, Real tau = Real(0),
+                   int rank = 0, int nranks = 1, Real far_tau = Real(0),
+                   int p0 = 0, int p1 = -1, bool tiled = false) {
+  const int npair = pairs.npair;
+  std::vector<int> h_prod(npair + 1, 0), h_hoff(npair + 1, 0);
+  for (int ip = 0; ip < npair; ++ip) {
+    const int la = pairs.h_la[ip], lb = pairs.h_lb[ip];
+    if (la + lb > JLMAX)
+      throw std::invalid_argument("coulomb_build: pair angular momentum exceeds JLMAX");
+    h_prod[ip + 1] = h_prod[ip] + ncart(la) * ncart(lb);
+    const int n1 = la + lb + 1;
+    h_hoff[ip + 1] = h_hoff[ip] + n1 * n1 * n1;
+  }
+  const int P1 = (p1 < 0) ? npair : p1;
+  const int pbase = tiled ? h_prod[p0] : 0;
+  const int jv_sz = tiled ? (h_prod[P1] - pbase) : h_prod[npair];
+  auto Dv = detail::to_device(D, static_cast<std::size_t>(h_prod[npair]), "intti::j::D");
+  Kokkos::View<Real *> Jv("intti::j::J", jv_sz);
+  coulomb_build_dev(pairs, Dv, grid, Jv, Q, bound, tau, rank, nranks, far_tau, p0, p1,
+                    tiled);
   auto hJ = Kokkos::create_mirror_view(Jv);
   Kokkos::deep_copy(hJ, Jv);
   for (int i = 0; i < jv_sz; ++i)
@@ -403,9 +435,9 @@ void coulomb_build(const PairTable<Real> &pairs, const Real *D,
   // FMM far-field: add the multipole contribution of the pairs the device
   // kernel skipped (same near/far predicate -> exact partition). Not supported
   // in the tiled path (the tiled driver uses far_tau = 0).
-  if (far && !tiled)
-    detail::coulomb_farfield_add(pairs, D, h_prod, h_hoff, far_cut, J, Q, bound,
-                                 tau, rank, nranks);
+  if (far_tau > Real(0) && !tiled)
+    detail::coulomb_farfield_add(pairs, D, h_prod, h_hoff, -log_(far_tau), J, Q,
+                                 bound, tau, rank, nranks);
 }
 
 } // namespace intti
