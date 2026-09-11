@@ -145,6 +145,38 @@ Real mbie_estimate(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
 
 namespace detail {
 
+/// Per-direction, PER HERMITE ORDER max over Cartesian components of |E_n^{ab}|.
+///
+/// Weighting each order by its own E mass, rather than factoring out a single
+/// max_n |B_n| and multiplying by sum_n |E_n|, is what makes the bound usable at
+/// high angular momentum. The Cramer factor carries sqrt(n!) -- 21886 at n = 12
+/// -- but the E coefficients that actually reach those orders are small, so the
+/// factorised form charges the largest |B_n| against the whole E mass. Measured
+/// against the ideal truncation, that cost up to 43 of 64 nodes on (ff|ff)
+/// quartets, including ones that are entirely negligible.
+///
+/// out must hold 3 * (la + lb + 1).
+template <class Real>
+void pair_e_absmax_n(const ShellPair<Real> &sp, Real *out) {
+  const int la = sp.la, lb = sp.lb, nt = la + lb + 1;
+  std::vector<Real> E(static_cast<std::size_t>(la + 1) * (lb + 1) * nt);
+  for (int d = 0; d < 3; ++d) {
+    e_coeffs(la, lb, sp.p, Real(sp.P[d] - sp.A[d]), Real(sp.P[d] - sp.B[d]),
+             Real(sp.K[d]), E.data());
+    for (int n = 0; n < nt; ++n) {
+      Real best = 0;
+      for (int i = 0; i <= la; ++i)
+        for (int j = 0; j <= lb; ++j) {
+          if (n > i + j) continue;
+          const Real v =
+              std::abs(E[(static_cast<std::size_t>(i) * (lb + 1) + j) * nt + n]);
+          if (v > best) best = v;
+        }
+      out[d * nt + n] = best;
+    }
+  }
+}
+
 /// Per-direction max over Cartesian components of sum_t |E_t^{ab}|: the
 /// t-independent half of a node's bound.
 template <class Real> void pair_e_absmax(const ShellPair<Real> &sp, Real out[3]) {
@@ -197,10 +229,19 @@ template <class Real> Real cramer_factor(Real theta, int L) {
 namespace detail {
 
 /// t_screen_keep with the per-pair E factors already computed.
+///
+/// ONE formula, shared with the device kernel in t_screen_batch. They were
+/// briefly different -- this one scanning node by node while the device used the
+/// collective bound -- which meant the same quartet could be screened two ways
+/// depending on which entry point a caller used, and the sweep tests validated
+/// only the host one.
 template <class Real>
 int t_screen_keep_pre(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
-                      const Real *Ea, const Real *Eb, const TGrid<Real> &grid, Real eps) {
+                      const Real *Ea, const Real *Eb, const Real *Fa, const Real *Fb,
+                      const TGrid<Real> &grid, Real eps) {
   const int nt = grid.n();
+  const Real pi = pi_v<Real>();
+  const Real kc = Real(1.086435);
   Real Epref = 1;
   for (int d = 0; d < 3; ++d) Epref *= Ea[d] * Eb[d];
   if (!(Epref > Real(0))) return 0;
@@ -210,26 +251,58 @@ int t_screen_keep_pre(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
     R2 += dx * dx;
   }
   const int L = bra.la + bra.lb + ket.la + ket.lb;
+  const int nbh = bra.la + bra.lb + 1, nkh = ket.la + ket.lb + 1;
   const Real p = bra.p, q = ket.p;
-  const Real pi = pi_v<Real>();
-  // walk down from the top of the grid, accumulating the discarded tail
-  Real tail = 0;
-  for (int i = nt - 1; i >= 0; --i) {
-    const Real t = grid.t[i];
-    const Real D = p * q + t * t * (p + q);
-    const Real theta = t * t * p * q / D;
-    // pref enters ONCE PER CARTESIAN DIRECTION: the quartet value is
-    // w * pref^3 * (three Hermite sums), not w * pref * (...). A single power
-    // UNDERESTIMATES whenever pi/sqrt(D) > 1, i.e. for diffuse pairs at small t,
-    // which makes the whole estimate not a bound. Found by a dropped quartet
-    // measuring 2.2e-11 against eps = 1e-11.
-    const Real pref3 = (pi / std::sqrt(D)) * (pi / std::sqrt(D)) * (pi / std::sqrt(D));
-    const Real b = std::abs(grid.w[i]) * pref3 * Epref *
-                   detail::cramer_factor(theta, L) * std::exp(-theta * R2 / 2);
-    if (tail + b > eps) return i + 1; // node i must be kept
-    tail += b;
+  const Real mu = p * q / (p + q);
+  const Real pr = pi / std::sqrt(p * q);
+  const Real pref3 = pr * pr * pr;
+  Real wsum = 0;
+  for (int i = 0; i < nt; ++i) wsum += std::abs(grid.w[i]);
+
+  // (a) factorised, (b) per Hermite order -- see t_screen_batch for the algebra
+  Real best = 0, pw = 1, fact = 1;
+  const Real smu = std::sqrt(2 * mu);
+  for (int m = 0; m <= L; ++m) {
+    if (m > 0) {
+      pw *= smu;
+      fact *= std::sqrt(Real(m));
+    }
+    best = std::max(best, pw * fact);
   }
-  return 0;
+  const Real A_fac = pref3 * kc * kc * kc * best * wsum * Epref;
+  const Real s4 = std::sqrt(4 * mu);
+  Real A_ord = pref3 * kc * kc * kc * wsum;
+  for (int d = 0; d < 3; ++d) {
+    Real gb = 0, pwb = 1, fb = 1;
+    for (int n = 0; n < nbh; ++n) {
+      if (n > 0) { pwb *= s4; fb *= std::sqrt(Real(n)); }
+      gb += Fa[d * nbh + n] * fb * pwb;
+    }
+    Real gk = 0, pwk = 1, fk = 1;
+    for (int n = 0; n < nkh; ++n) {
+      if (n > 0) { pwk *= s4; fk *= std::sqrt(Real(n)); }
+      gk += Fb[d * nkh + n] * fk * pwk;
+    }
+    A_ord *= gb * gk;
+  }
+  const Real C = std::min(A_fac, A_ord);
+
+  if (!(C > eps)) return 0;
+  if (!(R2 > Real(0))) return nt;
+  const Real thstar = 2 * std::log(C / eps) / R2;
+  if (thstar >= mu) return nt;
+  const Real den = p * q - thstar * (p + q);
+  if (!(den > Real(0))) return nt;
+  const Real t2star = thstar * p * q / den;
+  int lo = 0, hi = nt;
+  while (lo < hi) {
+    const int mid = (lo + hi) / 2;
+    if (grid.t[mid] * grid.t[mid] > t2star)
+      hi = mid;
+    else
+      lo = mid + 1;
+  }
+  return lo;
 }
 
 } // namespace detail
@@ -242,7 +315,10 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
   Real Ea[3], Eb[3];
   detail::pair_e_absmax(bra, Ea);
   detail::pair_e_absmax(ket, Eb);
-  return detail::t_screen_keep_pre(bra, ket, Ea, Eb, grid, eps);
+  std::vector<Real> Fa(3 * (bra.la + bra.lb + 1)), Fb(3 * (ket.la + ket.lb + 1));
+  detail::pair_e_absmax_n(bra, Fa.data());
+  detail::pair_e_absmax_n(ket, Fb.data());
+  return detail::t_screen_keep_pre(bra, ket, Ea, Eb, Fa.data(), Fb.data(), grid, eps);
 }
 
 
@@ -318,6 +394,24 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   // speedups on this machine are not quotable: load average 19 on 6 cores while
   // measuring, and identical runs varied 2x. The scan reduction is a 15-30x
   // change and survives that; the net does not.)
+  //
+  // WHAT THE CLOSED FORM COSTS, measured against the per-node scan it replaced:
+  //
+  //     sweep truncations   2554/4500 -> 1518/4500
+  //     worst loss          6.9e-12   -> 7.4e-20  (of a 1e-11 budget)
+  //     pre-filter nout     14.2%     -> 17.4%
+  //
+  // Nine orders of unused budget: the collective bound charges F(mu), the
+  // largest theta, against every node including the small-t ones that dominate
+  // the sum. Weighting each Hermite order by its own E mass (the A_ord branch)
+  // was added to recover high-L tightness and does not close this -- the
+  // looseness is the mu substitution, not the L factor.
+  //
+  // The way back, not taken here: use the closed form to get a valid starting
+  // index cheaply, then walk DOWN from it accumulating the exact tail while it
+  // stays under eps. Cost is O(keep_closed - keep_exact) rather than O(nt), so
+  // it is cheap exactly when the two are close and expensive when the gain is
+  // largest -- which needs measuring before it is worth doing.
   const int npair = static_cast<int>(pair_list.size());
   std::vector<Real> hE(static_cast<std::size_t>(npair) * 3);
   std::vector<Real> hp(npair), hP(static_cast<std::size_t>(npair) * 3);
@@ -329,6 +423,17 @@ void t_screen_batch(QuartetBatch<Real> &batch,
     hlb[i] = pair_list[i].lb;
     for (int d = 0; d < 3; ++d) hP[3 * i + d] = Real(pair_list[i].P[d]);
   }
+  // per-order E mass, ragged: pair i occupies 3*(la+lb+1) entries at hEoff[i]
+  std::vector<int> hEoff(npair);
+  int etot = 0;
+  for (int i = 0; i < npair; ++i) {
+    hEoff[i] = etot;
+    etot += 3 * (pair_list[i].la + pair_list[i].lb + 1);
+  }
+  std::vector<Real> hEn(etot);
+  for (int i = 0; i < npair; ++i) detail::pair_e_absmax_n(pair_list[i], &hEn[hEoff[i]]);
+  auto dEn = detail::to_device(hEn, "tscr::En");
+  auto dEoff = detail::to_device(hEoff, "tscr::Eoff");
   auto dE = detail::to_device(hE, "tscr::E"), dp = detail::to_device(hp, "tscr::p");
   auto dP = detail::to_device(hP, "tscr::P");
   auto dla = detail::to_device(hla, "tscr::la"), dlb = detail::to_device(hlb, "tscr::lb");
@@ -354,6 +459,7 @@ void t_screen_batch(QuartetBatch<Real> &batch,
           keep(q) = 0;
           return;
         }
+        const int nbh = dla(ib) + dlb(ib) + 1, nkh = dla(ik) + dlb(ik) + 1;
         Real R2 = 0;
         for (int d = 0; d < 3; ++d) {
           const Real dx = dP(3 * ib + d) - dP(3 * ik + d);
@@ -372,6 +478,11 @@ void t_screen_batch(QuartetBatch<Real> &batch,
         // step is an upper bound, so the result is still rigorous -- just looser,
         // which costs some truncation depth and buys the whole scan.
         const Real mu = p * qq / (p + qq);
+        // pref^3, one power per Cartesian direction (see the host path)
+        const Real pr = pi / sqrt_(p * qq);
+        const Real pref3 = pr * pr * pr;
+
+        // (a) FACTORISED: max_n |B_n| charged against the whole E mass.
         Real best = 0, pw = 1, fact = 1;
         const Real smu = sqrt_(2 * mu);
         for (int m = 0; m <= L; ++m) {
@@ -382,10 +493,31 @@ void t_screen_batch(QuartetBatch<Real> &batch,
           const Real v = pw * fact;
           if (v > best) best = v;
         }
-        // pref^3, one power per Cartesian direction (see the host path)
-        const Real pr = pi / sqrt_(p * qq);
-        const Real A = pr * pr * pr * kc * kc * kc * best * wsum;
-        const Real C = Epref * A;
+        const Real A_fac = pref3 * kc * kc * kc * best * wsum * Epref;
+
+        // (b) PER ORDER: weight each Hermite order by its own E mass. Using
+        //     sqrt((ta+tb)!) <= sqrt(ta!) sqrt(tb!) 2^{(ta+tb)/2} the double sum
+        //     factorises into one polynomial per pair per direction,
+        //       G(theta) = sum_n F_n sqrt(n!) (4 theta)^{n/2},
+        //     which is far tighter at high angular momentum: (a) charges
+        //     sqrt(L!) -- 21886 at L = 12 -- against E mass that is not there.
+        const Real s4 = sqrt_(4 * mu);
+        Real A_ord = pref3 * kc * kc * kc * wsum;
+        for (int d = 0; d < 3; ++d) {
+          Real gb = 0, pwb = 1, fb = 1;
+          for (int n = 0; n < nbh; ++n) {
+            if (n > 0) { pwb *= s4; fb *= sqrt_(Real(n)); }
+            gb += dEn(dEoff(ib) + d * nbh + n) * fb * pwb;
+          }
+          Real gk = 0, pwk = 1, fk = 1;
+          for (int n = 0; n < nkh; ++n) {
+            if (n > 0) { pwk *= s4; fk *= sqrt_(Real(n)); }
+            gk += dEn(dEoff(ik) + d * nkh + n) * fk * pwk;
+          }
+          A_ord *= gb * gk;
+        }
+        // both are valid upper bounds, so use the smaller
+        const Real C = A_fac < A_ord ? A_fac : A_ord;
         if (!(C > eps)) { // even the whole tail is negligible
           keep(q) = 0;
           return;
@@ -434,12 +566,23 @@ std::vector<int> t_screen_keeps(const std::vector<std::pair<int, int>> &quartets
                                 const TGrid<Real> &grid, Real eps) {
   const int npair = static_cast<int>(pair_list.size());
   std::vector<Real> Eabs(static_cast<std::size_t>(npair) * 3);
-  for (int i = 0; i < npair; ++i) detail::pair_e_absmax(pair_list[i], &Eabs[3 * i]);
+  std::vector<int> Foff(npair);
+  int ftot = 0;
+  for (int i = 0; i < npair; ++i) {
+    Foff[i] = ftot;
+    ftot += 3 * (pair_list[i].la + pair_list[i].lb + 1);
+  }
+  std::vector<Real> Fn(ftot);
+  for (int i = 0; i < npair; ++i) {
+    detail::pair_e_absmax(pair_list[i], &Eabs[3 * i]);
+    detail::pair_e_absmax_n(pair_list[i], &Fn[Foff[i]]);
+  }
   std::vector<int> keep(quartets.size());
   for (std::size_t q = 0; q < quartets.size(); ++q) {
     const auto [ib, ik] = quartets[q];
     keep[q] = detail::t_screen_keep_pre(pair_list[ib], pair_list[ik], &Eabs[3 * ib],
-                                        &Eabs[3 * ik], grid, eps);
+                                        &Eabs[3 * ik], &Fn[Foff[ib]], &Fn[Foff[ik]], grid,
+                                        eps);
   }
   return keep;
 }
