@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "intti/quartet.hpp"
+#include "intti/rigrad.hpp"
 #include "intti/screening.hpp"
 #include "intti/tgrid.hpp"
 
@@ -278,4 +279,55 @@ TEST(Screening, PaysOnExtendedSystemsNotCompactOnes) {
                         "still an upper bound before believing it";
   EXPECT_LT(fe, 0.2) << "the extended case no longer screens: the estimate has regressed";
   EXPECT_LT(fe, fc / 3) << "screening no longer discriminates by system extent";
+}
+// Screening a DERIVATIVE batch must not amplify. The quartets there are
+// promoted/demoted pairs combined with md_grad_terms coefficients of -2*alpha
+// and l, so a per-quartet bound of eps could in principle come out of the
+// digest multiplied by 2*alpha -- which reaches 1e6 for a tight basis function.
+//
+// It does not: the output error stays at or below eps for exponents spanning
+// six decades, and in practice sits at the Hessian's own round-off floor.
+//
+// Honest about what this shows: it is a GUARD, not a demonstration. The error
+// is independent of eps across four decades, which means screening is only
+// removing quartets that contribute nothing here -- the desired behaviour, but
+// it leaves the amplification path itself unexercised. If a case is found where
+// t-screening materially changes an RI derivative, this test should be
+// retargeted at it.
+TEST(Screening, DerivativeScreeningDoesNotAmplify) {
+  auto grid = intti::make_tgrid(intti::coulomb<double>());
+  auto probe = [&](double atight, double aloose) {
+    std::vector<intti::PrimitiveShell<double>> osh, ash;
+    for (int i = 0; i < 4; ++i) {
+      const double z = i * 20.0;
+      osh.push_back({atight, {0, 0, z}, 0});
+      osh.push_back({aloose, {0, 0, z}, 1});
+      ash.push_back({atight * 2, {0, 0, z}, 0});
+      ash.push_back({aloose * 2, {0, 0, z}, 1});
+    }
+    auto orb = intti::make_basis(osh);
+    auto aux = intti::make_basis(ash);
+    const int n = orb.nao;
+    std::vector<double> D(static_cast<std::size_t>(n) * n);
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) D[i * n + j] = 0.1 + 0.3 * std::sin(0.7 * i + 1.3 * j);
+    for (int i = 0; i < n; ++i)
+      for (int j = i + 1; j < n; ++j) D[i * n + j] = D[j * n + i];
+    const auto ref = intti::ri_j_hessian(orb, aux, D.data(), grid, 1e-12, 0, 0.0);
+    double scale = 0;
+    for (double v : ref) scale = std::max(scale, std::abs(v));
+    EXPECT_GT(scale, 1e-2) << "Hessian trivially zero";
+    for (double eps : {1e-12, 1e-10, 1e-8}) {
+      const auto got = intti::ri_j_hessian(orb, aux, D.data(), grid, 1e-12, 0, eps);
+      double worst = 0;
+      for (std::size_t i = 0; i < ref.size(); ++i)
+        worst = std::max(worst, std::abs(got[i] - ref[i]));
+      // a factor of 10 of headroom over eps; 2*alpha would be up to 1e6
+      EXPECT_LT(worst, std::max(eps * 10, 1e-11 * scale))
+          << "derivative screening amplified: alpha_max=" << atight << " eps=" << eps;
+    }
+  };
+  probe(2.2, 0.45);
+  probe(11720.0, 0.0737); // cc-pVDZ oxygen span
+  probe(1.0e6, 0.05);
 }

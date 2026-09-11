@@ -240,6 +240,43 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
 }
 
 
+// WHICH CALL SITES MAY USE THIS, and why the rest do not yet.
+//
+// Wired: jk_build's general path (its tau IS the Schwarz tolerance and bounds
+// the same thing) and the two RI Hessians (new tau_screen, default off).
+//
+//   * GIAO (giao2e.hpp) -- CANNOT, as written. t_screen_keep reads
+//     Real(sp.P[d]) and pair_charge_bound is real-pairs-only, while a London
+//     pair carries a complex product centre and prefactor. Note though that
+//     hermite_b keeps theta REAL for GIAOs and only X goes complex, so the
+//     per-node bound needs |e^{-theta X^2/2}| = e^{-theta Re(X^2)/2} rather
+//     than a fresh derivation -- more tractable than the real monopole
+//     construction was.
+//
+//   * Derivative quartets (erigrad, erihess, the remaining rigrad passes) --
+//     VALID but needs the check below. Their quartets are promoted/demoted
+//     pairs recombined with md_grad_terms coefficients of -2*alpha and l, so a
+//     per-quartet bound of eps could in principle emerge multiplied by 2*alpha,
+//     which is 1e6 for a tight function. Measured across six decades of
+//     exponent it does not (see DerivativeScreeningDoesNotAmplify), but that
+//     test could not construct a case where screening materially moves the
+//     result, so the path is guarded rather than demonstrated.
+//
+//   * Cholesky (cholesky.hpp) -- NOT without thought. The pivoted decomposition
+//     selects on diagonal magnitudes; perturbing them by eps perturbs the pivot
+//     ORDER, which is a discrete choice rather than a bounded error.
+//
+//   * The Schwarz pass itself (fock.hpp, make_batch(pairs, diag)) -- NEVER.
+//     It defines the tolerance the screening is measured against.
+//
+//   * 2c/3c (ncenter.hpp) and cross-basis (crossbasis.hpp) -- should be fine,
+//     real pairs and the plain Coulomb kernel, but they take no screening
+//     tolerance today and are not on any measured hot path.
+//
+//   * SOC (soc.hpp) -- unexamined. Its operator is not the plain Coulomb
+//     kernel, so the e^{-theta R^2} factor this rests on needs re-deriving
+//     before the bound can be claimed.
+
 /// Fill a batch's per-quartet node counts from t_screen_keep, so the engine
 /// evaluates each quartet on only the prefix of the grid it needs.
 ///
