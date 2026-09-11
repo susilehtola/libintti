@@ -252,21 +252,99 @@ void t_screen_batch(QuartetBatch<Real> &batch,
                     const std::vector<ShellPair<Real>> &pair_list,
                     const TGrid<Real> &grid, Real eps) {
   const int nt = grid.n();
+  // Two things keep this from costing more than it saves.
+  //
   // The E-coefficient factors depend on the PAIR, not the quartet, so they are
-  // built once per pair rather than twice per quartet. Without this the
-  // screening pass calls e_coeffs O(nq) times and can cost more than it saves.
+  // built once per pair rather than twice per quartet -- otherwise e_coeffs runs
+  // O(nq) times.
+  //
+  // And the per-quartet scan runs ON DEVICE. As a serial host loop it measured
+  // 156 ms against 70 ms of (screened) integral evaluation on a 9-atom chain --
+  // the screening dominated the work it was removing.
+  //
+  // STILL THE LIMIT, measured back-to-back (this machine's absolute timings vary
+  // ~4x between runs, so only same-run ratios mean anything):
+  //
+  //     compact 9-atom   net 1.23x   scan is  1% of the screened time
+  //     chain   9-atom   net 3.07x   scan is 48%
+  //     chain  16-atom   net 5.72x   scan is 51%
+  //
+  // So a 100x reduction in nodes realises ~6x, because the scan costs about as
+  // much as the integrals it saves. It is transcendental-bound: ~450 exp/sqrt
+  // per quartet walking the node list. The fix is to stop walking it -- bound
+  // the discarded tail collectively as A(p,q) * exp(-theta_i R^2 / 2) with A
+  // independent of R, so the crossing point is solved for instead of scanned.
+  // A depends only on the two pair exponents and can be cached across quartets
+  // sharing them. Not done here.
   const int npair = static_cast<int>(pair_list.size());
-  std::vector<Real> Eabs(static_cast<std::size_t>(npair) * 3);
-  for (int i = 0; i < npair; ++i) detail::pair_e_absmax(pair_list[i], &Eabs[3 * i]);
-  std::vector<int> keep(batch.nq, nt);
-  for (int q = 0; q < batch.nq; ++q) {
-    const auto [ib, ik] = batch.h_quartets[q];
-    keep[q] = detail::t_screen_keep_pre(pair_list[ib], pair_list[ik], &Eabs[3 * ib],
-                                        &Eabs[3 * ik], grid, eps);
+  std::vector<Real> hE(static_cast<std::size_t>(npair) * 3);
+  std::vector<Real> hp(npair), hP(static_cast<std::size_t>(npair) * 3);
+  std::vector<int> hla(npair), hlb(npair);
+  for (int i = 0; i < npair; ++i) {
+    detail::pair_e_absmax(pair_list[i], &hE[3 * i]);
+    hp[i] = pair_list[i].p;
+    hla[i] = pair_list[i].la;
+    hlb[i] = pair_list[i].lb;
+    for (int d = 0; d < 3; ++d) hP[3 * i + d] = Real(pair_list[i].P[d]);
   }
-  auto h = Kokkos::create_mirror_view(batch.keep);
-  for (int q = 0; q < batch.nq; ++q) h(q) = keep[q];
-  Kokkos::deep_copy(batch.keep, h);
+  auto dE = detail::to_device(hE, "tscr::E"), dp = detail::to_device(hp, "tscr::p");
+  auto dP = detail::to_device(hP, "tscr::P");
+  auto dla = detail::to_device(hla, "tscr::la"), dlb = detail::to_device(hlb, "tscr::lb");
+  std::vector<int> hqb(batch.nq), hqk(batch.nq);
+  for (int q = 0; q < batch.nq; ++q) {
+    hqb[q] = batch.h_quartets[q].first;
+    hqk[q] = batch.h_quartets[q].second;
+  }
+  auto dqb = detail::to_device(hqb, "tscr::qb"), dqk = detail::to_device(hqk, "tscr::qk");
+  auto tv = grid.t_dev, wv = grid.w_dev;
+  auto keep = batch.keep;
+  const Real pi = pi_v<Real>();
+  const Real kc = Real(1.086435);
+  Kokkos::parallel_for(
+      "intti::tscreen", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int q) {
+        const int ib = dqb(q), ik = dqk(q);
+        Real Epref = 1;
+        for (int d = 0; d < 3; ++d) Epref *= dE(3 * ib + d) * dE(3 * ik + d);
+        if (!(Epref > Real(0))) {
+          keep(q) = 0;
+          return;
+        }
+        Real R2 = 0;
+        for (int d = 0; d < 3; ++d) {
+          const Real dx = dP(3 * ib + d) - dP(3 * ik + d);
+          R2 += dx * dx;
+        }
+        const int L = dla(ib) + dlb(ib) + dla(ik) + dlb(ik);
+        const Real p = dp(ib), qq = dp(ik);
+        Real tail = 0;
+        int ans = 0;
+        for (int i = nt - 1; i >= 0; --i) {
+          const Real t = tv(i);
+          const Real D = p * qq + t * t * (p + qq);
+          const Real theta = t * t * p * qq / D;
+          // Cramer factor: k^3 max_{m<=L} (2 theta)^{m/2} sqrt(m!)
+          Real best = 0, pw = 1, fact = 1;
+          const Real st = sqrt_(2 * theta);
+          for (int m = 0; m <= L; ++m) {
+            if (m > 0) {
+              pw *= st;
+              fact *= sqrt_(Real(m));
+            }
+            const Real v = pw * fact;
+            if (v > best) best = v;
+          }
+          const Real wabs = wv(i) < 0 ? -wv(i) : wv(i);
+          const Real b = wabs * (pi / sqrt_(D)) * Epref * kc * kc * kc * best *
+                         exp_(-theta * R2 / 2);
+          if (tail + b > eps) {
+            ans = i + 1;
+            break;
+          }
+          tail += b;
+        }
+        keep(q) = ans;
+      });
+  Kokkos::fence();
   batch.nt_full = nt;
 }
 

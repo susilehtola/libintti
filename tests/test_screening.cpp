@@ -9,6 +9,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <vector>
 
 #include <gtest/gtest.h>
