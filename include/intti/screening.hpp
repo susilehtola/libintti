@@ -262,20 +262,19 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   // 156 ms against 70 ms of (screened) integral evaluation on a 9-atom chain --
   // the screening dominated the work it was removing.
   //
-  // STILL THE LIMIT, measured back-to-back (this machine's absolute timings vary
-  // ~4x between runs, so only same-run ratios mean anything):
+  // Walking the node list term by term made the scan ~450 transcendentals per
+  // quartet, and it became the limit: 48-51% of the screened runtime on chains,
+  // so a 100x cut in nodes realised only ~6x of wall clock. The closed form
+  // below removed it:
   //
-  //     compact 9-atom   net 1.23x   scan is  1% of the screened time
-  //     chain   9-atom   net 3.07x   scan is 48%
-  //     chain  16-atom   net 5.72x   scan is 51%
+  //     scan time, 9-atom chain    224 ms -> 6 ms
+  //     scan time, 16-atom chain  1553 ms -> ~100-270 ms
+  //     nodes kept, 16-atom chain  1.0%  -> 1.5%
   //
-  // So a 100x reduction in nodes realises ~6x, because the scan costs about as
-  // much as the integrals it saves. It is transcendental-bound: ~450 exp/sqrt
-  // per quartet walking the node list. The fix is to stop walking it -- bound
-  // the discarded tail collectively as A(p,q) * exp(-theta_i R^2 / 2) with A
-  // independent of R, so the crossing point is solved for instead of scanned.
-  // A depends only on the two pair exponents and can be cached across quartets
-  // sharing them. Not done here.
+  // -- a little truncation depth traded for essentially the whole scan. (Net
+  // speedups on this machine are not quotable: load average 19 on 6 cores while
+  // measuring, and identical runs varied 2x. The scan reduction is a 15-30x
+  // change and survives that; the net does not.)
   const int npair = static_cast<int>(pair_list.size());
   std::vector<Real> hE(static_cast<std::size_t>(npair) * 3);
   std::vector<Real> hp(npair), hP(static_cast<std::size_t>(npair) * 3);
@@ -297,6 +296,9 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   }
   auto dqb = detail::to_device(hqb, "tscr::qb"), dqk = detail::to_device(hqk, "tscr::qk");
   auto tv = grid.t_dev, wv = grid.w_dev;
+  Real wsum_h = 0;
+  for (int i = 0; i < nt; ++i) wsum_h += std::abs(grid.w[i]);
+  const Real wsum = wsum_h;
   auto keep = batch.keep;
   const Real pi = pi_v<Real>();
   const Real kc = Real(1.086435);
@@ -316,33 +318,60 @@ void t_screen_batch(QuartetBatch<Real> &batch,
         }
         const int L = dla(ib) + dlb(ib) + dla(ik) + dlb(ik);
         const Real p = dp(ib), qq = dp(ik);
-        Real tail = 0;
-        int ans = 0;
-        for (int i = nt - 1; i >= 0; --i) {
-          const Real t = tv(i);
-          const Real D = p * qq + t * t * (p + qq);
-          const Real theta = t * t * p * qq / D;
-          // Cramer factor: k^3 max_{m<=L} (2 theta)^{m/2} sqrt(m!)
-          Real best = 0, pw = 1, fact = 1;
-          const Real st = sqrt_(2 * theta);
-          for (int m = 0; m <= L; ++m) {
-            if (m > 0) {
-              pw *= st;
-              fact *= sqrt_(Real(m));
-            }
-            const Real v = pw * fact;
-            if (v > best) best = v;
+        // The discarded tail is bounded COLLECTIVELY rather than summed term by
+        // term, which turns an O(nt) walk with ~450 transcendentals into O(1):
+        //
+        //   sum_{j>=i} w_j (pi/sqrt(D_j)) F(theta_j) e^{-theta_j R^2/2}
+        //     <= e^{-theta_i R^2/2} * (pi/sqrt(pq)) * F(mu) * sum_j |w_j|
+        //
+        // using theta_j increasing (so the exponential is largest at j = i),
+        // D_j >= pq, theta_j <= mu = pq/(p+q), and F increasing in theta. Every
+        // step is an upper bound, so the result is still rigorous -- just looser,
+        // which costs some truncation depth and buys the whole scan.
+        const Real mu = p * qq / (p + qq);
+        Real best = 0, pw = 1, fact = 1;
+        const Real smu = sqrt_(2 * mu);
+        for (int m = 0; m <= L; ++m) {
+          if (m > 0) {
+            pw *= smu;
+            fact *= sqrt_(Real(m));
           }
-          const Real wabs = wv(i) < 0 ? -wv(i) : wv(i);
-          const Real b = wabs * (pi / sqrt_(D)) * Epref * kc * kc * kc * best *
-                         exp_(-theta * R2 / 2);
-          if (tail + b > eps) {
-            ans = i + 1;
-            break;
-          }
-          tail += b;
+          const Real v = pw * fact;
+          if (v > best) best = v;
         }
-        keep(q) = ans;
+        const Real A = (pi / sqrt_(p * qq)) * kc * kc * kc * best * wsum;
+        const Real C = Epref * A;
+        if (!(C > eps)) { // even the whole tail is negligible
+          keep(q) = 0;
+          return;
+        }
+        if (!(R2 > Real(0))) { // coincident centres: no distance decay to exploit
+          keep(q) = nt;
+          return;
+        }
+        // need theta_i > theta* for the tail beyond i to fall under eps
+        const Real thstar = 2 * log_(C / eps) / R2;
+        if (thstar >= mu) { // theta saturates below the threshold: keep all
+          keep(q) = nt;
+          return;
+        }
+        // theta(t) > thstar  <=>  t^2 > thstar pq / (pq - thstar (p+q))
+        const Real den = p * qq - thstar * (p + qq);
+        if (!(den > Real(0))) {
+          keep(q) = nt;
+          return;
+        }
+        const Real t2star = thstar * p * qq / den;
+        // keep the nodes with t^2 <= t2star; grid.t is ascending
+        int lo = 0, hi = nt; // first index with t^2 > t2star
+        while (lo < hi) {
+          const int mid = (lo + hi) / 2;
+          if (tv(mid) * tv(mid) > t2star)
+            hi = mid;
+          else
+            lo = mid + 1;
+        }
+        keep(q) = lo;
       });
   Kokkos::fence();
   batch.nt_full = nt;
