@@ -45,6 +45,7 @@
 #include "hermite1d.hpp"
 #include "math.hpp"
 #include "nuclear.hpp" // PointCharge
+#include "screening.hpp"
 #include "tgrid.hpp"
 
 namespace intti {
@@ -263,6 +264,10 @@ template <class Real> struct SO2eBatch {
   Kokkos::View<int *> qa, qb, qc, qd, e00, e01, e10, e11, shL, shOff, ksw;
   Kokkos::View<std::int64_t *> boff; ///< 64-bit: see QuartetBatch::out_offset
   int njob{0}, nao{0};
+  /// Fraction of the full grid the screened batch actually evaluates (1 when
+  /// screening is off). Reported so the saving can be measured rather than
+  /// assumed.
+  double node_fraction{1.0};
 };
 
 /// `tau` (0 = off) screens the ordered quartet loop with a Schwarz bound on the
@@ -369,6 +374,33 @@ SO2eBatch<Real> build_so2e_batch(const ShellBasis<Real> &basis, const TGrid<Real
           e11.push_back((la >= 1 && lb >= 1) ? emit(-1, -1) : -1);
         }
   auto batch = make_batch(tab, quartets);
+  // t-resolved node truncation (screening.hpp). The 2e spin-orbit quartets are
+  // ordinary Coulomb ERIs over shifted pairs, so the per-node bound applies
+  // unchanged -- what does not carry over is the tolerance: the digest weights
+  // each block by the MD centre-shift coefficients, so a quartet truncated at
+  // tau reaches W multiplied by up to max(2 alpha, l) per bra shell. That factor
+  // is handed to the screener per quartet (the max over the jobs that read it),
+  // exactly the factor the Schwarz pass above already uses.
+  if (tau > Real(0)) {
+    std::vector<Real> hamp(quartets.size(), Real(1));
+    for (std::size_t j = 0; j < qa.size(); ++j) {
+      const Real f = scale(qa[j]) * scale(qb[j]);
+      const int ee[4] = {e00[j], e01[j], e10[j], e11[j]};
+      for (int k = 0; k < 4; ++k)
+        if (ee[k] >= 0) {
+          const int e = ee[k] / 2;
+          if (f > hamp[e]) hamp[e] = f;
+        }
+    }
+    auto damp = to_device(hamp, "intti::so2e::amp");
+    t_screen_batch(batch, plist, grid, tau, 16, damp);
+    auto hkeep = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, batch.keep);
+    std::int64_t kept = 0;
+    for (int q = 0; q < batch.nq; ++q) kept += hkeep(q);
+    B.node_fraction = batch.nq ? static_cast<double>(kept) /
+                                     (static_cast<double>(batch.nq) * grid.n())
+                               : 1.0;
+  }
   QuartetWorkspace<Real> ws;
   B.out = Kokkos::View<Real *>("intti::so2e::out", batch.nout_total);
   eri_quartets(tab, batch, grid, B.out, ws);

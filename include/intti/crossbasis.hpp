@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "batch.hpp"
+#include "screening.hpp" // t_screen_batch
 #include "device.hpp"
 #include "fock.hpp"
 #include "gto.hpp"
@@ -61,7 +62,8 @@ template <class Real> struct CrossBatch {
 /// With bra == ket this is exactly coulomb_build.
 template <class Real>
 std::vector<Real> coulomb_cross(const ShellBasis<Real> &bra, const ShellBasis<Real> &ket,
-                                const Real *D, const TGrid<Real> &grid) {
+                                const Real *D, const TGrid<Real> &grid,
+                                Real tau_screen = Real(0)) {
   const int nA = bra.nao, nB = ket.nao;
   const int nsA = static_cast<int>(bra.shells.size());
   const int nsB = static_cast<int>(ket.shells.size());
@@ -97,6 +99,18 @@ std::vector<Real> coulomb_cross(const ShellBasis<Real> &bra, const ShellBasis<Re
       hqk.push_back(ik);
     }
   auto batch = make_batch(tab, quartets);
+  // t-resolved node truncation. The digest weights each quartet by a density
+  // element, so the per-quartet budget is tau_screen divided by max|D| -- a
+  // single scalar, since the bound is over the whole matrix rather than the
+  // block a given quartet reaches. Conservative, hence safe.
+  if (tau_screen > Real(0)) {
+    Real dmax = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(nB) * nB; ++i) {
+      const Real a = D[i] < Real(0) ? -D[i] : D[i];
+      if (a > dmax) dmax = a;
+    }
+    if (dmax > Real(0)) t_screen_batch(batch, plist, grid, tau_screen / dmax);
+  }
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::xj::out", batch.nout_total);
   eri_quartets(tab, batch, grid, out, ws);
@@ -135,7 +149,8 @@ std::vector<Real> coulomb_cross(const ShellBasis<Real> &bra, const ShellBasis<Re
 /// exchange_build.
 template <class Real>
 std::vector<Real> exchange_cross(const ShellBasis<Real> &bra, const ShellBasis<Real> &ket,
-                                 const Real *D, const TGrid<Real> &grid) {
+                                 const Real *D, const TGrid<Real> &grid,
+                                 Real tau_screen = Real(0)) {
   const int nA = bra.nao, nB = ket.nao;
   const int nsA = static_cast<int>(bra.shells.size());
   const int nsB = static_cast<int>(ket.shells.size());
@@ -173,6 +188,18 @@ std::vector<Real> exchange_cross(const ShellBasis<Real> &bra, const ShellBasis<R
       hqk.push_back(ik);
     }
   auto batch = make_batch(tab, quartets);
+  // t-resolved node truncation. The digest weights each quartet by a density
+  // element, so the per-quartet budget is tau_screen divided by max|D| -- a
+  // single scalar, since the bound is over the whole matrix rather than the
+  // block a given quartet reaches. Conservative, hence safe.
+  if (tau_screen > Real(0)) {
+    Real dmax = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(nB) * nB; ++i) {
+      const Real a = D[i] < Real(0) ? -D[i] : D[i];
+      if (a > dmax) dmax = a;
+    }
+    if (dmax > Real(0)) t_screen_batch(batch, plist, grid, tau_screen / dmax);
+  }
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::xk::out", batch.nout_total);
   eri_quartets(tab, batch, grid, out, ws);

@@ -351,7 +351,17 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
 // WHICH CALL SITES MAY USE THIS, and why the rest do not yet.
 //
 // Wired: jk_build's general path (its tau IS the Schwarz tolerance and bounds
-// the same thing) and the two RI Hessians (new tau_screen, default off).
+// the same thing), the two RI Hessians (tau_screen, default off), the 2e
+// spin-orbit build, the 2-/3-centre n-centre builds (primitive and contracted),
+// and the cross-basis J/K. Everything but jk_build defaults to off.
+//
+// The pattern that made the last four possible is the `amp` argument: the
+// screener bounds the QUARTET, but what the caller cares about is the error in
+// the matrix or tensor its digest builds, and every digest but a plain ERI one
+// multiplies the quartet by something first -- an MD centre-shift coefficient
+// (SOC), a contraction coefficient (contracted n-centre), a density element
+// (cross-basis). Handing that factor to the screener per quartet keeps eps
+// meaning "absolute error in the output".
 //
 //   * GIAO (giao2e.hpp) -- CANNOT, as written. t_screen_keep reads
 //     Real(sp.P[d]) and pair_charge_bound is real-pairs-only, while a London
@@ -377,9 +387,14 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
 //   * The Schwarz pass itself (fock.hpp, make_batch(pairs, diag)) -- NEVER.
 //     It defines the tolerance the screening is measured against.
 //
-//   * 2c/3c (ncenter.hpp) and cross-basis (crossbasis.hpp) -- should be fine,
-//     real pairs and the plain Coulomb kernel, but they take no screening
-//     tolerance today and are not on any measured hot path.
+//   * 2c/3c (ncenter.hpp) and cross-basis (crossbasis.hpp) -- WIRED, opt-in
+//     tau_screen on each public entry. Real pairs and the plain Coulomb kernel,
+//     so the bound is the unmodified one; only the budget changes. Contracted
+//     n-centre divides by the largest effective coefficient (prim_eff_max),
+//     cross-basis by max|D|. The cross-basis factor is a single scalar rather
+//     than per quartet: the bound is over the whole density matrix, not the
+//     block a given quartet reaches. Looser than it needs to be, and cheap
+//     enough that tightening it has not been worth doing.
 //
 //   * SOC (soc.hpp) -- unexamined. Its operator is not the plain Coulomb
 //     kernel, so the e^{-theta R^2} factor this rests on needs re-deriving
@@ -392,10 +407,19 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
 /// this narrows it. eps is an absolute bound on the discarded contribution per
 /// quartet, so it should be set against the tolerance the caller already uses
 /// for Schwarz rather than independently.
+///
+/// `amp` (optional, one entry per batch quartet) is the factor by which the
+/// caller's digest multiplies that quartet before it reaches the output. The
+/// per-quartet budget becomes eps/amp(q), so eps keeps meaning "absolute error
+/// in the quantity the caller actually builds". Derivative-like digests need
+/// this: an MD centre-shift coefficient is -2 alpha, which is 1e6 for a tight
+/// function, and a quartet screened at eps would land in the output at 1e6 eps.
+/// Leave it empty for a plain ERI digest, where the factor is 1.
 template <class Real>
 void t_screen_batch(QuartetBatch<Real> &batch,
                     const std::vector<ShellPair<Real>> &pair_list,
-                    const TGrid<Real> &grid, Real eps, int refine = 16) {
+                    const TGrid<Real> &grid, Real eps, int refine = 16,
+                    const Kokkos::View<Real *> &amp = Kokkos::View<Real *>()) {
   const int nt = grid.n();
   // Two things keep this from costing more than it saves.
   //
@@ -487,12 +511,15 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   for (int i = 0; i < nt; ++i) wsum_h += std::abs(grid.w[i]);
   const Real wsum = wsum_h;
   auto keep = batch.keep;
+  auto ampv = amp;
+  const Real eps0 = eps;
   const Real pi = pi_v<Real>();
   const Real kc = Real(1.086435);
   const int refine_n = refine;
   Kokkos::parallel_for(
       "intti::tscreen", Kokkos::RangePolicy<>(0, batch.nq), KOKKOS_LAMBDA(int q) {
         const int ib = dqb(q), ik = dqk(q);
+        const Real eps = ampv.extent(0) ? eps0 / ampv(q) : eps0;
         Real Epref = 1;
         for (int d = 0; d < 3; ++d) Epref *= dE(3 * ib + d) * dE(3 * ik + d);
         if (!(Epref > Real(0))) {

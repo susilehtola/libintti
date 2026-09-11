@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "batch.hpp"      // PairTable, make_batch, eri_quartets (device driver)
+#include "screening.hpp" // t_screen_batch
 #include "contracted.hpp" // ContractedBasis, detail::effective_coeff/contracted_prim
 #include "device.hpp"     // detail::to_device / to_host
 #include "fock.hpp"
@@ -57,7 +58,8 @@ bool pair_far(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
 
 /// Device (P|Q) metric over a primitive auxiliary basis.
 template <class Real>
-std::vector<Real> coulomb_2c_dev(const ShellBasis<Real> &aux, const TGrid<Real> &grid) {
+std::vector<Real> coulomb_2c_dev(const ShellBasis<Real> &aux, const TGrid<Real> &grid,
+                                 Real tau_screen = Real(0)) {
   const int naux = aux.nao;
   const int ns = static_cast<int>(aux.shells.size());
   std::vector<ShellPair<Real>> plist(ns);
@@ -73,6 +75,7 @@ std::vector<Real> coulomb_2c_dev(const ShellBasis<Real> &aux, const TGrid<Real> 
     for (int b = 0; b <= a; ++b) quartets.push_back({a, b});
   sort_by_class(tab, quartets);
   auto batch = make_batch(tab, quartets);
+  if (tau_screen > Real(0)) t_screen_batch(batch, plist, grid, tau_screen);
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::c2c::out", batch.nout_total);
   eri_quartets(tab, batch, grid, out, ws);
@@ -99,7 +102,8 @@ std::vector<Real> coulomb_2c_dev(const ShellBasis<Real> &aux, const TGrid<Real> 
 /// Device (mu nu | P) tensor over primitive orbital + auxiliary bases (exact).
 template <class Real>
 std::vector<Real> coulomb_3c_dev(const ShellBasis<Real> &orb,
-                                 const ShellBasis<Real> &aux, const TGrid<Real> &grid) {
+                                 const ShellBasis<Real> &aux, const TGrid<Real> &grid,
+                                 Real tau_screen = Real(0)) {
   const int nao = orb.nao, naux = aux.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int nsa = static_cast<int>(aux.shells.size());
@@ -121,6 +125,7 @@ std::vector<Real> coulomb_3c_dev(const ShellBasis<Real> &orb,
     for (int a = 0; a < nsa; ++a) quartets.push_back({ib, nbra + a});
   sort_by_class(tab, quartets);
   auto batch = make_batch(tab, quartets);
+  if (tau_screen > Real(0)) t_screen_batch(batch, plist, grid, tau_screen);
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::c3c::out", batch.nout_total);
   eri_quartets(tab, batch, grid, out, ws);
@@ -165,6 +170,21 @@ std::vector<Real> coulomb_3c_dev(const ShellBasis<Real> &orb,
 
 /// Flat effective-coefficient table for a contracted basis: eff(shell,c,p) at
 /// eoff[shell] + c*nprim(shell) + p, plus per-shell l/nprim/nctr/ao_off arrays.
+/// Largest weight the contracted digest can apply to primitive p of a shell:
+/// max over contracted functions of |effective coefficient|. The t-resolved
+/// screener works on PRIMITIVE quartets, so a per-quartet budget of eps arrives
+/// in the contracted tensor multiplied by this -- handed to t_screen_batch as
+/// the amplification factor, exactly as the derivative digests do.
+template <class Real> Real prim_eff_max(const ContractedShell<Real> &s, int p) {
+  Real m = 0;
+  for (int c = 0; c < s.nctr(); ++c) {
+    const Real v = effective_coeff(s, c, p);
+    const Real a = v < Real(0) ? -v : v;
+    if (a > m) m = a;
+  }
+  return m;
+}
+
 template <class Real> struct ContractedDev {
   Kokkos::View<Real *> eff;
   Kokkos::View<int *> eoff, L, nprim, nctr, aoff;
@@ -199,7 +219,8 @@ ContractedDev<Real> to_contracted_dev(const ContractedBasis<Real> &b, const char
 }
 
 template <class Real>
-std::vector<Real> coulomb_2c_dev(const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+std::vector<Real> coulomb_2c_dev(const ContractedBasis<Real> &aux, const TGrid<Real> &grid,
+                                 Real tau_screen = Real(0)) {
   const int naux = aux.nao, ns = static_cast<int>(aux.shells.size());
   auto dv = to_contracted_dev(aux, "intti::c2cc::eff");
   // primitive ghost-quartets for canonical shell pairs A>=B, all (pa,pb)
@@ -219,6 +240,14 @@ std::vector<Real> coulomb_2c_dev(const ContractedBasis<Real> &aux, const TGrid<R
         }
   auto tab = make_pair_table(plist);
   auto batch = make_batch(tab, quartets);
+  if (tau_screen > Real(0)) {
+    std::vector<Real> hamp(quartets.size());
+    for (std::size_t q = 0; q < quartets.size(); ++q)
+      hamp[q] = prim_eff_max(aux.shells[qA[q]], qpa[q]) *
+                prim_eff_max(aux.shells[qB[q]], qpb[q]);
+    auto damp = to_device(hamp, "intti::c2cc::amp");
+    t_screen_batch(batch, plist, grid, tau_screen, 16, damp);
+  }
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::c2cc::out", batch.nout_total);
   eri_quartets(tab, batch, grid, out, ws);
@@ -272,7 +301,7 @@ std::vector<Real> coulomb_2c_dev(const ContractedBasis<Real> &aux, const TGrid<R
 template <class Real>
 std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
                                  const ContractedBasis<Real> &aux, const TGrid<Real> &grid,
-                                 int sa0, int sa1) {
+                                 int sa0, int sa1, Real tau_screen = Real(0)) {
   const int nao = orb.nao;
   const int nso = static_cast<int>(orb.shells.size());
   const int p0 = aux.ao_off[sa0], naux = aux.ao_off[sa1] - p0;
@@ -298,6 +327,15 @@ std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
             }
   auto tab = make_pair_table(plist);
   auto batch = make_batch(tab, quartets);
+  if (tau_screen > Real(0)) {
+    std::vector<Real> hamp(quartets.size());
+    for (std::size_t q = 0; q < quartets.size(); ++q)
+      hamp[q] = prim_eff_max(orb.shells[qM[q]], qpm[q]) *
+                prim_eff_max(orb.shells[qN[q]], qpn[q]) *
+                prim_eff_max(aux.shells[qA[q]], qpa[q]);
+    auto damp = to_device(hamp, "intti::c3cc::amp");
+    t_screen_batch(batch, plist, grid, tau_screen, 16, damp);
+  }
   QuartetWorkspace<Real> ws;
   Kokkos::View<Real *> out("intti::c3cc::out", batch.nout_total);
   eri_quartets(tab, batch, grid, out, ws);
@@ -348,9 +386,10 @@ std::vector<Real> coulomb_3c_dev(const ContractedBasis<Real> &orb,
 /// Two-center Coulomb metric (P|Q) over an auxiliary basis: naux x naux,
 /// row-major, primitive Cartesian, unnormalized.
 template <class Real>
-std::vector<Real> coulomb_2c(const ShellBasis<Real> &aux, const TGrid<Real> &grid) {
+std::vector<Real> coulomb_2c(const ShellBasis<Real> &aux, const TGrid<Real> &grid,
+                             Real tau_screen = Real(0)) {
   if constexpr (kokkos_scalar_v<Real>)
-    return detail::coulomb_2c_dev(aux, grid);
+    return detail::coulomb_2c_dev(aux, grid, tau_screen);
   const int naux = aux.nao;
   std::vector<Real> M(static_cast<std::size_t>(naux) * naux, Real(0));
   const int ns = static_cast<int>(aux.shells.size());
@@ -379,9 +418,9 @@ std::vector<Real> coulomb_2c(const ShellBasis<Real> &aux, const TGrid<Real> &gri
 template <class Real>
 std::vector<Real> coulomb_3c(const ShellBasis<Real> &orb,
                              const ShellBasis<Real> &aux, const TGrid<Real> &grid,
-                             Real far_tau = Real(0)) {
+                             Real far_tau = Real(0), Real tau_screen = Real(0)) {
   if constexpr (kokkos_scalar_v<Real>)
-    if (far_tau == Real(0)) return detail::coulomb_3c_dev(orb, aux, grid);
+    if (far_tau == Real(0)) return detail::coulomb_3c_dev(orb, aux, grid, tau_screen);
   const int nao = orb.nao, naux = aux.nao;
   std::vector<Real> T(static_cast<std::size_t>(nao) * nao * naux, Real(0));
   const int nso = static_cast<int>(orb.shells.size());
@@ -476,9 +515,10 @@ std::vector<Real> coulomb_3c_auxblock(const ShellBasis<Real> &orb,
 /// Two-center Coulomb metric (P|Q) over a generally-contracted auxiliary basis
 /// (naux x naux, PySCF cart=True normalization).
 template <class Real>
-std::vector<Real> coulomb_2c(const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
+std::vector<Real> coulomb_2c(const ContractedBasis<Real> &aux, const TGrid<Real> &grid,
+                             Real tau_screen = Real(0)) {
   if constexpr (kokkos_scalar_v<Real>)
-    return detail::coulomb_2c_dev(aux, grid);
+    return detail::coulomb_2c_dev(aux, grid, tau_screen);
   const int naux = aux.nao;
   std::vector<Real> M(static_cast<std::size_t>(naux) * naux, Real(0));
   const int ns = static_cast<int>(aux.shells.size());
@@ -531,9 +571,10 @@ std::vector<Real> coulomb_2c(const ContractedBasis<Real> &aux, const TGrid<Real>
 template <class Real>
 std::vector<Real> coulomb_3c_auxblock(const ContractedBasis<Real> &orb,
                                       const ContractedBasis<Real> &aux,
-                                      const TGrid<Real> &grid, int sa0, int sa1) {
+                                      const TGrid<Real> &grid, int sa0, int sa1,
+                                      Real tau_screen = Real(0)) {
   if constexpr (kokkos_scalar_v<Real>)
-    return detail::coulomb_3c_dev(orb, aux, grid, sa0, sa1);
+    return detail::coulomb_3c_dev(orb, aux, grid, sa0, sa1, tau_screen);
   const int nao = orb.nao;
   const int pbase = aux.ao_off[sa0], naux = aux.ao_off[sa1] - pbase;
   std::vector<Real> T(static_cast<std::size_t>(nao) * nao * naux, Real(0));
@@ -599,8 +640,10 @@ std::vector<Real> coulomb_3c_auxblock(const ContractedBasis<Real> &orb,
 /// shell. Kept as the one-liner it is, so there is a single implementation.
 template <class Real>
 std::vector<Real> coulomb_3c(const ContractedBasis<Real> &orb,
-                             const ContractedBasis<Real> &aux, const TGrid<Real> &grid) {
-  return coulomb_3c_auxblock(orb, aux, grid, 0, static_cast<int>(aux.shells.size()));
+                             const ContractedBasis<Real> &aux, const TGrid<Real> &grid,
+                             Real tau_screen = Real(0)) {
+  return coulomb_3c_auxblock(orb, aux, grid, 0, static_cast<int>(aux.shells.size()),
+                             tau_screen);
 }
 
 } // namespace intti

@@ -121,3 +121,33 @@ TEST(CrossBasis, CoulombOutputSymmetric) {
 }
 
 } // namespace
+
+// Cross-basis J and K over a chain, with the t-resolved node truncation on.
+// Their digest weights each quartet by a density element, so the per-quartet
+// budget is the tolerance divided by max|D|; the error must stay inside the
+// tolerance the caller asked for, not inside that intermediate.
+TEST(CrossBasis, ScreenedMatchesExact) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::PrimitiveShell<double>> ash, bsh;
+  for (int i = 0; i < 5; ++i) {
+    ash.push_back({1.0 + 0.3 * i, {4.0 * i, 0.0, 0.0}, i % 2});
+    bsh.push_back({0.9 + 0.25 * i, {4.0 * i, 0.6, 0.0}, (i + 1) % 2});
+  }
+  auto A = intti::make_basis(ash), B = intti::make_basis(bsh);
+  const int nB = B.nao;
+  std::vector<double> D(static_cast<std::size_t>(nB) * nB);
+  for (int i = 0; i < nB; ++i)
+    for (int j = 0; j < nB; ++j) D[i * nB + j] = (i == j ? 1.4 : 0.2 / (1 + std::abs(i - j)));
+
+  const auto J0 = intti::coulomb_cross(A, B, D.data(), grid);
+  const auto K0 = intti::exchange_cross(A, B, D.data(), grid);
+  for (double tau : {1e-12, 1e-10}) {
+    const auto J = intti::coulomb_cross(A, B, D.data(), grid, tau);
+    const auto K = intti::exchange_cross(A, B, D.data(), grid, tau);
+    double dj = 0, dk = 0;
+    for (std::size_t i = 0; i < J0.size(); ++i) dj = std::max(dj, std::abs(J[i] - J0[i]));
+    for (std::size_t i = 0; i < K0.size(); ++i) dk = std::max(dk, std::abs(K[i] - K0[i]));
+    EXPECT_LT(dj, tau) << "cross J screened beyond its budget at tau=" << tau;
+    EXPECT_LT(dk, tau) << "cross K screened beyond its budget at tau=" << tau;
+  }
+}

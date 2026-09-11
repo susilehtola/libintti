@@ -520,3 +520,63 @@ TEST(Screening, BoundsHoldAtHighAngularMomentum) {
          "worst MBIE true/est %.3f\n", checked, truncated, worst_loss, worst_mbie);
   EXPECT_GT(truncated, 0) << "no truncation at high L: the sweep proves nothing there";
 }
+
+// A digest that multiplies a quartet by a known factor before it reaches the
+// output must screen that quartet at a correspondingly tighter tolerance -- an
+// MD centre-shift coefficient is -2 alpha, so a quartet dropped at eps can land
+// in the result at 1e6 eps for a tight function. The `amp` argument expresses
+// that, and it must be EXACTLY a per-quartet rescale of eps: nothing else about
+// the estimate may depend on it.
+TEST(Screening, AmplificationIsExactlyAToleranceRescale) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<Shell> sh;
+  for (double z : {0.0, 0.8, 11.0, 11.7, 23.0}) {
+    sh.push_back(Shell{1.4, {0, 0, z}, 0});
+    sh.push_back(Shell{0.45, {0.3, 0, z}, 1});
+  }
+  std::vector<intti::ShellPair<double>> plist;
+  for (std::size_t i = 0; i < sh.size(); ++i)
+    for (std::size_t j = 0; j < sh.size(); ++j)
+      plist.push_back(intti::make_pair(sh[i], sh[j]));
+  auto tab = intti::make_pair_table(plist);
+  const int npair = static_cast<int>(plist.size());
+  std::vector<std::pair<int, int>> quartets;
+  for (int a = 0; a < npair; ++a)
+    for (int b = a; b < npair; ++b) quartets.push_back({a, b});
+
+  const double eps = 1e-10, f = 1e4;
+  auto grab = [&](intti::QuartetBatch<double> &b) {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, b.keep);
+    return std::vector<int>(h.data(), h.data() + b.nq);
+  };
+
+  auto tight = intti::make_batch(tab, quartets);
+  intti::t_screen_batch(tight, plist, grid, eps / f);
+  const auto kref = grab(tight);
+
+  Kokkos::View<double *> amp("amp", quartets.size());
+  Kokkos::deep_copy(amp, f);
+  auto scaled = intti::make_batch(tab, quartets);
+  intti::t_screen_batch(scaled, plist, grid, eps, 16, amp);
+  const auto kamp = grab(scaled);
+
+  auto plain = intti::make_batch(tab, quartets);
+  intti::t_screen_batch(plain, plist, grid, eps);
+  const auto kplain = grab(plain);
+
+  int differs = 0;
+  for (std::size_t q = 0; q < kref.size(); ++q) {
+    ASSERT_EQ(kamp[q], kref[q]) << "amp is not a pure tolerance rescale at q=" << q;
+    // and the amplified budget really is stricter than the bare one
+    ASSERT_GE(kamp[q], kplain[q]) << "amplified screening kept fewer nodes at q=" << q;
+    if (kamp[q] != kplain[q]) ++differs;
+  }
+  EXPECT_GT(differs, 0) << "the factor changed nothing -- the test proves nothing";
+
+  // amp = 1 must reproduce the bare call exactly
+  Kokkos::deep_copy(amp, 1.0);
+  auto one = intti::make_batch(tab, quartets);
+  intti::t_screen_batch(one, plist, grid, eps, 16, amp);
+  const auto kone = grab(one);
+  for (std::size_t q = 0; q < kref.size(); ++q) ASSERT_EQ(kone[q], kplain[q]);
+}

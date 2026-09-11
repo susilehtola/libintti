@@ -341,3 +341,36 @@ TEST(SpinOrbit, TwoElectronDeviceMatchesBlockLoopAtHigherL) {
 }
 
 } // namespace
+
+TEST(SpinOrbit, TwoElectronTScreeningCutsNodesAndKeepsTheResult) {
+  // The 2e spin-orbit quartets are ordinary Coulomb ERIs over shifted pairs, so
+  // the t-resolved node truncation applies -- but at a tolerance divided by the
+  // MD centre-shift weight max(2 alpha, l) per bra shell, which is what the
+  // digest multiplies each block by. This pins both halves: the truncation
+  // actually removes node work on an extended system, and the matrices it
+  // produces still match the unscreened ones.
+  std::vector<intti::PrimitiveShell<double>> shells;
+  for (int i = 0; i < 7; ++i)
+    shells.push_back({0.7 + 0.25 * i, {5.0 * i, 0.3 * (i % 3), 0.0}, i % 2});
+  auto basis = intti::make_basis(shells);
+  auto grid = intti::make_tgrid(intti::coulomb());
+  const int nao = basis.nao;
+  std::vector<double> D(static_cast<std::size_t>(nao) * nao, 0.0);
+  for (int i = 0; i < nao; ++i)
+    for (int j = 0; j < nao; ++j) D[i * nao + j] = (i == j) ? 1.0 : 0.1 / (1 + std::abs(i - j));
+
+  const auto B = intti::detail::build_so2e_batch(basis, grid, 1e-11);
+  EXPECT_LT(B.node_fraction, 0.8)
+      << "t-screening removed no node work on a chain -- it is not reaching this path";
+  EXPECT_GT(B.node_fraction, 0.0);
+
+  const auto Yex = intti::spin_orbit_2e_coulomb(basis, D.data(), grid);
+  const auto Y = intti::spin_orbit_2e_coulomb(basis, D.data(), grid, 1e-11);
+  double scale = 0;
+  for (int k = 0; k < 3; ++k)
+    for (double v : Yex[k]) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 0.0);
+  for (int k = 0; k < 3; ++k)
+    for (std::size_t i = 0; i < Yex[k].size(); ++i)
+      EXPECT_NEAR(Y[k][i], Yex[k][i], 1e-9 * scale) << "k=" << k;
+}

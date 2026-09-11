@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include "intti/contracted.hpp"
 #include "intti/ncenter.hpp"
 #include "intti/quartet.hpp"
 
@@ -86,3 +87,71 @@ TEST(NCenter, ThreeCenterFarFieldMatchesExact) {
 }
 
 } // namespace
+
+// The 2- and 3-centre builds are the RI hot path, and their quartets are plain
+// Coulomb integrals over real pairs -- exactly what the t-resolved node
+// truncation (screening.hpp) bounds. They previously took no screening
+// tolerance at all, so an extended system evaluated the full t-grid for every
+// aux function no matter how far away it was.
+TEST(NCenter, ScreenedTwoAndThreeCentreMatchTheExactBuild) {
+  auto grid = intti::make_tgrid(intti::coulomb());
+  // a chain, so most orbital-pair/aux-function distances are large
+  std::vector<Shell> osh, ash;
+  for (int i = 0; i < 6; ++i) {
+    osh.push_back({1.1 + 0.2 * i, {4.5 * i, 0.0, 0.0}, i % 2});
+    ash.push_back({2.2 + 0.4 * i, {4.5 * i, 0.0, 0.0}, i % 3});
+  }
+  auto orb = intti::make_basis(osh), aux = intti::make_basis(ash);
+
+  const auto M0 = intti::coulomb_2c(aux, grid);
+  const auto T0 = intti::coulomb_3c(orb, aux, grid);
+  double sm = 0, st = 0;
+  for (double v : M0) sm = std::max(sm, std::abs(v));
+  for (double v : T0) st = std::max(st, std::abs(v));
+  ASSERT_GT(sm, 1e-3);
+  ASSERT_GT(st, 1e-3);
+
+  for (double tau : {1e-13, 1e-11}) {
+    const auto M = intti::coulomb_2c(aux, grid, tau);
+    const auto T = intti::coulomb_3c(orb, aux, grid, 0.0, tau);
+    double dm = 0, dt = 0;
+    for (std::size_t i = 0; i < M0.size(); ++i) dm = std::max(dm, std::abs(M[i] - M0[i]));
+    for (std::size_t i = 0; i < T0.size(); ++i) dt = std::max(dt, std::abs(T[i] - T0[i]));
+    // eps is an ABSOLUTE per-quartet budget: the error may not exceed it
+    EXPECT_LT(dm, tau) << "2c screened beyond its budget at tau=" << tau;
+    EXPECT_LT(dt, tau) << "3c screened beyond its budget at tau=" << tau;
+  }
+  // and it must actually be doing something at a loose tolerance
+  const auto Mloose = intti::coulomb_2c(aux, grid, 1e-8);
+  double dl = 0;
+  for (std::size_t i = 0; i < M0.size(); ++i)
+    dl = std::max(dl, std::abs(Mloose[i] - M0[i]));
+  EXPECT_GT(dl, 0.0) << "screening changed nothing -- it is not reaching this path";
+  EXPECT_LT(dl, 1e-8);
+}
+
+TEST(NCenter, ScreenedContractedTwoAndThreeCentreMatchTheExactBuild) {
+  // Contracted: the digest multiplies each primitive quartet by an effective
+  // coefficient, so the per-quartet budget is divided by the largest one. If
+  // that factor were dropped the errors below would exceed tau.
+  auto grid = intti::make_tgrid(intti::coulomb());
+  std::vector<intti::ContractedShell<double>> osh, ash;
+  for (int i = 0; i < 4; ++i) {
+    osh.push_back({{5.0 * i, 0.0, 0.0}, i % 2, {2.9, 0.8, 0.24}, {0.15, 0.49, 0.61}});
+    ash.push_back({{5.0 * i, 0.0, 0.0}, i % 2, {4.4, 1.3}, {0.6, 0.55}});
+  }
+  intti::ContractedBasis<double> orb = intti::make_contracted_basis(osh);
+  intti::ContractedBasis<double> aux = intti::make_contracted_basis(ash);
+
+  const auto M0 = intti::coulomb_2c(aux, grid);
+  const auto T0 = intti::coulomb_3c(orb, aux, grid);
+  for (double tau : {1e-13, 1e-11}) {
+    const auto M = intti::coulomb_2c(aux, grid, tau);
+    const auto T = intti::coulomb_3c(orb, aux, grid, tau);
+    double dm = 0, dt = 0;
+    for (std::size_t i = 0; i < M0.size(); ++i) dm = std::max(dm, std::abs(M[i] - M0[i]));
+    for (std::size_t i = 0; i < T0.size(); ++i) dt = std::max(dt, std::abs(T[i] - T0[i]));
+    EXPECT_LT(dm, tau) << "contracted 2c screened beyond its budget at tau=" << tau;
+    EXPECT_LT(dt, tau) << "contracted 3c screened beyond its budget at tau=" << tau;
+  }
+}

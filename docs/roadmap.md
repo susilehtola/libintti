@@ -1965,3 +1965,24 @@ elevated-l block variant returning all (e,f) components), minor caching
   serial/OpenMP fallback. Anything written for dual-space execution stays
   unverified until it runs on real hardware, the same gate that has been sitting
   on GPU validation from the start.
+
+- **DEVICE GEMM -- the one thing blocking a device-resident RI path.** The
+  space-flexible API (space.hpp) now covers the routines an SCF calls every
+  iteration: `jk_build_into`, `exchange_build_into` and `coulomb_build_into` all
+  take the density and the output in either memory space and copy nothing that
+  is already where the kernel needs it. The RI entry points cannot join them,
+  and the obstacle is not their interface -- it is that everything downstream of
+  the three-centre integrals is host BLAS. `RIFit::B` is a `std::vector`,
+  `ri_jk` is `detail::gemm` (blas.hpp: dgemm/sgemm, triple loop at extended
+  precision), and `ri_k_occ`/`ri_k_occ2`/the tiled builders are the same.
+
+  Offering `ri_jk_into` on top of that would be a lie: the density would land on
+  the device and be pulled straight back for the GEMM. Doing it honestly means a
+  device GEMM -- KokkosKernels `KokkosBlas::gemm`, which is a new dependency and
+  covers float/double only, or a hand-written team-based kernel, which would be
+  slower than vendor BLAS on the host path it would also have to serve. The
+  extended-precision types have no BLAS in either case and keep the triple loop.
+
+  Not scheduled, because the decision is a dependency question rather than an
+  implementation one, and because the payoff is unmeasurable here (no GPU, no
+  Kokkos backend beyond OpenMP, where the copies this removes are nearly free).
