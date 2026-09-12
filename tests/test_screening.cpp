@@ -675,7 +675,66 @@ TEST(Screening, TruncationStaysCloseToTheBruteForceIdeal) {
   printf("vs ideal: keep=%ld ideal=%ld waste=%.1f%% of grid, worst ratio %.2f\n",
          tot_keep, tot_ideal, 100 * waste, worst_ratio);
   EXPECT_EQ(unsafe, 0) << "the estimate truncated harder than the true integral allows";
-  // measured 7.7% and 9.0x; the margins catch a real slackening, not noise
-  EXPECT_LT(waste, 0.10) << "the estimate has gone slack against the ideal";
-  EXPECT_LT(worst_ratio, 11.0) << "a single case has gone badly slack";
+  // measured 4.9% and 5.0x; the margins catch a real slackening, not noise
+  EXPECT_LT(waste, 0.07) << "the estimate has gone slack against the ideal";
+  EXPECT_LT(worst_ratio, 7.0) << "a single case has gone badly slack";
+}
+
+// The E-mass bound takes, per Cartesian direction, a max over (i,j) and then
+// multiplies the three directions together -- so without the Lagrangian
+// reweighting nothing stops the product being attained at i = la in all three
+// at once, a component of angular momentum 3*la that does not exist. This pins
+// the fix at the level it operates: the bound must still cover every REAL
+// Cartesian component, and must not have grown while doing it.
+TEST(Screening, EmassBoundCoversEveryRealCartesianComponent) {
+  double worst_ratio = 0;
+  for (int l = 1; l <= 4; ++l)
+    for (double aa : {0.3, 2.0, 30.0})
+      for (double sep : {0.0, 0.8, 2.5}) {
+        Shell a{aa, {0, 0, 0}, l}, b{aa * 0.4, {sep, 0.3 * sep, 0}, l};
+        auto sp = intti::make_pair(a, b);
+        const int la = sp.la, lb = sp.lb, nt = la + lb + 1;
+        std::vector<double> F(3 * nt);
+        intti::detail::pair_e_absmax_n(sp, F.data());
+        std::vector<double> E(static_cast<std::size_t>(la + 1) * (lb + 1) * nt);
+        for (double th : {0.01 * sp.p, 0.2 * sp.p, 1.0 * sp.p}) {
+          auto w = [&](int n) {
+            return std::sqrt(std::tgamma(n + 1.0)) * std::pow(4 * th, 0.5 * n);
+          };
+          double bound = 1;
+          for (int d = 0; d < 3; ++d) {
+            double acc = 0;
+            for (int n = 0; n < nt; ++n) acc += F[d * nt + n] * w(n);
+            bound *= acc;
+          }
+          double tru = 0;
+          for (int ka = 0; ka < intti::ncart(la); ++ka) {
+            int a3[3];
+            intti::cart_comp(la, ka, a3[0], a3[1], a3[2]);
+            for (int kb = 0; kb < intti::ncart(lb); ++kb) {
+              int b3[3];
+              intti::cart_comp(lb, kb, b3[0], b3[1], b3[2]);
+              double prod = 1;
+              for (int d = 0; d < 3; ++d) {
+                intti::e_coeffs(la, lb, sp.p, double(sp.P[d] - sp.A[d]),
+                                double(sp.P[d] - sp.B[d]), double(sp.K[d]), E.data());
+                double acc = 0;
+                for (int n = 0; n <= a3[d] + b3[d]; ++n)
+                  acc += std::abs(
+                             E[(static_cast<std::size_t>(a3[d]) * (lb + 1) + b3[d]) * nt + n]) *
+                         w(n);
+                prod *= acc;
+              }
+              tru = std::max(tru, prod);
+            }
+          }
+          ASSERT_GE(bound * (1 + 1e-9), tru)
+              << "E-mass bound undercuts a real component: l=" << l << " alpha=" << aa
+              << " sep=" << sep << " theta=" << th;
+          if (tru > 0) worst_ratio = std::max(worst_ratio, bound / tru);
+        }
+      }
+  printf("E-mass bound: worst bound/true over real components = %.3e\n", worst_ratio);
+  // was 1.4e9 at l=4 before the reweighting; the margin catches a regression
+  EXPECT_LT(worst_ratio, 1e6) << "the angular-momentum reweighting has stopped working";
 }

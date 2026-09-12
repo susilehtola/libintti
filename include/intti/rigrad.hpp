@@ -968,7 +968,33 @@ std::vector<Real> ri_j_hessian_kernel(const ShellBasis<Real> &orb,
         }
     auto tab = make_pair_table(plist);
     auto batch = make_batch(tab, quartets);
-    if (tau_screen > Real(0)) t_screen_batch(batch, plist, grid, tau_screen);
+    if (tau_screen > Real(0)) {
+      // The digest recombines these quartets with md_grad_terms coefficients --
+      // -2 alpha on the raised term, the Cartesian power on the lowered one --
+      // and a density element, so a quartet truncated at tau_screen reaches the
+      // Hessian multiplied by that. 2 alpha is 2.3e4 for a cc-pVDZ oxygen core
+      // function, and the amplification is real: it was invisible only while the
+      // estimate was too loose to spend its budget.
+      Real dmax = 0;
+      for (std::size_t i2 = 0; i2 < static_cast<std::size_t>(nao) * nao; ++i2) {
+        const Real v = D[i2] < Real(0) ? -D[i2] : D[i2];
+        if (v > dmax) dmax = v;
+      }
+      if (dmax <= Real(0)) dmax = Real(1);
+      std::vector<Real> hamp(quartets.size(), Real(1));
+      auto put = [&](int e, Real f) {
+        if (e >= 0 && f * dmax > hamp[e]) hamp[e] = f * dmax;
+      };
+      for (std::size_t j = 0; j < jm.size(); ++j) {
+        const auto &sm = orb.shells[jm[j]], &sn = orb.shells[jn[j]];
+        put(emp[j], 2 * sm.alpha);
+        put(emm[j], sm.l > 0 ? Real(sm.l) : Real(1));
+        put(enp[j], 2 * sn.alpha);
+        put(enm[j], sn.l > 0 ? Real(sn.l) : Real(1));
+      }
+      auto damp = detail::to_device(hamp, "intti::rijh::amp");
+      t_screen_batch(batch, plist, grid, tau_screen, 16, damp);
+    }
     QuartetWorkspace<Real> ws;
     Kokkos::View<Real *> qout("intti::rijh::out", batch.nout_total);
     eri_quartets(tab, batch, grid, qout, ws);
@@ -2247,7 +2273,32 @@ std::vector<Real> ri_k_hessian_kernel(const ShellBasis<Real> &orb,
         }
     auto tab = make_pair_table(plist);
     auto batch = make_batch(tab, quartets);
-    if (tau_screen > Real(0)) t_screen_batch(batch, plist, grid, tau_screen);
+    if (tau_screen > Real(0)) {
+      // Same amplification as the RI-J Hessian -- md_grad_terms weights of
+      // -2 alpha and l -- with the orbital coefficients in place of a density
+      // element, since this digest contracts each quartet against CL and CR.
+      Real cmax = 0;
+      for (std::size_t i2 = 0; i2 < static_cast<std::size_t>(nao) * nvec; ++i2) {
+        const Real a2 = CL[i2] < Real(0) ? -CL[i2] : CL[i2];
+        const Real b2 = CR[i2] < Real(0) ? -CR[i2] : CR[i2];
+        if (a2 > cmax) cmax = a2;
+        if (b2 > cmax) cmax = b2;
+      }
+      const Real w2 = cmax > Real(0) ? cmax * cmax : Real(1);
+      std::vector<Real> hamp(quartets.size(), Real(1));
+      auto put = [&](int e, Real f) {
+        if (e >= 0 && f * w2 > hamp[e]) hamp[e] = f * w2;
+      };
+      for (std::size_t j = 0; j < jl.size(); ++j) {
+        const auto &sl = orb.shells[jl[j]], &sn = orb.shells[jn2[j]];
+        put(elp[j], 2 * sl.alpha);
+        put(elm[j], sl.l > 0 ? Real(sl.l) : Real(1));
+        put(enp2[j], 2 * sn.alpha);
+        put(enm2[j], sn.l > 0 ? Real(sn.l) : Real(1));
+      }
+      auto damp = detail::to_device(hamp, "intti::rikh::amp");
+      t_screen_batch(batch, plist, grid, tau_screen, 16, damp);
+    }
     QuartetWorkspace<Real> ws;
     Kokkos::View<Real *> qout("intti::rikh::out", batch.nout_total);
     eri_quartets(tab, batch, grid, qout, ws);

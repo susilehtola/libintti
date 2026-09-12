@@ -147,6 +147,167 @@ namespace detail {
 
 /// Per-direction, PER HERMITE ORDER max over Cartesian components of |E_n^{ab}|.
 ///
+/// u_ij = lam^{-i} nu^{-j} for the whole (i,j) table, from two exponentials and
+/// a pair of power ladders rather than one exponential per entry.
+inline void fill_u(std::vector<double> &u, int la, int lb, double x, double y) {
+  const double ex = std::exp(-x), ey = std::exp(-y);
+  double pi_ = 1;
+  for (int i = 0, ij = 0; i <= la; ++i) {
+    double pj = pi_;
+    for (int j = 0; j <= lb; ++j, ++ij) {
+      u[ij] = pj;
+      pj *= ey;
+    }
+    pi_ *= ex;
+  }
+}
+
+/// Minimise a convex function of two variables by coordinate ternary search.
+/// Both E-mass bounds below reduce to one; in log coordinates each is a max of
+/// affine pieces, hence convex, so this converges on the true optimum.
+template <class Fn> void convex_min2(Fn f, double &x, double &y, int rounds = 2) {
+  const double R = 14.0; // e^{14} spans any E-coefficient ratio that occurs
+  for (int r = 0; r < rounds; ++r) {
+    double lo = x - R, hi = x + R;
+    for (int k = 0; k < 16; ++k) {
+      const double m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3;
+      if (f(m1, y) < f(m2, y)) hi = m2;
+      else lo = m1;
+    }
+    x = 0.5 * (lo + hi);
+    lo = y - R;
+    hi = y + R;
+    for (int k = 0; k < 16; ++k) {
+      const double m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3;
+      if (f(x, m1) < f(x, m2)) hi = m2;
+      else lo = m1;
+    }
+    y = 0.5 * (lo + hi);
+  }
+}
+
+/// PUTTING THE ANGULAR MOMENTUM BACK IN. Both E-mass bounds below take, per
+/// Cartesian direction, a max over (i, j) with i <= la and j <= lb, and then
+/// multiply the three directions together. Nothing ties the three maxima to the
+/// same basis function, so the product is allowed to be attained at i = la in
+/// ALL THREE directions at once -- a Cartesian component of angular momentum
+/// 3 la, which does not exist. A real component satisfies sum_d i_d = la and
+/// sum_d j_d = lb.
+///
+/// Measured against the true max over components, that freedom cost a factor of
+/// 22 at l = 1, 1.2e3 at l = 2, 1.8e5 at l = 3 and 5.4e7 at l = 4 -- PER PAIR,
+/// so squared for a quartet. It was the largest remaining source of slack once
+/// the kernel algebra was tightened.
+///
+/// Enforcing the constraint exactly would break the factorisation the whole
+/// bound rests on. A Lagrangian relaxation keeps it: for ANY lam, nu > 0 and any
+/// real component,
+///   prod_d S_d(i_d, j_d)
+///     = lam^{la} nu^{lb} prod_d [S_d(i_d,j_d) lam^{-i_d} nu^{-j_d}]
+///     <= lam^{la} nu^{lb} prod_d max_{ij} [S_d(i,j) lam^{-i} nu^{-j}],
+/// using sum_d i_d = la and sum_d j_d = lb in the first line. The right-hand
+/// side is factorised exactly as before -- the multipliers only reweight the
+/// tables and contribute one scalar, which is folded in as its cube root per
+/// direction, so NOTHING downstream changes and the device cost is unaffected.
+///
+/// Correctness holds for every (lam, nu); only tightness depends on the choice,
+/// which is why this can be a host-side fit. lam = nu = 1 reproduces the old
+/// bound exactly, and since the search minimises an objective whose value there
+/// is the old bound, the result can never be worse than it was.
+///
+/// The per-order tables are used at every theta on the grid, and a fit to one
+/// theta measurably hurts others, so the objective is the WORST log-excess over
+/// the reachable range (theta < mu = pq/(p+q) < p). Max of convex is convex, so
+/// the search still applies, and feasibility of (1,1) bounds the optimum by 0.
+template <class Real>
+void e_lagrange_fit(const std::vector<Real> *A, int la, int lb, int nt, Real p,
+                    bool per_order, double &x, double &y) {
+  x = 0;
+  y = 0;
+  if (la + lb == 0) return; // nothing to constrain
+  const int nij = (la + 1) * (lb + 1);
+  // Repack |E| as [d][n][ij] ONCE. The hot loop is a max over ij at fixed
+  // (d, n), which in the natural [d][ij][n] layout strides by nt; contiguous it
+  // vectorises, and the search runs it tens of times per pair.
+  std::vector<double> Aa(static_cast<std::size_t>(3) * nt * nij);
+  for (int d = 0; d < 3; ++d)
+    for (int ij = 0; ij < nij; ++ij)
+      for (int n = 0; n < nt; ++n)
+        Aa[(static_cast<std::size_t>(d) * nt + n) * nij + ij] =
+            static_cast<double>(std::abs(A[d][static_cast<std::size_t>(ij) * nt + n]));
+  std::vector<double> u(nij);
+  if (!per_order) {
+    // theta-independent: c_ij = sum_n |E|, one objective
+    std::vector<double> c(static_cast<std::size_t>(3) * nij, 0.0);
+    for (int d = 0; d < 3; ++d)
+      for (int n = 0; n < nt; ++n)
+        for (int ij = 0; ij < nij; ++ij)
+          c[d * nij + ij] += Aa[(static_cast<std::size_t>(d) * nt + n) * nij + ij];
+    auto f = [&](double xx, double yy) {
+      fill_u(u, la, lb, xx, yy);
+      double lg = la * xx + lb * yy;
+      for (int d = 0; d < 3; ++d) {
+        double best = 0;
+        for (int ij = 0; ij < nij; ++ij) best = std::max(best, c[d * nij + ij] * u[ij]);
+        lg += std::log(best > 0 ? best : 1e-300);
+      }
+      return lg;
+    };
+    convex_min2(f, x, y);
+    if (f(x, y) > f(0, 0)) { x = 0; y = 0; }
+    return;
+  }
+  // per-order: minimise the worst log-excess over the reachable theta range
+  const double th[5] = {0.001 * double(p), 0.01 * double(p), 0.1 * double(p),
+                        0.4 * double(p), 1.0 * double(p)};
+  std::vector<double> w(static_cast<std::size_t>(5) * nt);
+  for (int k = 0; k < 5; ++k) {
+    double fact = 1, pw = 1;
+    const double s4 = std::sqrt(4 * th[k]);
+    for (int n = 0; n < nt; ++n) {
+      if (n > 0) { fact *= std::sqrt(double(n)); pw *= s4; }
+      w[k * nt + n] = fact * pw;
+    }
+  }
+  std::vector<double> bn(static_cast<std::size_t>(3) * nt);
+  // The per-(d,n) max over (i,j) does not depend on theta, so it is built ONCE
+  // per (x,y) and all five theta are read off it. Recomputing it per theta made
+  // the fit five times more expensive than the scan it was tightening.
+  auto logb_all = [&](double xx, double yy, double *lg5) {
+    fill_u(u, la, lb, xx, yy);
+    for (int d = 0; d < 3; ++d)
+      for (int n = 0; n < nt; ++n) {
+        const double *a = &Aa[(static_cast<std::size_t>(d) * nt + n) * nij];
+        double best = 0;
+        for (int ij = 0; ij < nij; ++ij) {
+          const double v = a[ij] * u[ij];
+          if (v > best) best = v;
+        }
+        bn[d * nt + n] = best;
+      }
+    const double lin = la * xx + lb * yy;
+    for (int k = 0; k < 5; ++k) {
+      double lg = lin;
+      for (int d = 0; d < 3; ++d) {
+        double acc = 0;
+        for (int n = 0; n < nt; ++n) acc += bn[d * nt + n] * w[k * nt + n];
+        lg += std::log(acc > 0 ? acc : 1e-300);
+      }
+      lg5[k] = lg;
+    }
+  };
+  double base[5], cur[5];
+  logb_all(0, 0, base);
+  auto f = [&](double xx, double yy) {
+    logb_all(xx, yy, cur);
+    double m = -1e300;
+    for (int k = 0; k < 5; ++k) m = std::max(m, cur[k] - base[k]);
+    return m;
+  };
+  convex_min2(f, x, y);
+  if (f(x, y) > 0) { x = 0; y = 0; } // never worse than the unscaled bound
+}
+
 /// Weighting each order by its own E mass, rather than factoring out a single
 /// max_n |B_n| and multiplying by sum_n |E_n|, is what makes the bound usable at
 /// high angular momentum. The Cramer factor carries sqrt(n!) -- 21886 at n = 12
@@ -159,44 +320,59 @@ namespace detail {
 template <class Real>
 void pair_e_absmax_n(const ShellPair<Real> &sp, Real *out) {
   const int la = sp.la, lb = sp.lb, nt = la + lb + 1;
-  std::vector<Real> E(static_cast<std::size_t>(la + 1) * (lb + 1) * nt);
+  std::vector<Real> E[3];
   for (int d = 0; d < 3; ++d) {
+    E[d].assign(static_cast<std::size_t>(la + 1) * (lb + 1) * nt, Real(0));
     e_coeffs(la, lb, sp.p, Real(sp.P[d] - sp.A[d]), Real(sp.P[d] - sp.B[d]),
-             Real(sp.K[d]), E.data());
+             Real(sp.K[d]), E[d].data());
+  }
+  double x, y;
+  e_lagrange_fit(E, la, lb, nt, sp.p, true, x, y);
+  // the scalar lam^{la} nu^{lb} is folded in as its cube root per direction, so
+  // the arrays stay the same shape and every consumer is untouched
+  const Real m3 = Real(std::exp((la * x + lb * y) / 3));
+  for (int d = 0; d < 3; ++d)
     for (int n = 0; n < nt; ++n) {
       Real best = 0;
       for (int i = 0; i <= la; ++i)
         for (int j = 0; j <= lb; ++j) {
           if (n > i + j) continue;
           const Real v =
-              std::abs(E[(static_cast<std::size_t>(i) * (lb + 1) + j) * nt + n]);
+              std::abs(E[d][(static_cast<std::size_t>(i) * (lb + 1) + j) * nt + n]) *
+              Real(std::exp(-i * x - j * y));
           if (v > best) best = v;
         }
-      out[d * nt + n] = best;
+      out[d * nt + n] = m3 * best;
     }
-  }
 }
 
 /// Per-direction max over Cartesian components of sum_t |E_t^{ab}|: the
 /// t-independent half of a node's bound.
 template <class Real> void pair_e_absmax(const ShellPair<Real> &sp, Real out[3]) {
   const int la = sp.la, lb = sp.lb, nt = la + lb + 1;
-  std::vector<Real> E(static_cast<std::size_t>(la + 1) * (lb + 1) * nt);
+  std::vector<Real> E[3];
   for (int d = 0; d < 3; ++d) {
-    const Real ab = sp.A[d] - sp.B[d];
     // K is already folded into E_0^{00} by e_coeffs when passed here
+    E[d].assign(static_cast<std::size_t>(la + 1) * (lb + 1) * nt, Real(0));
     e_coeffs(la, lb, sp.p, Real(sp.P[d] - sp.A[d]), Real(sp.P[d] - sp.B[d]),
-             Real(sp.K[d]), E.data());
-    (void)ab;
+             Real(sp.K[d]), E[d].data());
+  }
+  // same angular-momentum relaxation as pair_e_absmax_n, but this bound carries
+  // no theta dependence, so one objective replaces the minimax over the grid
+  double x, y;
+  e_lagrange_fit(E, la, lb, nt, sp.p, false, x, y);
+  const Real m3 = Real(std::exp((la * x + lb * y) / 3));
+  for (int d = 0; d < 3; ++d) {
     Real best = 0;
     for (int i = 0; i <= la; ++i)
       for (int j = 0; j <= lb; ++j) {
         Real acc = 0;
         for (int t = 0; t <= i + j; ++t)
-          acc += std::abs(E[(static_cast<std::size_t>(i) * (lb + 1) + j) * nt + t]);
+          acc += std::abs(E[d][(static_cast<std::size_t>(i) * (lb + 1) + j) * nt + t]);
+        acc *= Real(std::exp(-i * x - j * y));
         if (acc > best) best = acc;
       }
-    out[d] = best;
+    out[d] = m3 * best;
   }
 }
 
@@ -681,14 +857,21 @@ int t_screen_keep(const ShellPair<Real> &bra, const ShellPair<Real> &ket,
 //     than a fresh derivation -- more tractable than the real monopole
 //     construction was.
 //
-//   * Derivative quartets (erigrad, erihess, the remaining rigrad passes) --
-//     VALID but needs the check below. Their quartets are promoted/demoted
-//     pairs recombined with md_grad_terms coefficients of -2*alpha and l, so a
-//     per-quartet bound of eps could in principle emerge multiplied by 2*alpha,
-//     which is 1e6 for a tight function. Measured across six decades of
-//     exponent it does not (see DerivativeScreeningDoesNotAmplify), but that
-//     test could not construct a case where screening materially moves the
-//     result, so the path is guarded rather than demonstrated.
+//   * Derivative quartets (erigrad, erihess, the rigrad passes) -- WIRED, and
+//     the amplification this used to only warn about turned out to be REAL.
+//     Their quartets are promoted/demoted pairs recombined with md_grad_terms
+//     coefficients of -2*alpha and l, so a per-quartet bound of eps emerges
+//     multiplied by 2*alpha -- 2.3e4 for a cc-pVDZ oxygen core function.
+//     DerivativeScreeningDoesNotAmplify was written to catch exactly that and
+//     passed for as long as the estimate was too loose to spend its budget;
+//     tightening the E-mass bound made it fail at 2e-7 against a 1e-10
+//     tolerance, a factor of 2000. Both RI Hessians now hand the screener that
+//     factor per quartet (with the density element, or the orbital
+//     coefficients, that the digest also applies), and the test passes for the
+//     right reason.
+//
+//     Worth keeping in mind generally: a screening guard that never fires is
+//     not evidence of safety, only of slack somewhere upstream.
 //
 //   * Cholesky (cholesky.hpp) -- NOT without thought. The pivoted decomposition
 //     selects on diagonal magnitudes; perturbing them by eps perturbs the pivot
@@ -768,10 +951,23 @@ void t_screen_batch(QuartetBatch<Real> &batch,
   //     SOC chain, 5 / 7 / 9 centres    0.651 / 0.524 / 0.450  ->  0.491 / 0.376 / 0.323
   //     ERI chain, 6 / 10 / 16 centres  0.672 / 0.263 / 0.090  ->  0.454 / 0.165 / 0.057
   //
-  // and against a brute-force ideal (the smallest truncation that actually
-  // stays under eps, found by bisection on a 60-quartet probe spanning l <= 3,
-  // alpha over two decades and R from 0 to 20), waste fell from 17.6% of the
-  // grid to 7.7%, worst case 11.5x to 9.0x.
+  // Putting the angular-momentum constraint back into the E-mass bound
+  // (e_lagrange_fit) then bought a second round, on the high-l systems it was
+  // aimed at -- a 10-centre chain at 4.2 A carrying s plus a tight and a
+  // diffuse high-l shell per centre:
+  //
+  //     spd   0.1479 -> 0.1332      spf   0.1886 -> 0.1567
+  //
+  // It is worth ~2-3% on compact systems and nothing at all on s/p chains,
+  // where there is little angular momentum to constrain. The scan costs 1-6% of
+  // the evaluation it is pruning. Wall-clock is NOT quotable on this machine:
+  // identical code measured 1387 to 4035 ms on the same batch, so only the node
+  // fractions above mean anything.
+  //
+  // Against a brute-force ideal (the smallest truncation that actually stays
+  // under eps, found by bisection on a 60-quartet probe spanning l <= 3, alpha
+  // over two decades and R from 0 to 20), waste fell from 17.6% of the grid to
+  // 7.7% and then to 4.9%, worst case 11.5x to 9.0x to 5.0x.
   //
   // A NOTE ON WHAT eps BUYS. It is a PER-QUARTET budget -- the same convention
   // as the Schwarz tolerance elsewhere in the library -- so an output element
