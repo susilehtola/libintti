@@ -2230,43 +2230,34 @@ elevated-l block variant returning all (e,f) components), minor caching
   1/h; with boxes sized to resolve the density those two conditions conflict.
   Resolving it is exactly the operator-driven refinement above.
 
-- **RECOMMENDATION: STOP BUILDING THE MULTIRESOLUTION ENGINE. INTERFACE TO MRCPP
-  INSTEAD, AND DEMOTE THE GRID PILLAR.**
+- **DECIDED (2026-09-15): OCTREE LINE CLOSED, GRID ROUTE DEMOTED TO THE
+  TESTSUITE.**
 
-  Everything measured over the octree work points the same way, and the decisive
-  fact is that the kernel representations ALREADY AGREE. MRCPP's PoissonKernel is
-  a `GaussExp<1>` -- a sum of Gaussians obtained by discretising the same
-  integral transform this library's t grid discretises. There is no mathematical
-  impedance mismatch to bridge; what MRCPP has that we do not is a decade of work
-  on the part that is actually hard.
+  The kernel representations already agree -- MRCPP's PoissonKernel is a
+  `GaussExp<1>`, a sum of Gaussians from the same integral transform the t grid
+  discretises -- so there was never a mathematical gap to bridge, only a decade
+  of other people's work on the part that is hard. And the measurements say that
+  part is not ours: the operator primitive took one sitting and validated to
+  3e-6, while the scheduling, band structure, adaptive projection with error
+  control, and operator-driven refinement are multiresolution analysis, a
+  separate field from Gaussian integrals.
 
-  And the evidence says the hard part is not ours. The operator primitive took
-  one sitting and validated to 3e-6 (bench/octree_apply.cpp). What is hard is the
-  scheduling, the band structure, the adaptive projection with guaranteed error,
-  the cross-correlation coefficients, and -- newly discovered here -- refinement
-  driven by the OPERATOR rather than the function. That is multiresolution
-  analysis, a separate field, and libintti's claim is Gaussian integrals.
+  What was done:
+    * fegrid.hpp and gridri.hpp moved from include/intti to tests/include/intti.
+      They are a small-scale independent reference -- validated against the
+      analytic engine, sharing no code with it below the t grid -- and that is
+      worth keeping. Being orders of magnitude slower than the analytic route on
+      any real basis set, it is not worth SHIPPING: exposing API that cannot be
+      used at production size is the tractability rule applied to ourselves.
+    * bench/octree_count.cpp, bench/octree_apply.cpp and bench/stream_j.cpp
+      deleted. Their measurements stay in this file as the record of why the
+      line was closed; the code has no consumer now.
+    * bench/scaling.cpp keeps the analytic J/K scaling, which is still a real
+      performance target, minus its grid column.
 
-  So:
-    * Keep the existing tensor-grid route as a SMALL-SCALE INDEPENDENT ORACLE.
-      It is validated, it shares no code with the analytic engine below the t
-      grid, and it does not need to be fast to be useful. It already pays for
-      itself there.
-    * Close the octree / non-standard-form line. The measurements stay as the
-      record of why.
-    * If numerical or mixed Gaussian-numerical bases are wanted, interface to
-      MRCPP rather than rebuild. libintti supplies what it is good at -- Gaussian
-      densities, potentials and matrix elements -- and MRCPP supplies the
-      discretisation.
+  ON THE LICENCE QUESTION, which was the open item: MADNESS is being relicensed
+  to MIT, which removes it. MIT against BSD-3-Clause carries no relinking
+  obligation, so MADNESS -- not MRCPP at LGPL-3.0 -- is the interface target if
+  numerical or mixed Gaussian-numerical bases are wanted later. That is a future
+  interface, not a dependency, and nothing in the library waits on it.
 
-  NEEDS A DECISION: MRCPP is LGPL-3.0 and libintti is BSD-3-Clause. Linking is
-  allowed, but the combined work carries the LGPL relinking obligation, which is
-  a real constraint on a library meant to be embedded in other people's codes. It
-  should therefore be an OPTIONAL backend behind an interface, never a core
-  dependency -- and that is a call to make deliberately rather than by drifting
-  into it.
-
-  What today's work leaves behind regardless of that decision: the grid seeding
-  fix, worth 822x in points on one water and a faster test suite, and the
-  analytic-potential route, which is both faster and more accurate than DAGE at
-  the same grid. Those are in the shipped code and stand on their own.

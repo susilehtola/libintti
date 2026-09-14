@@ -17,7 +17,6 @@
 
 #include "basis_io.hpp"
 #include "intti/fock.hpp"
-#include "intti/gridri.hpp"
 #include "intti/kernel.hpp"
 #include "intti/tgrid.hpp"
 
@@ -58,8 +57,8 @@ int main(int argc, char **argv) {
   Kokkos::initialize(argc, argv);
   {
     auto tg = intti::make_tgrid(intti::coulomb());
-    std::printf("%-13s %5s %6s %8s %12s %12s %14s\n", "basis", "nwat", "nao", "npair",
-                "J ms", "K ms", "grid N (1e-2)");
+    std::printf("%-13s %5s %6s %8s %12s %12s\n", "basis", "nwat", "nao", "npair",
+                "J ms", "K ms");
     for (const char *b : {"def2-SVP", "def2-QZVPPD"})
       for (int n : sizes) {
         const std::string path = dir + "/" + b + "_" + std::to_string(n) + ".txt";
@@ -80,12 +79,9 @@ int main(int argc, char **argv) {
         t0 = std::chrono::steady_clock::now();
         intti::exchange_build(cb, D.data(), tg, K.data(), 1e-10);
         const double tk = ms_since(t0);
-        // the grid route's cost is set by the grid it would need, which is
-        // reported rather than run: see docs/roadmap.md for why it cannot be.
-        const auto g = intti::grid_for_basis(cb, 1e-2);
-        std::printf("%-13s %5d %6d %8d %12.0f %12.0f %8d (%.1e pts)\n", b, n, nao,
+        std::printf("%-13s %5d %6d %8d %12.0f %12.0f\n", b, n, nao,
                     static_cast<int>(cb.shells.size() * (cb.shells.size() + 1) / 2), tj,
-                    tk, g.N, double(g.N) * g.N * g.N);
+                    tk);
         std::fflush(stdout);
       }
   }

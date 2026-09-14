@@ -62,6 +62,13 @@ endif()
 if(INTTI_ENABLE_CHOLESKY)
   target_sources(intti_tests PRIVATE test_cholesky.cpp)
 endif()
+# The finite-element grid route lives here, not in include/intti, because it is
+# a small-scale reference: validated against the analytic engine, with which it
+# shares no code below the t grid, and useful precisely as an independent check.
+# It is orders of magnitude slower than the analytic route on any real basis set
+# (see docs/roadmap.md), so it is not shipped as API.
+target_include_directories(intti_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 target_link_libraries(intti_tests PRIVATE intti::intti GTest::gtest)
 include(GoogleTest)
 gtest_discover_tests(intti_tests)

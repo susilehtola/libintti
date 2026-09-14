@@ -36,9 +36,9 @@
 #include <cstddef>
 #include <vector>
 
-#include "device.hpp"
-#include "kernel.hpp"
-#include "tgrid.hpp"
+#include "intti/device.hpp"
+#include "intti/kernel.hpp"
+#include "intti/tgrid.hpp"
 
 namespace intti {
 

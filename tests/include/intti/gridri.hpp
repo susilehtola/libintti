@@ -24,13 +24,13 @@
 #include <cstddef>
 #include <vector>
 
-#include "c2s.hpp"        // c2s_matrix (Cartesian -> real solid harmonic)
-#include "contracted.hpp" // ContractedBasis, detail::effective_coeff
+#include "intti/c2s.hpp"        // c2s_matrix (Cartesian -> real solid harmonic)
+#include "intti/contracted.hpp" // ContractedBasis, detail::effective_coeff
 #include "fegrid.hpp"
-#include "fock.hpp" // ShellBasis
-#include "gto.hpp"  // ncart, cart_comp
-#include "nuclear.hpp" // potential_on_points (analytic V on the grid)
-#include "tgrid.hpp"
+#include "intti/fock.hpp" // ShellBasis
+#include "intti/gto.hpp"  // ncart, cart_comp
+#include "intti/nuclear.hpp" // potential_on_points (analytic V on the grid)
+#include "intti/tgrid.hpp"
 
 namespace intti {
 
