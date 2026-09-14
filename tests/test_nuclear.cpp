@@ -155,3 +155,70 @@ TEST(Nuclear, PotentialOnPointsMatchesTheCollocationMatrices) {
     EXPECT_LT(worst, (far > 0 ? 1e-7 : 1e-12) * scale) << "far_tau=" << far;
   }
 }
+
+// The boxed far field expands the potential once per box instead of once per
+// point. It measured no faster than the per-point far field and is not on the
+// shipped path (see its documentation), but it is correct and is the M2L half
+// of a hierarchical method, so its accuracy is pinned here: it must converge to
+// the exact potential as the tolerance tightens.
+TEST(Nuclear, BoxedFarFieldConvergesToTheExactPotential) {
+  std::vector<intti::PrimitiveShell<double>> sh;
+  for (int i = 0; i < 3; ++i) {
+    sh.push_back({1.8, {2.6 * i, 0.0, 0.0}, 0});
+    sh.push_back({0.6, {2.6 * i, 0.0, 0.0}, 1});
+  }
+  auto basis = intti::make_basis(sh);
+  const int n = basis.nao;
+  std::vector<double> D((std::size_t)n * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = 0.2 + 0.3 * std::cos(0.7 * i + 1.3 * j);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) {
+      const double a = 0.5 * (D[i * n + j] + D[j * n + i]);
+      D[i * n + j] = D[j * n + i] = a;
+    }
+
+  const int nb = 4, per = 4;
+  const double lo = -5.0, hi = 10.0, bw = (hi - lo) / nb;
+  std::vector<std::array<double, 3>> pts;
+  intti::PointBoxes<double> boxes;
+  boxes.start.push_back(0);
+  for (int bx = 0; bx < nb; ++bx)
+    for (int by = 0; by < nb; ++by)
+      for (int bz = 0; bz < nb; ++bz) {
+        const double cx = lo + (bx + 0.5) * bw, cy = lo + (by + 0.5) * bw,
+                     cz = lo + (bz + 0.5) * bw;
+        double rad = 0;
+        for (int i = 0; i < per; ++i)
+          for (int j = 0; j < per; ++j)
+            for (int k = 0; k < per; ++k) {
+              const double x = lo + bx * bw + (i + 0.5) * bw / per;
+              const double y = lo + by * bw + (j + 0.5) * bw / per;
+              const double z = lo + bz * bw + (k + 0.5) * bw / per;
+              pts.push_back({x, y, z});
+              rad = std::max(rad, std::sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy) +
+                                            (z - cz) * (z - cz)));
+            }
+        boxes.center.push_back({cx, cy, cz});
+        boxes.radius.push_back(rad);
+        boxes.start.push_back((int)pts.size());
+      }
+
+  auto tg = intti::make_tgrid(intti::coulomb());
+  const auto exact = intti::potential_on_points(basis, D.data(), pts, tg, 0.0, 0.0);
+  double scale = 0;
+  for (double v : exact) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 1e-3);
+
+  double prev = 1.0;
+  for (double ft : {1e-6, 1e-9, 1e-12}) {
+    const auto got =
+        intti::potential_on_points_boxed(basis, D.data(), pts, boxes, tg, 0.0, ft, 10);
+    double worst = 0;
+    for (std::size_t g = 0; g < pts.size(); ++g)
+      worst = std::max(worst, std::abs(got[g] - exact[g]));
+    EXPECT_LT(worst, 30 * ft * scale) << "boxed far field beyond its tolerance, far_tau=" << ft;
+    EXPECT_LE(worst, prev * 1.001) << "tightening far_tau made it worse at " << ft;
+    prev = std::max(worst, 1e-16);
+  }
+}

@@ -74,7 +74,7 @@ void attraction_pair_visit(const PrimitiveShell<Real> &sa,
   }
   const Real pair_bound = (2 * pi / p) * expmu; // (2 pi/p) exp(-mu R_AB^2)
   const int nca = ncart(la), ncb = ncart(lb);
-  std::vector<Real> Bx(la + lb + 1), By(la + lb + 1), Bz(la + lb + 1), Tbuf;
+  std::vector<Real> Bx(la + lb + 1), By(la + lb + 1), Bz(la + lb + 1), Tbuf, Tscr;
   std::vector<Real> blk(static_cast<std::size_t>(nca) * ncb);
   const int n1 = la + lb + 1;
   for (std::size_t ic = 0; ic < centers.size(); ++ic) {
@@ -93,8 +93,14 @@ void attraction_pair_visit(const PrimitiveShell<Real> &sa,
       // multipole far branch: T_{tuv}(P - c), monopole charge (no ket sign)
       const Real X[3] = {Pd[0] - c.R[0], Pd[1] - c.R[1], Pd[2] - c.R[2]};
       const int Dt = la + lb + 1;
-      Tbuf.assign(static_cast<std::size_t>(Dt) * Dt * Dt, Real(0));
-      multipole_tensor(la + lb, X, Tbuf.data());
+      // scratch hoisted out of the centre loop: multipole_tensor's own buffer is
+      // O((la+lb+1)^4), and allocating it per centre costs more than the tensor
+      // at high angular momentum
+      if (Tbuf.empty()) {
+        Tbuf.assign(static_cast<std::size_t>(Dt) * Dt * Dt, Real(0));
+        Tscr.assign(static_cast<std::size_t>(Dt) * Dt * Dt * Dt, Real(0));
+      }
+      multipole_tensor(la + lb, X, Tbuf.data(), Tscr.data());
       const Real pop = pi / p;
       const Real wpref = c.weight * pop * sqrt_(pop); // (pi/p)^{3/2}
       for (int ka = 0; ka < nca; ++ka) {
@@ -498,6 +504,225 @@ std::vector<Real> potential_on_points(const ShellBasis<Real> &basis, const Real 
                                           for (int i = 0; i < nb; ++i) s += db[i] * blk[i];
                                           V[g0 + ic] += s;
                                         });
+        }
+      });
+  Kokkos::fence();
+  return V;
+}
+
+/// Points grouped into boxes for the boxed far field. `start` holds nbox+1
+/// offsets into a point list that is ORDERED BY BOX, so box b owns
+/// [start[b], start[b+1]); `center` and `radius` bound each box, with radius the
+/// largest |r_g - center| over its points.
+template <class Real> struct PointBoxes {
+  std::vector<int> start;
+  std::vector<std::array<Real, 3>> center;
+  std::vector<Real> radius;
+  int nbox() const { return static_cast<int>(center.size()); }
+};
+
+/// V(g) = sum_ab D_ab <a|1/|r-r_g||b>, with the far field taken ONCE PER BOX
+/// instead of once per point.
+///
+/// MEASURED: THIS DOES NOT BEAT THE PER-POINT FAR FIELD, and the shipped grid
+/// path does not use it. Against potential_on_points with the same far_tau, on a
+/// 4-centre chain with 27000 points in 216 boxes, it runs at 0.94x (s/p), 1.04x
+/// (s/d) and 1.12x (s/f). It is kept because it is correct, tested, and is the
+/// M2L kernel a real fast multipole method would need -- not because it is
+/// currently worth calling.
+///
+/// The reason it does not pay is structural, and worth recording so the mistake
+/// is not repeated. The box criterion is STRICTER than the point criterion, so
+/// boxing can only reclassify points that the per-point path was already
+/// handling cheaply; it can never convert an expensive near point into a far
+/// one. Meanwhile each box needs the multipole tensor to order
+/// (l_a + l_b) + lloc rather than l_a + l_b -- 13 against 3 for an s/p pair at
+/// lloc = 10, and the tensor recursion is O(D^4). Fewer sites, each much more
+/// expensive, and the two cancel.
+///
+/// What would pay is grouping the SOURCES as well: one multipole per source box
+/// instead of one per pair, so the interaction count becomes
+/// nbox x nbox rather than nbox x npair. That is a real hierarchical method and
+/// a much larger piece of work; this routine is the half of it that exists.
+///
+/// Writing X_B = P - c_B and d = r_g - c_B, the multipole tensor expands as
+///   T_tuv(X_B - d) = sum_abc (-1)^{a+b+c} (d^abc / a!b!c!) T_{t+a,u+b,v+c}(X_B),
+/// so the far potential of a pair is the polynomial sum_abc L_abc d^abc with
+///   L_abc = (-1)^{a+b+c}/(a!b!c!) (pi/p)^{3/2} sum_tuv Ehat_tuv T_{t+a,u+b,v+c}(X_B),
+/// where Ehat are the pair's Hermite moments already contracted with the density
+/// block. The L of every far pair accumulate into ONE polynomial per box, which
+/// is then evaluated at the box's points -- so the far field costs
+/// nbox x npair for the expansions plus npoints for the evaluation, rather than
+/// npoints x npair.
+///
+/// A pair is far from a box when both hold: the Gaussian asymptotics are valid
+/// over the whole box, p (|X_B| - a_B)^2 > -ln(far_tau), and the Taylor series
+/// converges, a_B <= sep |X_B|. Everything else stays on the per-point path,
+/// which keeps its own point-level near/far split.
+///
+/// The default sep is far_tau^{1/(lloc+1)}, from the nominal (a_B/|X_B|)^{lloc+1}
+/// remainder. That is conservative: measured convergence is closer to sep^6 than
+/// sep^11 at lloc = 10, so an explicit, looser sep is usually safe. Measured
+/// error at far_tau = 1e-10, 4-centre chain: lloc = 10 gives 8e-11 at sep = 0.12,
+/// 8e-9 at 0.25 and 1e-6 at 0.40.
+template <class Real>
+std::vector<Real>
+potential_on_points_boxed(const ShellBasis<Real> &basis, const Real *D,
+                          const std::vector<std::array<Real, 3>> &points,
+                          const PointBoxes<Real> &boxes, const TGrid<Real> &grid,
+                          Real tau = Real(0), Real far_tau = Real(1e-10),
+                          int lloc = 10, Real sep = Real(-1)) {
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao;
+  std::vector<Real> V(points.size(), Real(0));
+  if (points.empty() || boxes.nbox() == 0) return V;
+  // Truncating the Taylor series at lloc leaves (a_B/|X_B|)^{lloc+1}, so tie the
+  // separation to the tolerance the caller already gave rather than inventing a
+  // second knob.
+  if (!(sep > Real(0)))
+    sep = far_tau > Real(0) ? std::pow(static_cast<double>(far_tau),
+                                       1.0 / (lloc + 1))
+                            : Real(0.3);
+
+  // per-pair invariants: density-contracted Hermite moments, centre, exponent
+  struct PairData {
+    int a, b, nt;
+    Real p, P[3], wpref;
+    std::vector<Real> Ehat, Dblk;
+  };
+  std::vector<PairData> pd;
+  const Real pi = pi_v<Real>();
+  int ntmax = 0;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b <= a; ++b) {
+      const auto &sa = basis.shells[a], &sb = basis.shells[b];
+      const int nca = ncart(sa.l), ncb = ncart(sb.l);
+      const int oa = basis.ao_off[a], ob = basis.ao_off[b];
+      PairData e;
+      e.a = a;
+      e.b = b;
+      e.Dblk.assign(static_cast<std::size_t>(nca) * ncb, Real(0));
+      for (int ka = 0; ka < nca; ++ka)
+        for (int kb = 0; kb < ncb; ++kb) {
+          const Real d = D[static_cast<std::size_t>(oa + ka) * nao + ob + kb];
+          e.Dblk[ka * ncb + kb] =
+              (a == b) ? d : d + D[static_cast<std::size_t>(ob + kb) * nao + oa + ka];
+        }
+      const auto sp = make_pair(sa, sb);
+      std::vector<Real> E;
+      int nt = 0;
+      detail::pair_hermite_moments(sp, E, nt);
+      e.nt = nt;
+      ntmax = std::max(ntmax, nt);
+      e.Ehat.assign(static_cast<std::size_t>(nt) * nt * nt, Real(0));
+      for (int ka = 0; ka < nca; ++ka)
+        for (int kb = 0; kb < ncb; ++kb) {
+          const Real w = e.Dblk[ka * ncb + kb];
+          if (w == Real(0)) continue;
+          const std::size_t off = static_cast<std::size_t>(ka * ncb + kb) * nt * nt * nt;
+          for (int i = 0; i < nt * nt * nt; ++i) e.Ehat[i] += w * E[off + i];
+        }
+      e.p = sa.alpha + sb.alpha;
+      for (int d3 = 0; d3 < 3; ++d3) e.P[d3] = Real(sp.P[d3]);
+      const Real pop = pi / e.p;
+      e.wpref = pop * sqrt_(pop); // (pi/p)^{3/2}
+      pd.push_back(std::move(e));
+    }
+
+  const Real far_cut = far_tau > Real(0) ? -log_(far_tau) : Real(0);
+  const int nc1 = lloc + 1;
+  const int Dt = ntmax + lloc; // max multipole order + 1 over all pairs
+  // 1/(a! b! c!) with the (-1)^{a+b+c} folded in
+  std::vector<Real> inv_fact(nc1);
+  {
+    Real f = 1;
+    for (int k = 0; k < nc1; ++k) {
+      if (k > 0) f *= Real(k);
+      inv_fact[k] = Real(1) / f;
+    }
+  }
+
+  Kokkos::parallel_for(
+      "intti::potential_boxed",
+      Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, boxes.nbox()),
+      [&](int ib) {
+        const int g0 = boxes.start[ib], g1 = boxes.start[ib + 1];
+        if (g1 <= g0) return;
+        const auto &cB = boxes.center[ib];
+        const Real aB = boxes.radius[ib];
+        std::vector<Real> Lc(static_cast<std::size_t>(nc1) * nc1 * nc1, Real(0));
+        std::vector<Real> T(static_cast<std::size_t>(Dt) * Dt * Dt),
+            W(static_cast<std::size_t>(Dt) * Dt * Dt * Dt);
+        std::vector<PointCharge<Real>> nearpts;
+        std::vector<int> nearidx;
+        bool haveNear = false;
+
+        for (const auto &e : pd) {
+          Real X[3], r2 = 0;
+          for (int d3 = 0; d3 < 3; ++d3) {
+            X[d3] = e.P[d3] - cB[d3];
+            r2 += X[d3] * X[d3];
+          }
+          const Real r = sqrt_(r2), dmin = r - aB;
+          const bool far = far_tau > Real(0) && dmin > Real(0) &&
+                           e.p * dmin * dmin > far_cut && aB <= sep * r;
+          if (!far) {
+            if (!haveNear) {
+              nearpts.reserve(g1 - g0);
+              for (int g = g0; g < g1; ++g)
+                nearpts.push_back({Real(1), {points[g][0], points[g][1], points[g][2]}});
+              haveNear = true;
+            }
+            const int nb = ncart(basis.shells[e.a].l) * ncart(basis.shells[e.b].l);
+            const Real *db = e.Dblk.data();
+            detail::attraction_pair_visit(basis.shells[e.a], basis.shells[e.b], nearpts,
+                                          grid, tau, far_tau,
+                                          [&](std::size_t ic, const Real *blk) {
+                                            Real s = 0;
+                                            for (int i = 0; i < nb; ++i) s += db[i] * blk[i];
+                                            V[g0 + ic] += s;
+                                          });
+            continue;
+          }
+          // far: one local expansion, accumulated with every other far pair
+          const int nt = e.nt, Lo = (nt - 1) + lloc, Dl = Lo + 1;
+          multipole_tensor(Lo, X, T.data(), W.data());
+          for (int ca = 0; ca < nc1; ++ca)
+            for (int cb = 0; cb + ca < nc1; ++cb)
+              for (int cc = 0; cc + cb + ca < nc1; ++cc) {
+                Real s = 0;
+                for (int t = 0; t < nt; ++t)
+                  for (int u = 0; u < nt; ++u)
+                    for (int v = 0; v < nt; ++v) {
+                      const Real eh = e.Ehat[(static_cast<std::size_t>(t) * nt + u) * nt + v];
+                      if (eh == Real(0)) continue;
+                      s += eh * T[(static_cast<std::size_t>(t + ca) * Dl + u + cb) * Dl +
+                                  v + cc];
+                    }
+                const Real sgn = ((ca + cb + cc) & 1) ? Real(-1) : Real(1);
+                Lc[(static_cast<std::size_t>(ca) * nc1 + cb) * nc1 + cc] +=
+                    sgn * inv_fact[ca] * inv_fact[cb] * inv_fact[cc] * e.wpref * s;
+              }
+        }
+
+        // evaluate the accumulated polynomial at this box's points
+        for (int g = g0; g < g1; ++g) {
+          const Real dx = points[g][0] - cB[0], dy = points[g][1] - cB[1],
+                     dz = points[g][2] - cB[2];
+          Real s = 0, px = 1;
+          for (int ca = 0; ca < nc1; ++ca) {
+            Real py = px;
+            for (int cb = 0; cb + ca < nc1; ++cb) {
+              Real pz = py;
+              for (int cc = 0; cc + cb + ca < nc1; ++cc) {
+                s += Lc[(static_cast<std::size_t>(ca) * nc1 + cb) * nc1 + cc] * pz;
+                pz *= dz;
+              }
+              py *= dy;
+            }
+            px *= dx;
+          }
+          V[g] += s;
         }
       });
   Kokkos::fence();

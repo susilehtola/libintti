@@ -353,6 +353,51 @@ std::vector<Real> grid_coulomb_build(const ShellBasis<Real> &basis, const Real *
   return detail::grid_coulomb_dev(detail::ao_on_grid_dev(basis, grid), basis.nao, grid, tgrid, D, nv);
 }
 
+/// Group the FE grid's points into boxes -- one per (element, element, element)
+/// triple -- for the boxed far field (nuclear.hpp::potential_on_points_boxed).
+///
+/// The grid's natural order is row-major (ix, iy, iz), which interleaves boxes,
+/// so the points are reordered and `perm` records where each boxed point came
+/// from: perm[k] is the row-major index of boxed point k.
+template <class Real>
+void fegrid_boxes(const FEGrid1D<Real> &grid, std::vector<std::array<Real, 3>> &pts,
+                  PointBoxes<Real> &boxes, std::vector<std::size_t> &perm) {
+  const int N = grid.N, ne = grid.ne;
+  pts.clear();
+  perm.clear();
+  boxes.start.assign(1, 0);
+  boxes.center.clear();
+  boxes.radius.clear();
+  pts.reserve(static_cast<std::size_t>(N) * N * N);
+  perm.reserve(static_cast<std::size_t>(N) * N * N);
+  for (int ex = 0; ex < ne; ++ex)
+    for (int ey = 0; ey < ne; ++ey)
+      for (int ez = 0; ez < ne; ++ez) {
+        const Real cx = Real(0.5) * (grid.be[ex] + grid.be[ex + 1]);
+        const Real cy = Real(0.5) * (grid.be[ey] + grid.be[ey + 1]);
+        const Real cz = Real(0.5) * (grid.be[ez] + grid.be[ez + 1]);
+        Real rad = 0;
+        for (int i = 0; i < grid.nps[ex]; ++i) {
+          const int ix = grid.noff[ex] + i;
+          for (int j = 0; j < grid.nps[ey]; ++j) {
+            const int iy = grid.noff[ey] + j;
+            for (int k = 0; k < grid.nps[ez]; ++k) {
+              const int iz = grid.noff[ez] + k;
+              const Real x = grid.xnode[ix], y = grid.xnode[iy], z = grid.xnode[iz];
+              pts.push_back({x, y, z});
+              perm.push_back((static_cast<std::size_t>(ix) * N + iy) * N + iz);
+              const Real dx = x - cx, dy = y - cy, dz = z - cz;
+              const Real d = std::sqrt(dx * dx + dy * dy + dz * dz);
+              if (d > rad) rad = d;
+            }
+          }
+        }
+        boxes.center.push_back({cx, cy, cz});
+        boxes.radius.push_back(rad);
+        boxes.start.push_back(static_cast<int>(pts.size()));
+      }
+}
+
 /// Grid-RI Coulomb with the POTENTIAL taken analytically instead of by DAGE.
 ///
 /// The grid route represents the density on the grid and convolves it
@@ -378,10 +423,26 @@ std::vector<Real> grid_coulomb_build_analytic(const ShellBasis<Real> &basis,
                                               const Real *D, const FEGrid1D<Real> &grid,
                                               const TGrid<Real> &tgrid,
                                               Real tau = Real(0),
-                                              Real far_tau = Real(1e-14)) {
+                                              Real far_tau = Real(1e-10),
+                                              int lloc = 0) {
   const int N = grid.N, nao = basis.nao;
   const std::size_t N3 = static_cast<std::size_t>(N) * N * N;
-  const auto Vh = potential_on_points(basis, D, fegrid_points(grid), tgrid, tau, far_tau);
+  // lloc > 0 takes the far field once per BOX instead of once per point. It is
+  // OFF by default because it measured no faster (0.94-1.12x) than the
+  // per-point far field -- see potential_on_points_boxed for why. Kept reachable
+  // so the comparison can be rerun.
+  std::vector<Real> Vh(N3, Real(0));
+  if (lloc > 0 && far_tau > Real(0)) {
+    std::vector<std::array<Real, 3>> pts;
+    PointBoxes<Real> boxes;
+    std::vector<std::size_t> perm;
+    fegrid_boxes(grid, pts, boxes, perm);
+    const auto Vb =
+        potential_on_points_boxed(basis, D, pts, boxes, tgrid, tau, far_tau, lloc);
+    for (std::size_t k = 0; k < perm.size(); ++k) Vh[perm[k]] = Vb[k];
+  } else {
+    Vh = potential_on_points(basis, D, fegrid_points(grid), tgrid, tau, far_tau);
+  }
   auto V = detail::to_device(Vh, "gr::Vanalytic");
   auto ao = detail::ao_on_grid_dev(basis, grid);
   auto xw = detail::to_device(grid.xw, "gr::xw");

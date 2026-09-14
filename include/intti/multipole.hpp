@@ -36,13 +36,15 @@ namespace intti {
 /// T[(t*(L+1)+u)*(L+1)+v]. R is the (real) separation P_bra - P_ket. Uses the
 /// standard MD downward recursion seeded with S_n = (-1)^n (2n-1)!!/|R|^{2n+1}.
 template <class Real>
-void multipole_tensor(int L, const Real R[3], Real *T) {
+void multipole_tensor(int L, const Real R[3], Real *T, Real *W) {
   const int D = L + 1;
   auto id4 = [=](int n, int t, int u, int v) {
     return ((n * D + t) * D + u) * D + v;
   };
-  // scratch over the auxiliary order n (n + (t+u+v) <= L)
-  std::vector<Real> W(static_cast<std::size_t>(D) * D * D * D, Real(0));
+  // scratch over the auxiliary order n (n + (t+u+v) <= L), caller-provided:
+  // the boxed far field rebuilds this tensor once per (box, pair), so an
+  // allocation here would dominate it.
+  for (std::size_t i = 0; i < static_cast<std::size_t>(D) * D * D * D; ++i) W[i] = Real(0);
   const Real R2 = R[0] * R[0] + R[1] * R[1] + R[2] * R[2];
   Real dfac = 1, sign = 1, Rpow = sqrt_(R2); // R^{2n+1}
   for (int n = 0; n <= L; ++n) {
@@ -71,6 +73,13 @@ void multipole_tensor(int L, const Real R[3], Real *T) {
         }
   const int D3 = D * D * D;
   for (int i = 0; i < D3; ++i) T[i] = W[i]; // n = 0 block
+}
+
+/// multipole_tensor with the scratch allocated internally.
+template <class Real> void multipole_tensor(int L, const Real R[3], Real *T) {
+  const int D = L + 1;
+  std::vector<Real> W(static_cast<std::size_t>(D) * D * D * D, Real(0));
+  multipole_tensor(L, R, T, W.data());
 }
 
 namespace detail {
