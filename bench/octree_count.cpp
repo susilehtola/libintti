@@ -39,6 +39,7 @@ namespace {
 
 struct G3 {
   double alpha, c[3];
+  int id;
 };
 
 // pair-product Gaussians of the basis, deduplicated
@@ -49,6 +50,7 @@ std::vector<G3> pair_gaussians(const intti::ContractedBasis<double> &b) {
       for (double ai : si.alpha)
         for (double aj : sj.alpha) {
           G3 e;
+          e.id = 0;
           e.alpha = ai + aj;
           for (int d = 0; d < 3; ++d)
             e.c[d] = (ai * si.center[d] + aj * sj.center[d]) / e.alpha;
@@ -68,7 +70,36 @@ std::vector<G3> pair_gaussians(const intti::ContractedBasis<double> &b) {
                         return true;
                       }),
           g.end());
+  for (std::size_t i = 0; i < g.size(); ++i) g[i].id = static_cast<int>(i);
   return g;
+}
+
+// ACCURACY OF THE TREE ITSELF. The leaf quadratures together must reproduce the
+// closed-form norm of every Gaussian they are supposed to describe:
+//   int (x-Cx)^{2m0}(y-Cy)^{2m1}(z-Cz)^{2m2} e^{-2a|r-C|^2} d^3r
+// factorises per axis, so a box contributes the product of three one-dimensional
+// Gauss-Legendre sums and the check costs 3p per (leaf, Gaussian) rather than
+// p^3. Cases: the envelope, and each axis carrying the full polynomial degree.
+constexpr int NCASE = 4;
+std::vector<double> qacc; // ngauss x NCASE
+std::vector<double> gl_x, gl_w;
+
+double axis_moment(double lo, double hi, double a, double c, int m) {
+  const double mid = 0.5 * (lo + hi), hw = 0.5 * (hi - lo);
+  double s = 0;
+  for (std::size_t k = 0; k < gl_x.size(); ++k) {
+    const double u = mid + hw * gl_x[k] - c;
+    double t = std::exp(-2 * a * u * u);
+    for (int i = 0; i < 2 * m; ++i) t *= u;
+    s += hw * gl_w[k] * t;
+  }
+  return s;
+}
+
+double axis_exact(double a, int m) {
+  double e = std::sqrt(M_PI / (2 * a));
+  for (int i = 1; i <= m; ++i) e *= double(2 * i - 1) / (4 * a);
+  return e;
 }
 
 long nleaf = 0, maxdepth = 0;
@@ -115,6 +146,16 @@ void refine(const std::vector<G3> &gs, const double lo[3], const double hi[3], d
       ++nleaf;
       maxdepth = std::max(maxdepth, (long)depth);
       npoints += double(p) * p * p;
+      if (!qacc.empty())
+        for (const auto &g : live)
+          for (int cs = 0; cs < NCASE; ++cs) {
+            int m[3] = {0, 0, 0};
+            if (cs > 0) m[cs - 1] = pdeg;
+            double q = 1;
+            for (int d = 0; d < 3; ++d)
+              q *= axis_moment(lo[d], hi[d], g.alpha, g.c[d], m[d]);
+            qacc[(std::size_t)g.id * NCASE + cs] += q;
+          }
       return;
     }
     s_reject = std::min(s_reject, smax);
@@ -208,6 +249,10 @@ int main(int argc, char **argv) {
       hi[d] = c + 0.5 * side;
     }
 
+    if (s_crit_global > 0) {
+      qacc.assign(gs.size() * NCASE, 0.0);
+      intti::detail::fe_gauss_legendre<double>(std::max(p, pdeg + 2), -1.0, 1.0, gl_x, gl_w);
+    }
     const auto t0 = std::chrono::steady_clock::now();
     refine(gs, lo, hi, eps, std::max(p, pdeg + 2), pdeg, 0, 24);
     const double ms = std::chrono::duration<double, std::milli>(
@@ -224,6 +269,18 @@ int main(int argc, char **argv) {
                 tensor_pts / npoints, ms, nprobe_calls);
     std::printf("  indicator   : accepted up to s = h*sqrt(2a) = %.3f, refined from %.3f\n",
                 s_accept, s_reject);
+    if (!qacc.empty()) {
+      double worst = 0;
+      for (std::size_t i = 0; i < gs.size(); ++i)
+        for (int cs = 0; cs < NCASE; ++cs) {
+          int m[3] = {0, 0, 0};
+          if (cs > 0) m[cs - 1] = pdeg;
+          double e = 1;
+          for (int d = 0; d < 3; ++d) e *= axis_exact(gs[i].alpha, m[d]);
+          worst = std::max(worst, std::abs(qacc[i * NCASE + cs] - e) / e);
+        }
+      std::printf("  ACCURACY    : worst 3D norm defect over leaves = %.3e\n", worst);
+    }
   }
   Kokkos::finalize();
   return 0;

@@ -2147,6 +2147,35 @@ elevated-l block variant returning all (e,f) components), minor caching
   faster AND smaller than the probing tree. So the construction cost is a
   property of how the indicator is written, not of the problem.
 
+  AT MATCHED ACCURACY THE SAVING IS LARGER than the table above, which used the
+  conservative probing indicator. Checking the tree itself -- the leaf
+  quadratures against the closed-form 3D Gaussian norm, which factorises per
+  axis so it costs 3p per (leaf, Gaussian) rather than p^3 -- the defect is FLAT
+  below a threshold and then breaks:
+
+      jit-SVP, 1 water, order 6:
+        s_crit   0.70   0.82   0.95   1.05   1.30   1.60   2.00   3.00
+        points  3.74e6 2.06e6 1.54e6 1.12e6 8.47e5 5.94e5 3.03e5 1.75e5
+        defect  8.2e-5 7.2e-5 7.0e-5 7.0e-5 7.0e-5 5.5e-4 4.3e-3 8.7e-2
+
+  Below the knee the defect sits at 7.0e-5 no matter how much the tree is
+  coarsened, because it is set by the DOMAIN truncation at eps = 1e-2, not by
+  refinement -- and the tensor grid for the same case is at the same 7.0e-5. So
+  the two can be compared at equal accuracy:
+
+      1 water  jit  order  6, s_crit 1.3:  1.51e7 -> 8.47e5    17.8x
+      2 water  jit  order  6, s_crit 1.3:  2.90e8 -> 2.09e6   138.7x
+      1 water QZVPPD order 10, s_crit 2.2:  7.10e7 -> 4.49e6    15.8x  (and more
+                                                       accurate: 3.6e-5 vs 4.6e-5)
+
+  The knee moves with the order -- 1.3 at p = 6, 2.2 at p = 10, near s_crit ~
+  p/4.5 -- which is what an exponentially convergent interpolant should do.
+
+  AND THE SCALING IS THE POINT. One to two waters costs the octree 8.47e5 ->
+  2.09e6 points, a factor of 2.5 for twice the atoms; it costs the tensor grid
+  1.51e7 -> 2.90e8, a factor of 19. Linear against cubic, measured rather than
+  argued. Tree construction with the closed-form indicator: 28 ms to 1 s.
+
   WHAT IS ACTUALLY HARD is not the grid but the operator on it: applying the
   separated Gaussian kernel between boxes at different levels, which is the
   multiwavelet non-standard form. The t-quadrature already supplies the
