@@ -1987,43 +1987,50 @@ elevated-l block variant returning all (e,f) components), minor caching
   implementation one, and because the payoff is unmeasurable here (no GPU, no
   Kokkos backend beyond OpenMP, where the copies this removes are nearly free).
 
-- **GRID-RI CANNOT RUN A REAL BASIS SET -- BLOCKING, AND NOT A TUNING PROBLEM.**
-  The grid route was only ever exercised on the small uncontracted model bases
-  in the test suite (2-4 centres, s+p+d, N = 20-90 per axis). Measured on what a
-  real calculation would need, via `grid_for_basis` on PySCF dumps
-  (prototype/dump_basis.py, bench/scaling.cpp):
+- **GRID-RI ON A REAL BASIS SET: THE BLOCKER IS TIME, NOT MEMORY.** (Corrects an
+  earlier entry here that said memory, which was wrong.)
 
-      def2-SVP,     1 water,  25 AO:  N = 1452/axis,  N^3 = 3.1e9 points
-      def2-SVP,     2 water,  50 AO:  N = 5121/axis,  N^3 = 1.3e11
-      def2-SVP,     4 water, 100 AO:  N = 5953/axis,  N^3 = 2.1e11
+  MEMORY IS NOT THE PROBLEM. gridri.hpp's reference implementation materialises
+  the AO values as an nao x N^3 View -- 612 GB for one water in def2-SVP -- but
+  that is a property of that implementation, which its own header flags as a
+  reference, not of the method. The work is element-local: two element blocks
+  suffice at any moment, everything else contracts on the fly. bench/stream_j.cpp
+  does it that way and the peak footprint is 100 kB (def2-SVP) and 632 kB
+  (def2-QZVPPD), against 612 GB and worse for the materialised form.
 
-  One scalar field on the smallest of those is 24 GB; `ao_on_grid_dev` allocates
-  nao x N^3, which is 612 GB. def2-QZVPPD is far worse (its tightest primitive
-  is alpha = 1.2e5, a 0.002 bohr feature). So the grid route cannot do ONE water
-  molecule in a double-zeta basis.
+  THE POINT COUNT IS THE PROBLEM, and it is severe. Measured with the streaming
+  build, one water molecule:
 
-  The cause is NOT only the tight core, which was the obvious guess. Capping the
-  def2-SVP exponents and rebuilding the grid:
+      def2-SVP     25 AO   N =  1452/axis   3.06e9  points   44 us/pt ->    37 hours
+      def2-QZVPPD 158 AO   N = 17383/axis   5.25e12 points  263 us/pt ->    44 years
 
-      alpha <= 2266 (full)   N = 1452        alpha <= 77     N = 1272
-      alpha <= 341           N = 1362        alpha <= 6.7    N =  766
-                                             alpha <= 2.0    N =  620
+  against 0.19 s and 37.8 s for the analytic Coulomb build on the same systems.
 
-  Removing the core entirely still leaves N = 620, i.e. 2.4e8 points. The real
-  cause is structural: ONE GLOBAL TENSOR-PRODUCT GRID has to resolve every
-  length scale present in the basis, across the whole molecular domain, on every
-  axis. Real basis sets span four to five decades in exponent, hence two to
-  three in length scale, and a tensor product pays that on all three axes at
-  once.
+  TWO SEPARATE FACTORS, and they should not be conflated:
 
-  So the analytic-vs-grid scaling comparison cannot be made as posed, and no
-  amount of far-field work on the grid route changes that -- the far field
-  accelerates the potential, while what is unaffordable is the grid itself.
+  1. Cost per point is npair x 163 ns -- the npair x npoints shape, since the
+     Coulomb potential is long ranged and every pair contributes at every point.
+     A source-side fast multipole method would collapse npair into nbox and cut
+     this to O(1) per point, worth roughly 250x here. That is the work described
+     under potential_on_points_boxed, of which only the target half exists.
 
-  What would fix it is a different spatial discretisation, not a better
-  algorithm on this one: atom-centred (Becke) quadrature instead of a global
-  tensor product, a multiresolution basis, or removing the core with a
-  pseudopotential. Each is a substantial piece of work and a different design.
-  Until one of them exists, the grid pillar's honest scope is smooth model
-  bases, NAO/numerical work where no analytic alternative exists, and use as an
-  independent oracle for the analytic route.
+  2. The point count itself, which no algorithm on this grid changes. N is set by
+     the ratio of the domain to the finest feature in the basis, on every axis,
+     and a tensor product cubes it.
+
+  WHY ENRICHING THE BASIS MAKES IT WORSE, NOT BETTER. The hope was that the
+  analytic route pays N^4 in basis size while the grid route pays only for the
+  grid, so a large basis on a small molecule would favour the grid. It does not,
+  because standard enrichment widens the length-scale range at BOTH ends:
+  def2-QZVPPD's tightest primitive is alpha = 1.2e5 against def2-SVP's 2266, so
+  its grid is 12x finer per axis and 1700x larger in total. The analytic route
+  got 200x more expensive going SVP -> QZVPPD; the grid route got 1700x more
+  expensive.
+
+  The crossover argument only works for enrichment that does NOT add tight
+  functions -- valence-only enrichment over a pseudopotential or frozen core.
+  That, or a discretisation whose cost is not set by the finest feature
+  everywhere: atom-centred (Becke) quadrature, or multiresolution. Until one of
+  those exists the grid pillar's honest scope is smooth model bases, NAO and
+  numerical work where no analytic alternative exists, and use as an independent
+  oracle for the analytic route.
