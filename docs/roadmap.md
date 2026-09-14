@@ -2229,3 +2229,44 @@ elevated-l block variant returning all (e,f) components), minor caching
   density's own scale sqrt(alpha_max), while the box-box apply needs t_c below
   1/h; with boxes sized to resolve the density those two conditions conflict.
   Resolving it is exactly the operator-driven refinement above.
+
+- **RECOMMENDATION: STOP BUILDING THE MULTIRESOLUTION ENGINE. INTERFACE TO MRCPP
+  INSTEAD, AND DEMOTE THE GRID PILLAR.**
+
+  Everything measured over the octree work points the same way, and the decisive
+  fact is that the kernel representations ALREADY AGREE. MRCPP's PoissonKernel is
+  a `GaussExp<1>` -- a sum of Gaussians obtained by discretising the same
+  integral transform this library's t grid discretises. There is no mathematical
+  impedance mismatch to bridge; what MRCPP has that we do not is a decade of work
+  on the part that is actually hard.
+
+  And the evidence says the hard part is not ours. The operator primitive took
+  one sitting and validated to 3e-6 (bench/octree_apply.cpp). What is hard is the
+  scheduling, the band structure, the adaptive projection with guaranteed error,
+  the cross-correlation coefficients, and -- newly discovered here -- refinement
+  driven by the OPERATOR rather than the function. That is multiresolution
+  analysis, a separate field, and libintti's claim is Gaussian integrals.
+
+  So:
+    * Keep the existing tensor-grid route as a SMALL-SCALE INDEPENDENT ORACLE.
+      It is validated, it shares no code with the analytic engine below the t
+      grid, and it does not need to be fast to be useful. It already pays for
+      itself there.
+    * Close the octree / non-standard-form line. The measurements stay as the
+      record of why.
+    * If numerical or mixed Gaussian-numerical bases are wanted, interface to
+      MRCPP rather than rebuild. libintti supplies what it is good at -- Gaussian
+      densities, potentials and matrix elements -- and MRCPP supplies the
+      discretisation.
+
+  NEEDS A DECISION: MRCPP is LGPL-3.0 and libintti is BSD-3-Clause. Linking is
+  allowed, but the combined work carries the LGPL relinking obligation, which is
+  a real constraint on a library meant to be embedded in other people's codes. It
+  should therefore be an OPTIONAL backend behind an interface, never a core
+  dependency -- and that is a call to make deliberately rather than by drifting
+  into it.
+
+  What today's work leaves behind regardless of that decision: the grid seeding
+  fix, worth 822x in points on one water and a faster test suite, and the
+  analytic-potential route, which is both faster and more accurate than DAGE at
+  the same grid. Those are in the shipped code and stand on their own.
