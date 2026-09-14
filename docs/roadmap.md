@@ -2107,3 +2107,49 @@ elevated-l block variant returning all (e,f) components), minor caching
   is missing is the adaptive 3D discretisation, not the operator. That is the
   honest statement of what the grid pillar would take, and it is a different
   project rather than a fix.
+
+- **HOW TO BUILD THE ADAPTIVE 3D GRID -- measured, bench/octree_count.cpp.**
+
+  Grid construction is usually the bottleneck of finite-element electronic
+  structure, because the refinement indicator needs the solution and you pay a
+  solve-estimate-refine cycle. THAT DOES NOT APPLY HERE. The density is a sum of
+  Gaussian products known in closed form before anything is solved, so the
+  indicator is a priori; and because a Gaussian factorises, the error of a
+  tensor-product polynomial on a box is bounded by the sum of the three
+  one-dimensional errors along its edges, which fegrid.hpp already computes.
+
+  WHAT AN OCTREE WOULD SAVE. Refining in volume instead of per axis, at eps =
+  1e-2:
+
+      1 water def2-SVP, axis-aligned   3.38e6 -> 1.72e6 points    2.0x
+      1 water def2-SVP, general orient 1.51e7 -> 1.71e6           8.8x
+      2 water def2-SVP, general orient 2.90e8 -> 6.93e6          41.9x
+      1 water def2-QZVPPD              7.10e7 -> 6.35e6          11.2x
+
+  The ratio GROWS with system size (8.8x -> 41.9x for one to two waters), which
+  is the linear-against-cubic scaling showing up directly. Note also that the
+  octree barely notices orientation -- 1.71e6 points axis-aligned or not --
+  where the tensor grid pays 4x for the same molecule rotated.
+
+  AND CONSTRUCTION NEED NOT BE THE BOTTLENECK. The probing indicator (16 probes
+  per axis per Gaussian per degree per box) takes 36 s on two waters. But it
+  turns out to be a function of ONE dimensionless group, s = h sqrt(2a), the
+  number of Gaussian widths across the half-box: its accept and reject bands
+  nearly touch, at 1.052 against 0.819 for order 6 and 1.976 against 1.838 for
+  order 10. Replacing the probe with that single comparison:
+
+      probing       32073 leaves   6.93e6 points   35809 ms
+      s_crit = 0.82 39990 leaves   8.64e6 points      58 ms
+      s_crit = 0.95 27656 leaves   5.97e6 points      42 ms
+      s_crit = 1.05 17958 leaves   3.88e6 points      28 ms
+
+  617x faster at the conservative threshold, and at s_crit = 1.05 it is both
+  faster AND smaller than the probing tree. So the construction cost is a
+  property of how the indicator is written, not of the problem.
+
+  WHAT IS ACTUALLY HARD is not the grid but the operator on it: applying the
+  separated Gaussian kernel between boxes at different levels, which is the
+  multiwavelet non-standard form. The t-quadrature already supplies the
+  separated representation; the tree, on this evidence, is cheap. That is the
+  opposite of where the effort is usually assumed to go, and it is worth
+  knowing before committing to the project.
