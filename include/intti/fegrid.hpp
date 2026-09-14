@@ -222,6 +222,28 @@ void fe_hp_refine(const std::vector<FEGaussian1D<Real>> &gs, Real a, Real b, Rea
 /// the Gaussian envelope only; 2*lmax for a basis of max angular momentum lmax).
 ///
 namespace detail {
+/// Local feature scale at x: the width of the tightest Gaussian that is still
+/// alive there, 1/sqrt(a) over the g with a (x-c)^2 <= -ln(eps). Near a nucleus a
+/// tight core function keeps this small, so nothing merges; away from every
+/// centre only diffuse functions survive the amplitude test and the scale is
+/// large.
+template <class Real>
+Real fe_local_scale(const std::vector<FEGaussian1D<Real>> &gs, Real x, Real eps,
+                    Real fallback) {
+  const Real cut = -std::log(eps);
+  Real h = fallback;
+  bool any = false;
+  for (const auto &g : gs) {
+    const Real d = x - g.center;
+    if (g.alpha * d * d <= cut) {
+      const Real w = Real(1) / std::sqrt(g.alpha);
+      if (!any || w < h) h = w;
+      any = true;
+    }
+  }
+  return h;
+}
+
 /// Relative defect of the grid's QUADRATURE on one 1D Gaussian factor:
 ///   int (x-x0)^{2d} e^{-2 a (x-x0)^2} dx  =  (2d-1)!! / (4a)^d  sqrt(pi/(2a)),
 /// which is closed form, so the defect is a single number per function and per
@@ -373,7 +395,8 @@ FEGrid1D<Real> make_fegrid1d_greedy(const std::vector<FEGaussian1D<Real>> &gauss
 template <class Real>
 FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians,
                                 Real eps, int pmin, int pmax, int pdeg,
-                                const std::vector<Real> *seeds_in);
+                                const std::vector<Real> *seeds_in,
+                                Real seed_merge = Real(1));
 
 template <class Real>
 FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians,
@@ -384,7 +407,7 @@ FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians
 template <class Real>
 FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians,
                                 Real eps, int pmin, int pmax, int pdeg,
-                                const std::vector<Real> *seeds_in) {
+                                const std::vector<Real> *seeds_in, Real seed_merge) {
   Real xlo = gaussians.front().center, xhi = xlo;
   for (const auto &g : gaussians) {
     // the product factor (x-c)^pdeg exp(-a(x-c)^2) extends a little past the
@@ -405,6 +428,32 @@ FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians
   }
   std::sort(seeds.begin(), seeds.end());
   seeds.erase(std::unique(seeds.begin(), seeds.end()), seeds.end());
+  // Collapse seeds closer together than the local feature scale: two boundaries
+  // that close cannot hold anything between them the neighbouring elements do
+  // not already resolve. The test is local, which is what makes it safe -- it
+  // never merges across a nucleus, because a tight core function keeps the
+  // scale there far below any atomic separation.
+  //
+  // THIS BUYS 1-3%, NOT THE FACTOR IT LOOKS LIKE IT SHOULD. One shared 1D grid
+  // serves all three axes, so the seed list is the union of the x, y and z
+  // projections of every centre -- 3 natom values for a molecule at general
+  // coordinates -- and it is tempting to read the resulting mesh growth as a
+  // seeding artefact. It is not. Measured on water clusters at general
+  // orientation, merging moves N by 247 -> 245 and 667 -> 660. The refinement
+  // puts those boundaries back, because each atom's core Gaussian really does
+  // make a narrow feature at its projected coordinate ON EVERY AXIS, and a
+  // tensor-product grid has to resolve all 3 natom of them. The crowding is
+  // real; it is the discretisation, not the seeding.
+  if (seed_merge > Real(0) && seeds.size() > 2) {
+    const Real span = seeds.back() - seeds.front();
+    std::vector<Real> keep{seeds.front()};
+    for (std::size_t i = 1; i + 1 < seeds.size(); ++i) {
+      const Real h = detail::fe_local_scale(gaussians, seeds[i], eps, span);
+      if (seeds[i] - keep.back() >= seed_merge * h) keep.push_back(seeds[i]);
+    }
+    keep.push_back(seeds.back());
+    seeds.swap(keep);
+  }
   std::vector<Real> bnd{xlo};
   std::vector<int> ord;
   for (std::size_t s = 0; s + 1 < seeds.size(); ++s)

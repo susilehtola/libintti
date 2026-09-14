@@ -2034,6 +2034,31 @@ elevated-l block variant returning all (e,f) components), minor caching
   the exponential p-convergence far better than a global greedy loop; kept in
   make_fegrid1d_greedy so the comparison is on record.
 
+  THE CROWDING IS REAL AND IS NOT A SEEDING ARTEFACT. One shared 1D grid serves
+  all three axes, so the seeds are the union of the x, y and z projections of
+  every centre: 3 natom values at general coordinates. Collapsing seeds closer
+  than the local feature scale (make_fegrid1d_hp's seed_merge, on by default)
+  was the obvious fix and it buys 1-3%:
+
+      lattice water   1/2/4:  N = 155/485/486  ->  150/480/480
+      general orient. 1/2  :  N = 247/667      ->  245/660
+
+  The refinement puts the boundaries back, because each atom's core Gaussian
+  really does make a narrow feature at its projected coordinate on every axis,
+  and a tensor product has to resolve all 3 natom of them. So N grows LINEARLY
+  in the number of atoms and the point count cubically, against the analytic
+  route's roughly quadratic growth. That is the asymptotic trade: the grid wins
+  on basis size and loses on system size.
+
+  One measurement makes the cost of a tensor product vivid. Rotating a SINGLE
+  water molecule from axis-aligned to general orientation -- same molecule, same
+  basis, same accuracy -- takes N from 155 to 247, a factor of four in points,
+  because its three atoms then project onto nine distinct coordinates instead of
+  four. A tensor-product grid is not rotationally invariant, and a lattice of
+  identical monomers hides this completely: 2 and 4 waters on the lattice give
+  N = 485 and 486, because the extra monomers project onto coordinates that are
+  already there. Grid benchmarks on symmetric geometries are worthless.
+
   WHERE THIS LEAVES THE COMPARISON. One water, streaming J against the analytic
   build: def2-SVP 210 s vs 0.19 s, def2-QZVPPD 9.25 h vs 37.8 s. Still three
   orders behind -- but the RATIO now improves with basis enrichment (1100x ->
