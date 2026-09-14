@@ -2182,3 +2182,50 @@ elevated-l block variant returning all (e,f) components), minor caching
   separated representation; the tree, on this evidence, is cheap. That is the
   opposite of where the effort is usually assumed to go, and it is worth
   knowing before committing to the project.
+
+- **THE APPLY ON THE OCTREE: primitive done and validated, scheduling not.**
+  (bench/octree_apply.cpp)
+
+  The box-to-box separated-kernel apply is implemented and correct. At each t
+  node the kernel factorises, e^{-t^2|x-y|^2} = prod_d e^{-t^2 (x_d-y_d)^2}, so a
+  source box acts on a target box through three (p x p) matrices,
+      M^(d)_ab = w^S_b exp(-t^2 (x^T_a - y^S_b)^2),
+  which is 3 p^4 work rather than p^6 and needs no two-scale relation, because
+  source and target are both quadrature representations. Validated to ~3e-6
+  relative against potential_on_points, with the residual set by the domain
+  truncation, not the apply: it does not move between order 4 and order 6.
+
+  IT IS ONLY CORRECT FOR PART OF THE t GRID, and the boundary is one
+  dimensionless number. Sweeping the t range with apply and oracle on the SAME
+  truncated grid, so the quadrature error cancels and only the spatial
+  discretisation is left:
+
+      t_max     0.073   0.33   0.85    1.9    4.2   10.7   42.7   5754
+      t h_min    0.06   0.29   0.75   1.68   3.73   9.45   37.7   5078
+      rel err   4e-06  3e-06  5e-06  5e-05  7e-04  2e-02  2e-01     77
+
+  The error depends on t h and nothing else. A box-box apply works while the
+  kernel width 1/t is comparable to or larger than the box, and fails once the
+  kernel is narrower than the box it is being integrated over.
+
+  TWO CONSEQUENCES, both of which change what the project is.
+
+  First, the hierarchy is not an optimisation, it is required for correctness:
+  every t node must be applied on boxes of size h ~ 1/t. The multiresolution
+  principle arrives here from the quadrature side rather than from complexity
+  counting.
+
+  Second -- and this is the one that was not anticipated -- at large t the
+  required boxes are FINER THAN THE DENSITY'S OWN SCALE. The tree has to be
+  refined for the OPERATOR as well as for the function, so the point counts in
+  bench/octree_count.cpp, which refine only until rho is resolved, are a LOWER
+  BOUND on what the apply needs. How much of a lower bound is not yet measured
+  and is the next thing to find out, because it feeds straight back into the
+  17.8x / 138.7x savings quoted there.
+
+  Also worth recording: the obvious escape for large t, folding the tail into
+  the delta limit the way truncated t grids already do (tail_coeff, tail_order in
+  tgrid.hpp), does NOT work here unaided. That expansion needs t_c well above the
+  density's own scale sqrt(alpha_max), while the box-box apply needs t_c below
+  1/h; with boxes sized to resolve the density those two conditions conflict.
+  Resolving it is exactly the operator-driven refinement above.
