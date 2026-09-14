@@ -220,9 +220,171 @@ void fe_hp_refine(const std::vector<FEGaussian1D<Real>> &gs, Real a, Real b, Rea
 /// This is the cheap per-axis construction of the tensorial grid (roadmap M-FE).
 /// `pdeg` is the maximum AO-product polynomial degree per axis to resolve (0 =
 /// the Gaussian envelope only; 2*lmax for a basis of max angular momentum lmax).
+///
+namespace detail {
+/// Relative defect of the grid's QUADRATURE on one 1D Gaussian factor:
+///   int (x-x0)^{2d} e^{-2 a (x-x0)^2} dx  =  (2d-1)!! / (4a)^d  sqrt(pi/(2a)),
+/// which is closed form, so the defect is a single number per function and per
+/// degree. A grid that reproduces the norm of a function describes it; a grid
+/// that does not, does not. This is exactly the criterion the analytic-potential
+/// route needs, because there the grid is used ONLY as a quadrature.
+template <class Real>
+Real fe_norm_defect(const FEGrid1D<Real> &g, Real a, Real x0, int d) {
+  Real q = 0;
+  for (int i = 0; i < g.N; ++i) {
+    const Real u = g.xnode[i] - x0;
+    Real t = std::exp(-2 * a * u * u);
+    for (int k = 0; k < 2 * d; ++k) t *= u;
+    q += g.xw[i] * t;
+  }
+  Real exact = std::sqrt(pi_v<Real>() / (2 * a));
+  for (int m = 1; m <= d; ++m) exact *= Real(2 * m - 1) / (4 * a);
+  return std::abs(q - exact) / exact;
+}
+
+} // namespace detail
+
+/// Greedy, norm-driven 1D mesh construction. MEASURED WORSE THAN THE BISECTION
+/// BUILDER ONCE THAT IS SEEDED CORRECTLY, and kept only so the comparison is on
+/// record. On one water in def2-SVP, asked for eps = 1e-2:
+///
+///     atom-seeded bisection   N = 155   worst norm defect 4.3e-5
+///     this, greedy            N = 864   worst norm defect 9.3e-3
+///
+/// The greedy converges to the tolerance it was given; the bisection builder
+/// overshoots it by four orders and still uses a fifth of the points. Refining
+/// where the norm defect is worst is a sound idea, but it loses to trying every
+/// order pmin..pmax on a candidate element before splitting it -- a Gaussian is
+/// entire, so p-refinement converges exponentially and h-refinement does not,
+/// and the per-element order trial exploits that far better than a global
+/// greedy loop can.
+///
+/// The bisection builder (make_fegrid1d_hp) seeds an element boundary at every
+/// Gaussian centre it is handed. A caller with one Gaussian per shell PAIR per
+/// axis therefore gets 3 npair boundaries, and since a Gaussian product is
+/// smooth there is nothing at those points to resolve: the mesh comes out as one
+/// element per seed, every element at pmin, and N grows as nshell^2 with no
+/// relation to the requested accuracy. Measured on one water molecule that was
+/// N = 1452 per axis for def2-SVP and N = 17383 for def2-QZVPPD; since the cost
+/// is N^3, that is three to four orders of magnitude of pure waste.
+///
+/// This builds the mesh from the accuracy instead. Each iteration measures the
+/// norm defect of every function, takes the WORST, and inserts points at that
+/// function's own natural length scale, x0 + k/sqrt(a) for k = -NSCALE..NSCALE;
+/// when those are already present it raises the order of the element holding the
+/// centre, and bisects only when the order is exhausted. Nothing is placed that
+/// some function did not ask for, which is what keeps the mesh compact when the
+/// x, y and z projections of a polyatomic molecule crowd together.
+template <class Real>
+FEGrid1D<Real> make_fegrid1d_greedy(const std::vector<FEGaussian1D<Real>> &gaussians,
+                                    Real eps, int pmin = 4, int pmax = 16, int pdeg = 0,
+                                    int maxit = 4000) {
+  constexpr int NSCALE = 6;
+  pmin = std::max(pmin, pdeg + 2);
+  pmax = std::max(pmax, pmin);
+  Real xlo = gaussians.front().center, xhi = xlo;
+  for (const auto &g : gaussians) {
+    const Real w = std::sqrt((-std::log(eps) + pdeg) / g.alpha);
+    xlo = std::min(xlo, g.center - w);
+    xhi = std::max(xhi, g.center + w);
+  }
+  // distinct (alpha, centre): duplicates only cost time in the scan
+  std::vector<FEGaussian1D<Real>> gs;
+  for (const auto &g : gaussians) {
+    bool dup = false;
+    for (const auto &h : gs)
+      if (std::abs(h.alpha - g.alpha) <= Real(1e-12) * h.alpha &&
+          std::abs(h.center - g.center) <= Real(1e-10)) {
+        dup = true;
+        break;
+      }
+    if (!dup) gs.push_back(g);
+  }
+
+  std::vector<Real> bnd{xlo, xhi};
+  std::vector<int> ord{pmin};
+  auto insert_point = [&](Real x) {
+    if (!(x > bnd.front() && x < bnd.back())) return false;
+    for (std::size_t i = 0; i < bnd.size(); ++i) {
+      const Real scale = std::max<Real>(Real(1e-10), std::abs(bnd[i]));
+      if (std::abs(bnd[i] - x) <= Real(1e-6) * scale) return false;
+    }
+    const std::size_t k =
+        std::lower_bound(bnd.begin(), bnd.end(), x) - bnd.begin(); // 1 <= k <= ne
+    bnd.insert(bnd.begin() + k, x);
+    ord.insert(ord.begin() + (k - 1), ord[k - 1]);
+    return true;
+  };
+
+  FEGrid1D<Real> g = detail::make_fegrid1d_elements(bnd, ord);
+  for (int it = 0; it < maxit; ++it) {
+    Real worst = 0;
+    int iworst = -1;
+    for (std::size_t i = 0; i < gs.size(); ++i)
+      for (int d = 0; d <= pdeg; ++d) {
+        const Real e = detail::fe_norm_defect(g, gs[i].alpha, gs[i].center, d);
+        if (e > worst) {
+          worst = e;
+          iworst = static_cast<int>(i);
+        }
+      }
+    if (worst <= eps || iworst < 0) break;
+    const Real a = gs[iworst].alpha, c = gs[iworst].center;
+    const Real h = Real(1) / std::sqrt(a);
+    // ORDER FIRST. A Gaussian is entire, so barycentric interpolation on an
+    // element converges exponentially in the order while h-refinement at fixed
+    // order converges only algebraically: raising p is strictly the better move
+    // until p is spent. Refining h first measured 3x worse (N = 474 against 155
+    // on one water in def2-SVP), which is a factor of 27 in points.
+    const Real reach = NSCALE * h;
+    bool bumped = false;
+    for (int e = 0; e + 1 < static_cast<int>(bnd.size()); ++e)
+      if (bnd[e + 1] > c - reach && bnd[e] < c + reach && ord[e] < pmax) {
+        ++ord[e];
+        bumped = true;
+      }
+    if (!bumped) {
+      // p is spent over the function's support: now split, at its own natural
+      // length scale rather than blindly in half
+      bool added = false;
+      for (int k = -NSCALE; k <= NSCALE && !added; ++k) added = insert_point(c + k * h);
+      if (!added) {
+        int e = 0;
+        while (e + 2 < static_cast<int>(bnd.size()) && bnd[e + 1] < c) ++e;
+        if (!insert_point(Real(0.5) * (bnd[e] + bnd[e + 1]))) break;
+      }
+    }
+    g = detail::make_fegrid1d_elements(bnd, ord);
+  }
+  return g;
+}
+
+/// `seeds_in`, when non-null, replaces the default seeding at every Gaussian
+/// centre. Seeds only choose the INITIAL subdivision -- accuracy comes from
+/// fe_hp_refine, which tests every Gaussian on every element regardless -- so
+/// changing them cannot make the mesh wrong, only bigger or smaller.
+///
+/// The default is much bigger. A caller with one Gaussian per SHELL PAIR per
+/// axis (grid_for_basis) seeds 3 npair boundaries, and since a Gaussian product
+/// is smooth there is nothing at those points for a boundary to resolve: the
+/// mesh comes out as one element per seed, all at pmin, and N grows as nshell^2
+/// with no relation to the accuracy asked for. Seeding at the distinct function
+/// centres instead lets the refinement decide, which is what it is for.
+template <class Real>
+FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians,
+                                Real eps, int pmin, int pmax, int pdeg,
+                                const std::vector<Real> *seeds_in);
+
 template <class Real>
 FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians,
                                 Real eps, int pmin = 4, int pmax = 16, int pdeg = 0) {
+  return make_fegrid1d_hp<Real>(gaussians, eps, pmin, pmax, pdeg, nullptr);
+}
+
+template <class Real>
+FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians,
+                                Real eps, int pmin, int pmax, int pdeg,
+                                const std::vector<Real> *seeds_in) {
   Real xlo = gaussians.front().center, xhi = xlo;
   for (const auto &g : gaussians) {
     // the product factor (x-c)^pdeg exp(-a(x-c)^2) extends a little past the
@@ -234,8 +396,13 @@ FEGrid1D<Real> make_fegrid1d_hp(const std::vector<FEGaussian1D<Real>> &gaussians
   pmin = std::max(pmin, pdeg + 2); // room to represent the degree-pdeg polynomial
   pmax = std::max(pmax, pmin);
   std::vector<Real> seeds{xlo, xhi};
-  for (const auto &g : gaussians)
-    if (g.center > xlo && g.center < xhi) seeds.push_back(g.center);
+  if (seeds_in) {
+    for (Real c : *seeds_in)
+      if (c > xlo && c < xhi) seeds.push_back(c);
+  } else {
+    for (const auto &g : gaussians)
+      if (g.center > xlo && g.center < xhi) seeds.push_back(g.center);
+  }
   std::sort(seeds.begin(), seeds.end());
   seeds.erase(std::unique(seeds.begin(), seeds.end()), seeds.end());
   std::vector<Real> bnd{xlo};

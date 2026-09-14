@@ -1987,50 +1987,59 @@ elevated-l block variant returning all (e,f) components), minor caching
   implementation one, and because the payoff is unmeasurable here (no GPU, no
   Kokkos backend beyond OpenMP, where the copies this removes are nearly free).
 
-- **GRID-RI ON A REAL BASIS SET: THE BLOCKER IS TIME, NOT MEMORY.** (Corrects an
-  earlier entry here that said memory, which was wrong.)
+- **GRID-RI ON A REAL BASIS SET.** (Supersedes two earlier entries here, both
+  wrong: one blamed memory, the next accepted the grid size as given.)
 
-  MEMORY IS NOT THE PROBLEM. gridri.hpp's reference implementation materialises
-  the AO values as an nao x N^3 View -- 612 GB for one water in def2-SVP -- but
-  that is a property of that implementation, which its own header flags as a
-  reference, not of the method. The work is element-local: two element blocks
-  suffice at any moment, everything else contracts on the fly. bench/stream_j.cpp
-  does it that way and the peak footprint is 100 kB (def2-SVP) and 632 kB
-  (def2-QZVPPD), against 612 GB and worse for the materialised form.
+  MEMORY WAS NEVER THE PROBLEM. gridri.hpp's reference implementation
+  materialises the AO values as an nao x N^3 View, but the work is element-local
+  -- two blocks suffice at a time, everything else contracts on the fly.
+  bench/stream_j.cpp does that: peak footprint 100 kB, against 612 GB
+  materialised.
 
-  THE POINT COUNT IS THE PROBLEM, and it is severe. Measured with the streaming
-  build, one water molecule:
+  THE GRID WAS BUILT BADLY, AND THAT WAS MOST OF THE COST. make_fegrid1d_hp
+  seeds an element boundary at every Gaussian centre it is handed, and
+  grid_for_basis handed it one Gaussian per shell PAIR per axis. A pair centre
+  is not a feature -- the product is smooth there -- so the mesh came out as one
+  element per seed, every element at pmin, with N growing as nshell^2 and no
+  relation to the accuracy requested. The signature is unmistakable in
+  hindsight: 3 npair = 234 seeds gave ne = 240 elements, and N/ne = 6.05 = pmin
+  exactly, i.e. not one element was ever refined.
 
-      def2-SVP     25 AO   N =  1452/axis   3.06e9  points   44 us/pt ->    37 hours
-      def2-QZVPPD 158 AO   N = 17383/axis   5.25e12 points  263 us/pt ->    44 years
+  Seeding at the distinct SHELL centres instead, changing nothing else:
 
-  against 0.19 s and 37.8 s for the analytic Coulomb build on the same systems.
+      def2-SVP     1 water   N = 1452 -> 155     822x fewer points
+      def2-SVP     2 water   N = 5121 -> 485    1180x
+      def2-QZVPPD  1 water   N = 17383 -> 414  74000x
 
-  TWO SEPARATE FACTORS, and they should not be conflated:
+  and the streaming J for one water in def2-SVP goes from 37 hours to 210 s,
+  def2-QZVPPD from 44 years to 9.25 h.
 
-  1. Cost per point is npair x 163 ns -- the npair x npoints shape, since the
-     Coulomb potential is long ranged and every pair contributes at every point.
-     A source-side fast multipole method would collapse npair into nbox and cut
-     this to O(1) per point, worth roughly 250x here. That is the work described
-     under potential_on_points_boxed, of which only the target half exists.
+  THE THRESHOLD IS A REAL BUT WEAK LEVER. Measured worst norm defect --
+  quadrature of the closed-form Gaussian norm, detail::fe_norm_defect -- against
+  the eps asked for, one water:
 
-  2. The point count itself, which no algorithm on this grid changes. N is set by
-     the ratio of the domain to the finest feature in the basis, on every axis,
-     and a tensor product cubes it.
+      eps        1e-1    3e-2    1e-2    1e-3    1e-4    1e-6
+      SVP   N     125     140     155     202     254     352
+      defect   4.9e-3  5.3e-4  4.3e-5  8.3e-7  1.6e-8  4.3e-12
 
-  WHY ENRICHING THE BASIS MAKES IT WORSE, NOT BETTER. The hope was that the
-  analytic route pays N^4 in basis size while the grid route pays only for the
-  grid, so a large basis on a small molecule would favour the grid. It does not,
-  because standard enrichment widens the length-scale range at BOTH ends:
-  def2-QZVPPD's tightest primitive is alpha = 1.2e5 against def2-SVP's 2266, so
-  its grid is 12x finer per axis and 1700x larger in total. The analytic route
-  got 200x more expensive going SVP -> QZVPPD; the grid route got 1700x more
-  expensive.
+  N grows 2.8x for ten orders of magnitude of accuracy, which is the hp scheme
+  converging exponentially, as it should on entire functions. So eps is worth
+  loosening -- 1e-2 overshoots by four orders -- but it buys tens of percent,
+  not factors.
 
-  The crossover argument only works for enrichment that does NOT add tight
-  functions -- valence-only enrichment over a pseudopotential or frozen core.
-  That, or a discretisation whose cost is not set by the finest feature
-  everywhere: atom-centred (Becke) quadrature, or multiresolution. Until one of
-  those exists the grid pillar's honest scope is smooth model bases, NAO and
-  numerical work where no analytic alternative exists, and use as an independent
-  oracle for the analytic route.
+  A GREEDY NORM-DRIVEN BUILDER LOSES TO THIS. Refining wherever the norm defect
+  is worst, inserting at the function's own scale x0 +- n/sqrt(a), reaches
+  N = 864 at defect 9.3e-3 where the seeded bisection reaches N = 155 at 4.3e-5.
+  Trying every order pmin..pmax on a candidate element before splitting exploits
+  the exponential p-convergence far better than a global greedy loop; kept in
+  make_fegrid1d_greedy so the comparison is on record.
+
+  WHERE THIS LEAVES THE COMPARISON. One water, streaming J against the analytic
+  build: def2-SVP 210 s vs 0.19 s, def2-QZVPPD 9.25 h vs 37.8 s. Still three
+  orders behind -- but the RATIO now improves with basis enrichment (1100x ->
+  880x) rather than degrading, which is the opposite of what the previous entry
+  concluded from the broken grid. Per-point cost is still npair x 163 ns, the
+  npair x npoints shape; a source-side fast multipole method would make it O(1)
+  per point and is the missing half of potential_on_points_boxed. With that, the
+  SVP -> QZVPPD step costs the grid 19x and the analytic route 200x, so the
+  crossover argument is alive and was refuted earlier only by a bad mesh.
