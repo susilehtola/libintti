@@ -45,12 +45,12 @@ namespace detail {
 /// per-(pair,centre) decay screen; far_tau > 0 the FMM multipole far branch.
 /// The shared per-primitive-pair kernel of the primitive nuclear builder
 /// (attraction_accumulate) and the contracted one (contracted.hpp).
-template <class Real>
-void attraction_pair_block(const PrimitiveShell<Real> &sa,
+template <class Real, class Sink>
+void attraction_pair_visit(const PrimitiveShell<Real> &sa,
                            const PrimitiveShell<Real> &sb,
                            const std::vector<PointCharge<Real>> &centers,
                            const TGrid<Real> &grid, Real tau, Real far_tau,
-                           Real *acc) {
+                           Sink &&sink) {
   const int nt = grid.n();
   const Real pi = pi_v<Real>();
   const bool screen = tau > Real(0);
@@ -74,10 +74,12 @@ void attraction_pair_block(const PrimitiveShell<Real> &sa,
   }
   const Real pair_bound = (2 * pi / p) * expmu; // (2 pi/p) exp(-mu R_AB^2)
   const int nca = ncart(la), ncb = ncart(lb);
-  for (int i = 0; i < nca * ncb; ++i) acc[i] = Real(0);
   std::vector<Real> Bx(la + lb + 1), By(la + lb + 1), Bz(la + lb + 1), Tbuf;
+  std::vector<Real> blk(static_cast<std::size_t>(nca) * ncb);
   const int n1 = la + lb + 1;
-  for (const auto &c : centers) {
+  for (std::size_t ic = 0; ic < centers.size(); ++ic) {
+    const auto &c = centers[ic];
+    for (int i = 0; i < nca * ncb; ++i) blk[i] = Real(0);
     Real d2 = 0;
     if (screen || far)
       for (int d = 0; d < 3; ++d)
@@ -109,9 +111,10 @@ void attraction_pair_block(const PrimitiveShell<Real> &sa,
             for (int ty = 0; ty <= a3[1] + b3[1]; ++ty)
               for (int tz = 0; tz <= a3[2] + b3[2]; ++tz)
                 s += Ex[tx] * Ey[ty] * Ez[tz] * Tbuf[(tx * Dt + ty) * Dt + tz];
-          acc[ka * ncb + kb] += wpref * s;
+          blk[ka * ncb + kb] = wpref * s;
         }
       }
+      sink(ic, blk.data());
       continue;
     }
     for (int it = 0; it < nt; ++it) {
@@ -137,12 +140,29 @@ void attraction_pair_block(const PrimitiveShell<Real> &sa,
               s += Ed[tau_] * B[tau_];
             return pref * s;
           };
-          acc[ka * ncb + kb] += wt * gd(0, Bx.data()) * gd(1, By.data()) *
+          blk[ka * ncb + kb] += wt * gd(0, Bx.data()) * gd(1, By.data()) *
                                 gd(2, Bz.data());
         }
       }
     }
+    sink(ic, blk.data());
   }
+}
+
+/// Accumulate sum_c weight_c <a|1/|r-R_c||b> into acc (ncart(la) x ncart(lb)),
+/// OVERWRITING it: the original block form, now a sink over the visitor.
+template <class Real>
+void attraction_pair_block(const PrimitiveShell<Real> &sa,
+                           const PrimitiveShell<Real> &sb,
+                           const std::vector<PointCharge<Real>> &centers,
+                           const TGrid<Real> &grid, Real tau, Real far_tau,
+                           Real *acc) {
+  const int n = ncart(sa.l) * ncart(sb.l);
+  for (int i = 0; i < n; ++i) acc[i] = Real(0);
+  attraction_pair_visit(sa, sb, centers, grid, tau, far_tau,
+                        [&](std::size_t, const Real *blk) {
+                          for (int i = 0; i < n; ++i) acc[i] += blk[i];
+                        });
 }
 
 /// Accumulate sum_c weight_c <a|1/|r-R_c||b> into V (nao x nao, row-major).
@@ -401,6 +421,87 @@ potential_matrices(const ShellBasis<Real> &basis,
     out.push_back(std::move(V));
   }
   return out;
+}
+
+/// Coulomb potential of an AO DENSITY on a set of points:
+///   V(g) = sum_ab D_ab <a| 1/|r - r_g| |b>,
+/// i.e. the potential the density generates, sampled at r_g. Returns one value
+/// per point.
+///
+/// This is the shape a grid consumer needs, and the reason potential_matrices
+/// cannot serve it: that returns an nao x nao matrix PER POINT, which on an FE
+/// grid is nao^2 N^3 -- 3.7e6 points at nao = 24 is 2e9 doubles, so it fails the
+/// tractability rule outright. Contracting with D inside the point loop keeps
+/// the footprint at O(npoints) and never forms the per-point matrix at all.
+///
+/// far_tau routes a point well separated from a pair (p |P - r_g|^2 >
+/// -ln(far_tau)) through the exponent-free multipole tensor instead of the
+/// t-quadrature -- exact up to exp(-p R^2), and the whole point of doing this
+/// analytically rather than on a grid.
+template <class Real>
+std::vector<Real> potential_on_points(const ShellBasis<Real> &basis, const Real *D,
+                                      const std::vector<std::array<Real, 3>> &points,
+                                      const TGrid<Real> &grid, Real tau = Real(0),
+                                      Real far_tau = Real(0)) {
+  const int ns = static_cast<int>(basis.shells.size());
+  const int nao = basis.nao;
+  const std::size_t npt = points.size();
+  std::vector<Real> V(npt, Real(0));
+  if (npt == 0) return V;
+
+  // density sub-block per canonical pair, with the off-diagonal counted once
+  std::vector<std::pair<int, int>> pr;
+  std::vector<std::vector<Real>> Dblk;
+  for (int a = 0; a < ns; ++a)
+    for (int b = 0; b <= a; ++b) {
+      const int nca = ncart(basis.shells[a].l), ncb = ncart(basis.shells[b].l);
+      const int oa = basis.ao_off[a], ob = basis.ao_off[b];
+      std::vector<Real> blk(static_cast<std::size_t>(nca) * ncb);
+      for (int ka = 0; ka < nca; ++ka)
+        for (int kb = 0; kb < ncb; ++kb) {
+          const Real d = D[static_cast<std::size_t>(oa + ka) * nao + ob + kb];
+          blk[ka * ncb + kb] =
+              (a == b) ? d : d + D[static_cast<std::size_t>(ob + kb) * nao + oa + ka];
+        }
+      pr.push_back({a, b});
+      Dblk.push_back(std::move(blk));
+    }
+
+  // Parallel over CHUNKS of points, not over pairs: each thread owns a disjoint
+  // slice of V, so no atomics and no false sharing, and the visitor's scratch
+  // stays thread-local. Each chunk repeats the per-pair E setup, which is
+  // O((la+1)(lb+1)(la+lb+1)) against a chunk's worth of point work.
+  const int nthread = Kokkos::DefaultHostExecutionSpace().concurrency();
+  const std::size_t target = 512;
+  std::size_t nchunk = (npt + target - 1) / target;
+  if (nchunk < static_cast<std::size_t>(nthread)) nchunk = static_cast<std::size_t>(nthread);
+  if (nchunk > npt) nchunk = npt;
+  const std::size_t per = (npt + nchunk - 1) / nchunk;
+  Kokkos::parallel_for(
+      "intti::potential_on_points",
+      Kokkos::RangePolicy<Kokkos::DefaultHostExecutionSpace>(0, static_cast<int>(nchunk)),
+      [&](int ch) {
+        const std::size_t g0 = static_cast<std::size_t>(ch) * per;
+        if (g0 >= npt) return;
+        const std::size_t g1 = g0 + per < npt ? g0 + per : npt;
+        std::vector<PointCharge<Real>> pc;
+        pc.reserve(g1 - g0);
+        for (std::size_t g = g0; g < g1; ++g)
+          pc.push_back({Real(1), {points[g][0], points[g][1], points[g][2]}});
+        for (std::size_t ip = 0; ip < pr.size(); ++ip) {
+          const auto &sa = basis.shells[pr[ip].first], &sb = basis.shells[pr[ip].second];
+          const int nb = ncart(sa.l) * ncart(sb.l);
+          const Real *db = Dblk[ip].data();
+          detail::attraction_pair_visit(sa, sb, pc, grid, tau, far_tau,
+                                        [&](std::size_t ic, const Real *blk) {
+                                          Real s = 0;
+                                          for (int i = 0; i < nb; ++i) s += db[i] * blk[i];
+                                          V[g0 + ic] += s;
+                                        });
+        }
+      });
+  Kokkos::fence();
+  return V;
 }
 
 } // namespace intti

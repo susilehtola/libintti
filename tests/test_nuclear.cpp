@@ -108,3 +108,50 @@ TEST(Nuclear, FarFieldMatchesExact) {
 }
 
 } // namespace
+
+// potential_on_points is the density-contracted form of potential_matrices:
+// V(g) = sum_ab D_ab <a|1/|r-r_g||b>. Validating it AGAINST that routine is the
+// point -- potential_matrices is already tested, and the new one exists only
+// because its shape (nao^2 per point) cannot be put on a grid.
+TEST(Nuclear, PotentialOnPointsMatchesTheCollocationMatrices) {
+  auto basis = intti::make_basis<double>({{1.7, {0.0, 0.0, 0.0}, 0},
+                                          {0.6, {0.0, 0.0, 0.0}, 1},
+                                          {1.1, {0.3, -0.4, 1.2}, 0},
+                                          {0.8, {0.3, -0.4, 1.2}, 1}});
+  const int n = basis.nao;
+  std::vector<double> D((std::size_t)n * n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) D[i * n + j] = 0.2 + 0.4 * std::sin(0.9 * i + 1.7 * j);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) {
+      const double a = 0.5 * (D[i * n + j] + D[j * n + i]);
+      D[i * n + j] = D[j * n + i] = a;
+    }
+  std::vector<std::array<double, 3>> pts;
+  for (double x : {-2.5, -0.3, 0.0, 1.4, 6.0})
+    for (double y : {-1.1, 0.2, 3.3})
+      for (double z : {-0.7, 0.5, 4.8}) pts.push_back({x, y, z});
+  auto grid = intti::make_tgrid(intti::coulomb());
+
+  const auto ref = intti::potential_matrices(basis, pts, grid);
+  std::vector<double> want(pts.size(), 0.0);
+  for (std::size_t g = 0; g < pts.size(); ++g)
+    for (int a = 0; a < n; ++a)
+      for (int b = 0; b < n; ++b)
+        want[g] += D[a * n + b] * ref[g][(std::size_t)a * n + b];
+
+  double scale = 0;
+  for (double v : want) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 1e-3);
+
+  // exact branch, and the multipole far branch, must both reproduce it
+  for (double far : {0.0, 1e-12, 1e-8}) {
+    const auto got = intti::potential_on_points(basis, D.data(), pts, grid, 0.0, far);
+    double worst = 0;
+    for (std::size_t g = 0; g < pts.size(); ++g)
+      worst = std::max(worst, std::abs(got[g] - want[g]));
+    // the far branch is exact up to exp(-p R^2); 1e-8 is a loose tolerance and
+    // still lands far inside it
+    EXPECT_LT(worst, (far > 0 ? 1e-7 : 1e-12) * scale) << "far_tau=" << far;
+  }
+}

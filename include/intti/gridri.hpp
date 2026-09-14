@@ -19,6 +19,7 @@
 // convention is the library's unnormalized Cartesian primitive, matching
 // coulomb_build/exchange_build, so results compare directly to them.
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -28,6 +29,7 @@
 #include "fegrid.hpp"
 #include "fock.hpp" // ShellBasis
 #include "gto.hpp"  // ncart, cart_comp
+#include "nuclear.hpp" // potential_on_points (analytic V on the grid)
 #include "tgrid.hpp"
 
 namespace intti {
@@ -328,6 +330,20 @@ std::vector<Real> grid_exchange_dev(const Kokkos::View<Real **> &ao, int nao,
 }
 } // namespace detail
 
+/// The 3D grid points of an FE grid, in the row-major (ix,iy,iz) order the
+/// AO and density tensors use.
+template <class Real>
+std::vector<std::array<Real, 3>> fegrid_points(const FEGrid1D<Real> &grid) {
+  const int N = grid.N;
+  std::vector<std::array<Real, 3>> pts;
+  pts.reserve(static_cast<std::size_t>(N) * N * N);
+  for (int ix = 0; ix < N; ++ix)
+    for (int iy = 0; iy < N; ++iy)
+      for (int iz = 0; iz < N; ++iz)
+        pts.push_back({grid.xnode[ix], grid.xnode[iy], grid.xnode[iz]});
+  return pts;
+}
+
 /// Grid-RI Coulomb matrix J over a primitive Cartesian basis (density-on-grid +
 /// one DAGE). `tgrid` selects the kernel (coulomb for 1/r).
 template <class Real>
@@ -335,6 +351,58 @@ std::vector<Real> grid_coulomb_build(const ShellBasis<Real> &basis, const Real *
                                      const FEGrid1D<Real> &grid, const TGrid<Real> &tgrid,
                                      int nv = 24) {
   return detail::grid_coulomb_dev(detail::ao_on_grid_dev(basis, grid), basis.nao, grid, tgrid, D, nv);
+}
+
+/// Grid-RI Coulomb with the POTENTIAL taken analytically instead of by DAGE.
+///
+/// The grid route represents the density on the grid and convolves it
+/// numerically, which throws away the fact that -- for a GTO basis -- the source
+/// is a sum of Gaussian products whose Coulomb potential is known in closed
+/// form. potential_on_points evaluates that potential directly, and routes a
+/// point well separated from a pair through the exponent-free multipole tensor
+/// (far_tau), which is the cheap far field the DAGE has no equivalent of: its
+/// only screen is the v-clamp, and that fires solely when |t (u1-u2)| exceeds
+/// vmax across a whole element, so below t ~ 1.7 on a representative grid NO
+/// element is ever skipped.
+///
+/// Only the final quadrature J_ab = sum_g w_g chi_a chi_b V remains a grid
+/// approximation, so this is also strictly more accurate than the DAGE route at
+/// the same grid -- the density no longer has to be resolved, only the AO
+/// products that were going to be integrated anyway.
+///
+/// DAGE remains the general path: it is operator- and basis-agnostic, and a
+/// density that is not a sum of Gaussian products (an NAO product, a numerical
+/// orbital) has no closed-form potential to use here.
+template <class Real>
+std::vector<Real> grid_coulomb_build_analytic(const ShellBasis<Real> &basis,
+                                              const Real *D, const FEGrid1D<Real> &grid,
+                                              const TGrid<Real> &tgrid,
+                                              Real tau = Real(0),
+                                              Real far_tau = Real(1e-14)) {
+  const int N = grid.N, nao = basis.nao;
+  const std::size_t N3 = static_cast<std::size_t>(N) * N * N;
+  const auto Vh = potential_on_points(basis, D, fegrid_points(grid), tgrid, tau, far_tau);
+  auto V = detail::to_device(Vh, "gr::Vanalytic");
+  auto ao = detail::ao_on_grid_dev(basis, grid);
+  auto xw = detail::to_device(grid.xw, "gr::xw");
+  Kokkos::View<Real **> Jd("gr::Jd", nao, nao);
+  Kokkos::parallel_for(
+      "gr::contractJ", Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0, 0}, {nao, nao}),
+      KOKKOS_LAMBDA(int a, int b) {
+        if (b < a) return;
+        Real s = 0;
+        for (std::size_t g = 0; g < N3; ++g) {
+          const int ix = g / (N * N), iy = (g / N) % N, iz = g % N;
+          s += xw(ix) * xw(iy) * xw(iz) * ao(a, g) * ao(b, g) * V(g);
+        }
+        Jd(a, b) = s;
+        Jd(b, a) = s;
+      });
+  auto hJ = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Jd);
+  std::vector<Real> J(static_cast<std::size_t>(nao) * nao);
+  for (int a = 0; a < nao; ++a)
+    for (int b = 0; b < nao; ++b) J[a * nao + b] = hJ(a, b);
+  return J;
 }
 
 /// Grid-RI exchange matrix K over a primitive Cartesian basis, via co-densities

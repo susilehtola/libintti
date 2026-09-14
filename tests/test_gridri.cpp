@@ -245,3 +245,71 @@ TEST(GridRI, SphericalCoulombConsistentWithCartesian) {
 }
 
 } // namespace
+
+// The grid route represents the density on the grid and convolves it
+// numerically, which discards the fact that a GTO density is a sum of Gaussian
+// products with a closed-form potential. Taking that potential analytically
+// leaves the final quadrature as the ONLY grid approximation, so on the same
+// grid it must be at least as accurate as the DAGE route -- and it is the
+// route that has a cheap far field, which the DAGE has no equivalent of.
+TEST(GridRI, AnalyticPotentialBeatsDageOnTheSameGrid) {
+  std::vector<intti::PrimitiveShell<double>> shells = {
+      {2.0, {0.0, 0.0, 0.0}, 0}, {1.3, {0.0, 0.0, 0.0}, 1}, {1.1, {0.0, 0.0, 1.3}, 0}};
+  auto sb = intti::make_basis(shells);
+  const int n = sb.nao;
+  auto D = sym(n, 0.8);
+  auto grid = intti::grid_for_basis(sb, 3e-2);
+  auto tg = intti::make_tgrid(intti::coulomb());
+
+  std::vector<double> Jref((std::size_t)n * n, 0.0);
+  intti::coulomb_build(sb, D.data(), tg, Jref.data());
+  double scale = 0;
+  for (double v : Jref) scale = std::max(scale, std::abs(v));
+
+  intti::TGridSpec<double> spec;
+  spec.n = 16;
+  const auto Jd = intti::grid_coulomb_build(sb, D.data(), grid,
+                                            intti::make_tgrid(intti::coulomb(), spec), 14);
+  const auto Ja = intti::grid_coulomb_build_analytic(sb, D.data(), grid, tg, 0.0, 1e-14);
+  double ed = 0, ea = 0;
+  for (std::size_t k = 0; k < Jref.size(); ++k) {
+    ed = std::max(ed, std::abs(Jd[k] - Jref[k]));
+    ea = std::max(ea, std::abs(Ja[k] - Jref[k]));
+  }
+  EXPECT_LT(ea, 3e-2 * scale) << "analytic-potential grid J vs exact GTO J";
+  EXPECT_LE(ea, ed) << "the analytic potential should not be worse than the DAGE "
+                       "on the same grid (analytic " << ea << " vs DAGE " << ed << ")";
+}
+
+// The multipole far branch is the cheap far field: routing a point that is well
+// separated from a pair through the exponent-free tensor instead of the
+// t-quadrature. It must converge to the exact branch as far_tau tightens, and a
+// loose setting must stay far inside the grid error it sits behind.
+TEST(GridRI, MultipoleFarFieldConvergesToTheExactBranch) {
+  std::vector<intti::PrimitiveShell<double>> shells;
+  for (int i = 0; i < 3; ++i) {
+    shells.push_back({1.8, {3.0 * i, 0.0, 0.0}, 0});
+    shells.push_back({0.6, {3.0 * i, 0.0, 0.0}, 1});
+  }
+  auto sb = intti::make_basis(shells);
+  const int n = sb.nao;
+  auto D = sym(n, 0.7);
+  auto grid = intti::grid_for_basis(sb, 6e-2);
+  auto tg = intti::make_tgrid(intti::coulomb());
+
+  const auto exact = intti::grid_coulomb_build_analytic(sb, D.data(), grid, tg, 0.0, 0.0);
+  double scale = 0;
+  for (double v : exact) scale = std::max(scale, std::abs(v));
+  ASSERT_GT(scale, 1e-3);
+
+  double prev = 1.0;
+  for (double far : {1e-4, 1e-8, 1e-12}) {
+    const auto got = intti::grid_coulomb_build_analytic(sb, D.data(), grid, tg, 0.0, far);
+    double worst = 0;
+    for (std::size_t k = 0; k < exact.size(); ++k)
+      worst = std::max(worst, std::abs(got[k] - exact[k]));
+    EXPECT_LT(worst, 1e-3 * scale) << "far_tau=" << far << " left the grid's own error";
+    EXPECT_LE(worst, prev * 1.001) << "tightening far_tau made it worse at " << far;
+    prev = std::max(worst, 1e-16);
+  }
+}
