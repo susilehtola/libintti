@@ -73,6 +73,11 @@ if(INTTI_BUILD_TESTS)
   target_link_libraries(intti_dump_oneel PRIVATE intti::intti)
   add_executable(intti_dump_ri tools/dump_ri.cpp)
   target_link_libraries(intti_dump_ri PRIVATE intti::intti)
+  # J/K scaling over real basis sets. Built but NOT registered with ctest: a
+  # single def2-QZVPPD point runs for minutes to hours.
+  add_executable(intti_scaling bench/scaling.cpp)
+  target_link_libraries(intti_scaling PRIVATE intti::intti)
+  target_include_directories(intti_scaling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_FOUND)
     execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pyscf"

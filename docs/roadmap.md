@@ -1986,3 +1986,44 @@ elevated-l block variant returning all (e,f) components), minor caching
   Not scheduled, because the decision is a dependency question rather than an
   implementation one, and because the payoff is unmeasurable here (no GPU, no
   Kokkos backend beyond OpenMP, where the copies this removes are nearly free).
+
+- **GRID-RI CANNOT RUN A REAL BASIS SET -- BLOCKING, AND NOT A TUNING PROBLEM.**
+  The grid route was only ever exercised on the small uncontracted model bases
+  in the test suite (2-4 centres, s+p+d, N = 20-90 per axis). Measured on what a
+  real calculation would need, via `grid_for_basis` on PySCF dumps
+  (prototype/dump_basis.py, bench/scaling.cpp):
+
+      def2-SVP,     1 water,  25 AO:  N = 1452/axis,  N^3 = 3.1e9 points
+      def2-SVP,     2 water,  50 AO:  N = 5121/axis,  N^3 = 1.3e11
+      def2-SVP,     4 water, 100 AO:  N = 5953/axis,  N^3 = 2.1e11
+
+  One scalar field on the smallest of those is 24 GB; `ao_on_grid_dev` allocates
+  nao x N^3, which is 612 GB. def2-QZVPPD is far worse (its tightest primitive
+  is alpha = 1.2e5, a 0.002 bohr feature). So the grid route cannot do ONE water
+  molecule in a double-zeta basis.
+
+  The cause is NOT only the tight core, which was the obvious guess. Capping the
+  def2-SVP exponents and rebuilding the grid:
+
+      alpha <= 2266 (full)   N = 1452        alpha <= 77     N = 1272
+      alpha <= 341           N = 1362        alpha <= 6.7    N =  766
+                                             alpha <= 2.0    N =  620
+
+  Removing the core entirely still leaves N = 620, i.e. 2.4e8 points. The real
+  cause is structural: ONE GLOBAL TENSOR-PRODUCT GRID has to resolve every
+  length scale present in the basis, across the whole molecular domain, on every
+  axis. Real basis sets span four to five decades in exponent, hence two to
+  three in length scale, and a tensor product pays that on all three axes at
+  once.
+
+  So the analytic-vs-grid scaling comparison cannot be made as posed, and no
+  amount of far-field work on the grid route changes that -- the far field
+  accelerates the potential, while what is unaffordable is the grid itself.
+
+  What would fix it is a different spatial discretisation, not a better
+  algorithm on this one: atom-centred (Becke) quadrature instead of a global
+  tensor product, a multiresolution basis, or removing the core with a
+  pseudopotential. Each is a substantial piece of work and a different design.
+  Until one of them exists, the grid pillar's honest scope is smooth model
+  bases, NAO/numerical work where no analytic alternative exists, and use as an
+  independent oracle for the analytic route.
