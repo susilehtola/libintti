@@ -2068,3 +2068,42 @@ elevated-l block variant returning all (e,f) components), minor caching
   per point and is the missing half of potential_on_points_boxed. With that, the
   SVP -> QZVPPD step costs the grid 19x and the analytic route 200x, so the
   crossover argument is alive and was refuted earlier only by a bad mesh.
+
+  WHAT THE FIX IS NOT. Two candidates that look like escapes and are not.
+
+  Atom-centred (Becke) quadrature is NOT rotationally invariant either -- a
+  Lebedev angular grid is invariant only under the octahedral subgroup, and
+  rotating the molecule against the grid axes changes the quadrature. What it
+  does fix is the COST: the point count is natom x (radial x angular)
+  regardless of orientation, where the tensor grid's cost varied by a factor of
+  four on a single rotated water. That is a real distinction, but it is a
+  distinction about cost, not about invariance.
+
+  More importantly, atom-centred quadrature cannot keep the fitting-free
+  property, and the reason is worth stating exactly because it closes off the
+  whole direction. DAGE is fitting-free BECAUSE the grid is a tensor product:
+  the Gaussian kernel e^{-t^2 |r1-r2|^2} factorises per Cartesian axis, so
+  applying the Coulomb operator is three one-dimensional convolutions and no
+  auxiliary basis appears anywhere. Break the tensor structure and that
+  factorisation goes with it. On an atom-centred grid the potential has to come
+  from somewhere else -- in practice by expanding each atomic piece of the
+  density in spherical harmonics and solving the radial Poisson equation per
+  (l,m), i.e. by projecting onto an auxiliary set whose potentials are known in
+  closed form. That is a resolution of the identity by another name. So the
+  choice is not "tensor product or something better": it is fitting-free at
+  3 natom features per axis, or an auxiliary expansion with linear cost. The
+  tensor structure buys the fitting-free property and charges for it.
+
+  THE ONE ESCAPE THAT IS NOT RI is adaptive refinement in three dimensions --
+  multiwavelets on an octree, as in MADNESS. Refinement is then local in
+  VOLUME rather than the product of three per-axis resolutions, so an atom's
+  cusp costs a few small boxes instead of a narrow feature on every axis; and
+  the operator is still applied without a fit, because the Poisson kernel is
+  used in a SEPARATED representation, a sum of Gaussians applied by tensor
+  contractions within each box.
+
+  That separated representation is exactly this library's t-quadrature. The
+  kernel substrate already here is the one a multiresolution scheme needs; what
+  is missing is the adaptive 3D discretisation, not the operator. That is the
+  honest statement of what the grid pillar would take, and it is a different
+  project rather than a fix.
